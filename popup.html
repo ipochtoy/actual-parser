@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Pochtoy Parser</title>
+  <meta charset="UTF-8">
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      width: 350px;
+      padding: 15px;
+      background-color: #f7f8fa;
+    }
+    .header { text-align: center; margin-bottom: 15px; }
+    h1 { font-size: 20px; color: #333; }
+    .button-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 15px; }
+    .store-button {
+      background-color: #fff;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 10px;
+      font-size: 14px;
+      cursor: pointer;
+      text-align: center;
+      transition: all 0.2s ease;
+    }
+    .store-button:hover { background-color: #f0f2f5; border-color: #ccc; }
+    .store-button.loading .emoji { animation: spin 1s linear infinite; }
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    .emoji { font-size: 24px; display: block; margin-bottom: 5px; }
+
+    .button {
+      display: block;
+      width: 100%;
+      padding: 12px;
+      font-size: 14px;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      margin-bottom: 10px;
+      transition: background-color 0.2s ease;
+    }
+    .primary-button { background-color: #667eea; color: white; }
+    .primary-button:hover { background-color: #5a6ed8; }
+    .danger-button { background-color: #e53e3e; color: white; }
+    .danger-button:hover { background-color: #c53030; }
+    #status {
+      padding: 10px;
+      border-radius: 6px;
+      font-size: 13px;
+      text-align: center;
+      margin-top: 10px;
+      display: none;
+    }
+    .success { background-color: #d4edda; color: #155724; }
+    .error { background-color: #f8d7da; color: #721c24; }
+    .info { background-color: #d1ecf1; color: #0c5460; }
+    
+    /* Progress Bar Styles */
+    #multiProgress { margin-top: 15px; width: 100%; }
+    .progress-container { margin-bottom: 8px; }
+    .progress-label { font-size: 13px; color: #555; margin-bottom: 4px; display: block; }
+    .progress-bar-outer {
+        width: 100%;
+        height: 8px;
+        background-color: #e9ecef;
+        border-radius: 4px;
+        overflow: hidden;
+    }
+    .progress-bar {
+        height: 100%;
+        width: 0%;
+        background-color: #667eea;
+        transition: width 0.3s ease-in-out;
+    }
+    .progress-text {
+        font-size: 12px;
+        color: #667eea;
+        text-align: right;
+        display: block;
+        margin-top: 2px;
+    }
+
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>📦 Pochtoy Parsing</h1>
+      <div style="font-size: 11px; opacity: 0.7; margin-top: 4px;">v6.10.17</div>
+    </div>
+
+    <div class="store-buttons">
+      <button id="parseEbay" class="store-button" title="Parse eBay Orders"><span class="emoji">🛒</span> eBay</button>
+      <button id="parseIherb" class="store-button" title="Parse iHerb Orders"><span class="emoji">🏥</span> iHerb</button>
+      <button id="parseAmazon" class="store-button" title="Parse Amazon Orders"><span class="emoji">📦</span> Amazon</button>
+    </div>
+
+    <button id="parseAllStores" class="button primary-button">🚀 Parse All Stores</button>
+    
+    <div style="margin-bottom: 15px; font-size: 12px;">
+        <!-- Auto-start checkbox moved to automation section -->
+    </div>
+
+    <div id="multiProgress" style="display: none;">
+        <div class="progress-container" id="ebay-progress-container">
+            <div class="progress-label-container" style="display: flex; justify-content: space-between; align-items: center;">
+                <span class="progress-label">eBay:</span>
+                <span class="progress-text" id="ebay-progress-text">Waiting...</span>
+            </div>
+            <div class="progress-bar-outer">
+                <div class="progress-bar" id="ebay-progress-bar"></div>
+            </div>
+        </div>
+        <div class="progress-container" id="iherb-progress-container">
+            <div class="progress-label-container" style="display: flex; justify-content: space-between; align-items: center;">
+                <span class="progress-label">iHerb:</span>
+                <span class="progress-text" id="iherb-progress-text">Waiting...</span>
+            </div>
+            <div class="progress-bar-outer">
+                <div class="progress-bar" id="iherb-progress-bar"></div>
+            </div>
+        </div>
+        <div class="progress-container" id="amazon-progress-container">
+             <div class="progress-label-container" style="display: flex; justify-content: space-between; align-items: center;">
+                <span class="progress-label">Amazon:</span>
+                <span class="progress-text" id="amazon-progress-text">Waiting...</span>
+            </div>
+            <div class="progress-bar-outer">
+                <div class="progress-bar" id="amazon-progress-bar"></div>
+            </div>
+        </div>
+    </div>
+
+    <div id="status"></div>
+    <div id="unsupported-page" style="display: none;">
+      <p>This page is not supported. Please navigate to eBay, iHerb, or Amazon order history.</p>
+    </div>
+
+    <div id="actions">
+      <hr style="border: none; border-top: 1px solid #eee; margin: 15px 0;">
+      <button id="exportBtn" class="button" style="background-color: #f0f2f5; color: #333;">📥 Export to CSV</button>
+      <button id="copyToSheets" class="button" disabled>📋 Copy for Google Sheets</button>
+
+      <!-- New Upload Section -->
+      <div id="upload-section" class="button-group">
+          <input type="text" id="sheet-name" placeholder="Имя листа (e.g. Лист1)" value="Лист1">
+          <button id="upload-btn" class="button action-button">📤 Upload to Google Sheet</button>
+      </div>
+
+      <button id="clearData" class="button danger-button">🗑️ Clear Data</button>
+    </div>
+
+    <!-- Google Sheets Sync Section -->
+    <div id="google-sync-section">
+        <h3 style="text-align: center; font-size: 16px; margin-bottom: 10px;">🤖 Автоматизация Pochtoy.com</h3>
+        
+        <!-- Telegram Settings -->
+        <details style="margin-bottom: 10px; font-size: 12px; border: 1px solid #eee; border-radius: 4px; padding: 5px;">
+            <summary style="cursor: pointer; color: #667eea;">📱 Telegram Bot Settings</summary>
+            <div style="margin-top: 8px; display: flex; flex-direction: column; gap: 5px;">
+                <input type="text" id="tg-bot-token" placeholder="Bot Token" style="padding: 6px; border: 1px solid #ddd; border-radius: 4px;">
+                <div style="display: flex; gap: 5px;">
+                    <input type="text" id="tg-chat-id" placeholder="Chat ID" style="flex: 1; padding: 6px; border: 1px solid #ddd; border-radius: 4px;">
+                    <button id="save-tg-settings" class="button" style="width: auto; padding: 0 10px; margin: 0; background-color: #4a5568; color: white;">💾</button>
+                </div>
+                <div style="font-size: 10px; color: #666;">Команда для запуска: <b>/start_parser</b></div>
+            </div>
+        </details>
+
+        <div style="display: flex; gap: 5px; margin-bottom: 10px;">
+            <input type="text" id="spreadsheet-id" placeholder="Вставь ID твоей Google-таблицы" value="1w1QOzGWc_CNovlezuxyLta-h1kM3pgPXc_GoHYaOA98" style="flex: 1; padding: 10px; border-radius: 8px; border: 1px solid #ddd; box-sizing: border-box;">
+            <button id="save-spreadsheet-id" class="button" style="width: auto; padding: 0 15px; margin: 0; background-color: #4a5568; color: white;" title="Сохранить ID">💾</button>
+        </div>
+        <button id="start-sync-btn" class="button" style="background-color: #28a745; color: white;">▶️ Запустить синхронизацию</button>
+        <button id="run-robot-only-btn" class="button" style="background-color: #2b6cb0; color: white; margin-top: 5px;">🤖 Запустить робота (без парсинга)</button>
+        
+        <div style="margin-top: 8px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+            <label style="display:flex; align-items:center; gap:6px; font-size:12px;">
+                <input type="checkbox" id="skip-processed" checked /> Skip processed (DONE)
+            </label>
+            <label style="display:flex; align-items:center; gap:6px; font-size:12px;">
+                <input type="checkbox" id="color-processed" checked /> Color processed rows
+            </label>
+            <button id="reset-marks-btn" class="button" style="background:#e2e8f0; color:#333; padding:6px 10px;">↺ Reset marks</button>
+        </div>
+        
+        <div style="margin-top: 8px; font-size: 12px;">
+            <label style="display:flex; align-items:center; gap:6px;">
+                <input type="checkbox" id="limit-rows" checked /> Обрабатывать только последние 800 строк
+            </label>
+        </div>
+        
+        <div style="margin-top: 8px; font-size: 12px;">
+            <label style="display:flex; align-items:center; gap:6px;">
+                <input type="checkbox" id="chain-pochtoy" checked /> 🔄 Затем авто-запустить Pochtoy.com
+            </label>
+        </div>
+        
+        <div id="automation-progress-section" style="display: none; margin-top: 15px;">
+            <div class="progress-label-container">
+                <span class="progress-label" id="automation-progress-label">Выполняется...</span>
+                <span class="progress-text" id="automation-progress-text">0/0</span>
+            </div>
+            <div class="progress-bar-outer">
+                <div class="progress-bar" id="automation-progress-bar"></div>
+            </div>
+            <div id="automation-current-task" style="font-size: 11px; opacity: 0.8; margin-top: 4px; text-align: center;"></div>
+            <button id="stop-sync-btn" class="button danger-button" style="margin-top: 10px;">🛑 Остановить</button>
+        </div>
+    </div>
+
+  </div>
+  <script type="module" src="google-auth.js"></script>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,58 @@
+{
+  "manifest_version": 3,
+  "name": "Pochtoy Parsing",
+  "version": "6.10.17",
+  "description": "🇧🇾 Parse orders from eBay, iHerb, Amazon and export to Google Sheets",
+  "permissions": ["storage", "identity", "tabs", "scripting"],
+  "host_permissions": [
+    "https://secure.iherb.com/*",
+    "https://www.ebay.com/*",
+    "https://www.amazon.com/*",
+    "https://www.pochtoy.com/*",
+    "https://api.telegram.org/*"
+  ],
+  "oauth2": {
+    "client_id": "294811721052-4fkb0f5cea2qsek0cfm46jq6i7n3r25t.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/spreadsheets"
+    ]
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.ebay.com/mye/myebay/purchase*"],
+      "js": ["content-ebay.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://secure.iherb.com/myaccount/orders*"],
+      "js": ["content-iherb.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.amazon.com/gp/your-account/order-history*",
+        "https://www.amazon.com/gp/css/order-history*",
+        "https://www.amazon.com/your-orders*"
+      ],
+      "js": ["content-amazon.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  }
+}

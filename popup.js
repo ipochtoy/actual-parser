@@ -1,0 +1,710 @@
+import { readSheetData, writeDataToSheet } from './google-auth.js';
+
+// Fixed default Google Sheet ID (Pochtoy sheet)
+const DEFAULT_SPREADSHEET_ID = '1w1QOzGWc_CNovlezuxyLta-h1kM3pgPXc_GoHYaOA98';
+
+document.addEventListener('DOMContentLoaded', () => {
+    initialize();
+});
+
+const stores = [
+    { name: 'Ebay', id: 'parseEbay', urlPattern: '*://www.ebay.com/mye/myebay/purchase*', url: 'https://www.ebay.com/mye/myebay/purchase', action: 'parseEbay' },
+    { name: 'iHerb', id: 'parseIherb', urlPattern: '*://secure.iherb.com/myaccount/orders*', url: 'https://secure.iherb.com/myaccount/orders', action: 'parseIherb' },
+    { name: 'Amazon', id: 'parseAmazon', urlPattern: '*://www.amazon.com/gp/your-account/order-history*', url: 'https://www.amazon.com/gp/your-account/order-history', action: 'parseAmazon' }
+];
+
+function initialize() {
+    stores.forEach(store => {
+        document.getElementById(store.id)?.addEventListener('click', () => parseStore(store));
+    });
+
+    document.getElementById('parseAllStores')?.addEventListener('click', parseAllStores);
+    document.getElementById('exportBtn')?.addEventListener('click', exportToCsv);
+    document.getElementById('copyToSheets')?.addEventListener('click', () => copyForAllStores(false));
+    // copyAndOpen button removed; keep code resilient if absent
+    document.getElementById('copyAndOpen')?.addEventListener('click', () => copyForAllStores(true));
+    document.getElementById('clearData')?.addEventListener('click', clearAllStoreData);
+    document.getElementById('upload-btn')?.addEventListener('click', uploadToSheets);
+    
+    // --- NEW: Automation Listeners ---
+    document.getElementById('start-sync-btn').addEventListener('click', startSync);
+    document.getElementById('stop-sync-btn').addEventListener('click', stopSync);
+
+    const pagesToParseInput = document.getElementById('pagesToParse');
+    pagesToParseInput.addEventListener('change', (event) => {
+        chrome.storage.local.set({ savedPagesToParse: event.target.value });
+    });
+
+    // New controls
+    document.getElementById('skip-processed').addEventListener('change', (e)=>{
+        chrome.storage.local.set({ skipProcessed: e.target.checked });
+    });
+    document.getElementById('color-processed').addEventListener('change', (e)=>{
+        chrome.storage.local.set({ colorProcessed: e.target.checked });
+    });
+    document.getElementById('limit-rows').addEventListener('change', (e)=>{
+        chrome.storage.local.set({ limitRows: e.target.checked });
+    });
+    document.getElementById('chain-pochtoy').addEventListener('change', (e)=>{
+        chrome.storage.local.set({ chainPochtoy: e.target.checked });
+    });
+    document.getElementById('save-tg-settings').addEventListener('click', () => {
+        const token = document.getElementById('tg-bot-token').value.trim();
+        const chatId = document.getElementById('tg-chat-id').value.trim();
+        chrome.storage.local.set({ tgBotToken: token, tgChatId: chatId }, () => {
+            const btn = document.getElementById('save-tg-settings');
+            btn.textContent = '✓';
+            setTimeout(() => btn.textContent = '💾', 1000);
+            // Notify background to reload settings
+            chrome.runtime.sendMessage({ action: 'reloadTgSettings' });
+        });
+    });
+
+    document.getElementById('reset-marks-btn').addEventListener('click', resetMarks);
+
+    // Restore saved toggles and default spreadsheet
+    chrome.storage.local.get(['skipProcessed','colorProcessed','limitRows','chainPochtoy','savedPagesToParse','spreadsheetId','sheetName','tgBotToken','tgChatId'], (res)=>{
+        if (typeof res.skipProcessed === 'boolean') document.getElementById('skip-processed').checked = res.skipProcessed;
+        // default true
+        document.getElementById('color-processed').checked = (typeof res.colorProcessed === 'boolean') ? res.colorProcessed : true;
+        document.getElementById('limit-rows').checked = (typeof res.limitRows === 'boolean') ? res.limitRows : true;
+        document.getElementById('chain-pochtoy').checked = (typeof res.chainPochtoy === 'boolean') ? res.chainPochtoy : false;
+        
+        if (res.tgBotToken) document.getElementById('tg-bot-token').value = res.tgBotToken;
+        if (res.tgChatId) document.getElementById('tg-chat-id').value = res.tgChatId;
+        if (res.savedPagesToParse) pagesToParseInput.value = res.savedPagesToParse;
+
+        // Restore Spreadsheet ID (or use hardcoded default)
+        const ssInput = document.getElementById('spreadsheet-id');
+        if (ssInput) {
+            ssInput.value = res.spreadsheetId || DEFAULT_SPREADSHEET_ID;
+        }
+
+        const snInput = document.getElementById('sheet-name');
+        if (snInput && res.sheetName) snInput.value = res.sheetName;
+    });
+
+    // Save Spreadsheet ID on change
+    document.getElementById('spreadsheet-id')?.addEventListener('change', (e) => {
+        const newVal = e.target.value.trim();
+        chrome.storage.local.set({ spreadsheetId: newVal });
+    });
+    
+    // Save Spreadsheet ID button
+    document.getElementById('save-spreadsheet-id')?.addEventListener('click', () => {
+        const val = document.getElementById('spreadsheet-id').value.trim();
+        chrome.storage.local.set({ spreadsheetId: val }, () => {
+            const btn = document.getElementById('save-spreadsheet-id');
+            const originalText = btn.textContent;
+            btn.textContent = '✓';
+            btn.style.backgroundColor = '#28a745';
+            setTimeout(() => {
+                btn.textContent = originalText;
+                btn.style.backgroundColor = '#4a5568';
+            }, 1000);
+        });
+    });
+
+    // Only persist sheet name, spreadsheet ID is hardcoded
+    document.getElementById('sheet-name')?.addEventListener('change', (e)=>{
+        chrome.storage.local.set({ sheetName: e.target.value.trim() || 'Лист1' });
+    });
+
+    updateCopyButtonState();
+    restoreProgressState();
+    restorePagesToParse();
+    restoreAutomationState(); // Restore automation progress on open
+}
+
+function restorePagesToParse() {
+    chrome.storage.local.get('savedPagesToParse', (result) => {
+        if (result.savedPagesToParse) {
+            const pagesToParseInput = document.getElementById('pagesToParse');
+            if (pagesToParseInput) {
+                pagesToParseInput.value = result.savedPagesToParse;
+            }
+        }
+    });
+}
+
+function getUrlPatternsForStore(store) {
+    if (store.name === 'Amazon') {
+        return [
+            '*://www.amazon.com/gp/your-account/order-history*',
+            '*://www.amazon.com/gp/css/order-history*',
+            '*://www.amazon.com/your-orders*'
+        ];
+    }
+    return [store.urlPattern];
+}
+
+function urlMatchesAnyPattern(url, patterns) {
+    return patterns.some(p => {
+        const rx = new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, m => m === '*' ? '.*' : `\\${m}`).replace(/\\\*/g, '.*'));
+        return rx.test(url);
+    });
+}
+
+async function parseStore(store) {
+    const button = document.getElementById(store.id);
+    button.classList.add('loading');
+    button.disabled = true;
+
+    try {
+        // Clear any previous stop flag when we explicitly start parsing
+        await new Promise(resolve => chrome.storage.local.set({ stopAllParsers: false }, resolve));
+
+        const patterns = getUrlPatternsForStore(store);
+        // --- IMPROVEMENT: Check current tab first ---
+        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+
+        let tabToUse;
+
+        if (activeTab && activeTab.url && urlMatchesAnyPattern(activeTab.url, patterns)) {
+            // If the currently active tab matches the store's URL, use it
+            console.log(`Parsing directly on active tab: ${activeTab.url}`);
+            tabToUse = activeTab;
+        } else {
+            // Otherwise, find an existing tab matching any pattern
+            const existingTabs = await chrome.tabs.query({ url: patterns });
+            if (existingTabs.length > 0) {
+                tabToUse = existingTabs[0];
+                await chrome.tabs.update(tabToUse.id, { active: true });
+            } else {
+                // Create new tab using explicit URL (no wildcard replacement)
+                tabToUse = await chrome.tabs.create({ url: store.url, active: true });
+            }
+        }
+        
+        // Wait a moment for the page to be ready, especially if we just created/switched
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        console.log(`Sending parse message to ${store.name} on tab ${tabToUse.id}`);
+        chrome.tabs.sendMessage(tabToUse.id, { 
+            action: store.action,
+            // Pass pagesToParse value in case it's Amazon
+            options: { 
+                pages: (store.name === 'Amazon') ? (parseInt(document.getElementById('pagesToParse')?.value, 10) || 10) : undefined
+            }
+        });
+
+    } catch (error) {
+        console.error(`Error parsing ${store.name}:`, error);
+        updateStatus(`Error with ${store.name}: ${error.message}`, 'error');
+    } finally {
+        button.classList.remove('loading');
+        button.disabled = false;
+    }
+}
+
+async function parseAllStores() {
+    updateStatus('🚀 Launching parsers...', 'info');
+    await clearAllStoreData(false); // silent clear
+
+    // Notify background to initialize state
+    chrome.runtime.sendMessage({ action: "startParsingAllStores" });
+
+    // Clear any previous stop flag when we explicitly start parsing
+    await new Promise(resolve => chrome.storage.local.set({ stopAllParsers: false }, resolve));
+
+    const multiProgress = document.getElementById('multiProgress');
+    if (multiProgress) {
+        multiProgress.style.display = 'block';
+        ['ebay', 'iherb', 'amazon'].forEach(storeKey => {
+            updateStoreProgress(storeKey.charAt(0).toUpperCase() + storeKey.slice(1), 0, 1, 'Waiting...');
+        });
+    }
+
+    const storeConfigs = [
+        { name: 'Ebay', url: 'https://www.ebay.com/mye/myebay/purchase', action: 'exportEbayOrders' },
+        { name: 'iHerb', url: 'https://secure.iherb.com/myaccount/orders', action: 'exportIherbOrders' },
+        { name: 'Amazon', url: 'https://www.amazon.com/gp/your-account/order-history', action: 'parseAmazonOrders' }
+    ];
+
+    try {
+        // Step 1: Create all tabs in parallel and get their IDs
+        const tabPromises = storeConfigs.map(store => {
+            updateStoreProgress(store.name, 0, 1, "Opening...");
+            return chrome.tabs.create({ url: store.url, active: false });
+        });
+        const tabs = await Promise.all(tabPromises);
+
+        // Step 2: Wait for all tabs to likely have loaded
+        updateStatus('Opened tabs, waiting for them to load...', 'info');
+        await new Promise(resolve => setTimeout(resolve, 3000)); // 3-second wait
+
+        // Step 3: Send all parsing messages in parallel (NO AWAIT IN LOOP)
+        tabs.forEach((tab, i) => {
+            const store = storeConfigs[i];
+            try {
+                updateStoreProgress(store.name, 0, 1, "Starting parse...");
+                // Fire and forget: send the message but don't wait for the long parsing process to finish
+                chrome.tabs.sendMessage(tab.id, { 
+                    action: store.action,
+                    options: store.name === 'Amazon' ? { pages: (parseInt(document.getElementById('pagesToParse')?.value, 10) || 10) } : undefined
+                });
+                console.log(`✅ Sent parse command to ${store.name} (Tab ID: ${tab.id})`);
+            } catch (error) {
+                console.error(`❌ Could not send message to ${store.name} (Tab ID: ${tab.id}).`, error);
+                updateStoreProgress(store.name, 1, 1, "Error");
+            }
+        });
+
+        updateStatus('✅ All parse commands sent!', 'success');
+
+    } catch (error) {
+        console.error('Error in parseAllStores:', error);
+        updateStatus('Failed to open or command tabs.', 'error');
+    }
+}
+
+
+function updateStatus(message, type) {
+    const statusEl = document.getElementById('status');
+    statusEl.textContent = message;
+    statusEl.className = `status ${type}`;
+    statusEl.style.display = 'block';
+      setTimeout(() => {
+        if (statusEl.textContent === message) {
+            statusEl.style.display = 'none';
+        }
+    }, 5000);
+}
+
+function updateCopyButtonState() {
+    chrome.storage.local.get('orderData', (result) => {
+        const orderData = result.orderData || {};
+        let totalProducts = 0;
+        Object.values(orderData).forEach(storeData => {
+            if (typeof storeData.totalProductsCount === 'number') {
+                totalProducts += storeData.totalProductsCount;
+            } else if (Array.isArray(storeData.orders)) {
+                totalProducts += storeData.orders.length;
+            }
+        });
+
+        const copyBtn = document.getElementById('copyToSheets');
+        const copyAndOpenBtn = document.getElementById('copyAndOpen');
+        
+        if (copyBtn) {
+            if (totalProducts > 0) {
+                copyBtn.textContent = `📋 Copy ${totalProducts} items for Google Sheets`;
+                copyBtn.disabled = false;
+            } else {
+                copyBtn.textContent = '📋 Copy for Google Sheets';
+                copyBtn.disabled = true;
+            }
+        }
+        if (copyAndOpenBtn) {
+            if (totalProducts > 0) {
+                copyAndOpenBtn.textContent = `📊 Copy ${totalProducts} & Open Sheets`;
+                copyAndOpenBtn.disabled = false;
+            } else {
+                copyAndOpenBtn.textContent = '📊 Copy & Open Google Sheets';
+                copyAndOpenBtn.disabled = true;
+            }
+        }
+  });
+}
+
+async function exportToCsv() {
+    chrome.storage.local.get('orderData', (result) => {
+        const allOrders = [];
+        const orderData = result.orderData || {};
+        Object.values(orderData).forEach(storeData => {
+            if (storeData.orders) {
+                allOrders.push(...storeData.orders);
+            }
+        });
+
+        if (allOrders.length === 0) {
+            updateStatus('No orders to export.', 'info');
+      return;
+    }
+
+        const header = "Store\tOrder ID\tTracking Number\tProduct Name\tQuantity\tColor\tSize\n";
+        const tsv = allOrders.map(o => `${o.store_name}\t${o.order_id}\t${o.track_number}\t${o.product_name}\t${o.qty}\t${o.color || ''}\t${o.size || ''}`).join('\n');
+        const blob = new Blob([header + tsv], { type: 'text/tab-separated-values;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.setAttribute("href", url);
+        link.setAttribute("download", `orders_${new Date().toISOString().slice(0,10)}.tsv`);
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        updateStatus('Exported to CSV (TSV format).', 'success');
+    });
+}
+
+async function copyForAllStores(openSheets = false) {
+    const buttonToAnimate = openSheets ? document.getElementById('copyAndOpen') : document.getElementById('copyToSheets');
+    const originalText = buttonToAnimate.textContent;
+
+    chrome.storage.local.get('orderData', async (result) => {
+        const allOrders = [];
+        const orderData = result.orderData || {};
+        Object.values(orderData).forEach(storeData => {
+            if (storeData.orders) {
+                allOrders.push(...storeData.orders);
+            }
+        });
+
+        if (allOrders.length === 0) {
+            updateStatus('No orders to copy.', 'info');
+            return;
+        }
+
+        const tsv = allOrders.map(o => `${o.store_name || ''}\t${o.order_id || ''}\t${o.track_number || ''}\t${o.product_name || ''}\t${o.qty || ''}\t${o.color || ''}\t${o.size || ''}`).join('\n');
+        
+        try {
+            await navigator.clipboard.writeText(tsv);
+            updateStatus(`Copied ${allOrders.length} items!`, 'success');
+            
+            // --- VISUAL FEEDBACK ---
+            buttonToAnimate.textContent = '✓ Copied!';
+            buttonToAnimate.style.backgroundColor = '#28a745'; // Green
+            buttonToAnimate.style.color = 'white';
+
+            setTimeout(() => {
+                buttonToAnimate.textContent = originalText;
+                buttonToAnimate.style.backgroundColor = '';
+                buttonToAnimate.style.color = '';
+            }, 2000);
+            // --- END FEEDBACK ---
+
+            if(openSheets) {
+                chrome.tabs.create({ url: 'https://docs.google.com/spreadsheets/d/1w1QOzGWc_CNovlezuxyLta-h1kM3pgPXc_GoHYaOA98/edit#gid=0' });
+            }
+        } catch (err) {
+            updateStatus('Failed to copy.', 'error');
+        }
+    });
+}
+
+function copyForSheets() {
+    copyForAllStores(false);
+}
+
+function copyAndOpenSheets() {
+    copyForAllStores(true);
+}
+
+async function clearAllStoreData(confirmUser = true) {
+    const doClear = confirmUser ? confirm("Are you sure you want to clear ALL stored data for ALL stores?") : true;
+    if (doClear) {
+        // Also act as STOP for running tasks
+        chrome.runtime.sendMessage({ action: "stopPochtoyAutomation" });
+        await new Promise(resolve => chrome.storage.local.set({ stopAllParsers: true }, resolve));
+
+        await chrome.storage.local.remove(['orderData', 'progressState', 'automationState', 'parsingState']); // Clear automation state too
+        updateCopyButtonState();
+        updateStatus('All data cleared and parsing stopped.', 'success');
+        
+        // Also reset progress bars if they are visible
+        const multiProgress = document.getElementById('multiProgress');
+        if (multiProgress) {
+            multiProgress.style.display = 'none';
+        }
+        updateAutomationProgress({ isRunning: false, summary: null }); // Reset UI
+    }
+}
+
+
+// === NEW UPLOAD LOGIC ===
+
+async function uploadToSheets() {
+    const uploadBtn = document.getElementById('upload-btn');
+    const originalBtnText = uploadBtn.textContent;
+    uploadBtn.textContent = 'Uploading...';
+    uploadBtn.disabled = true;
+
+    let spreadsheetId = (document.getElementById('spreadsheet-id').value.trim()) || DEFAULT_SPREADSHEET_ID;
+    if (!spreadsheetId) {
+        alert("Please enter a Spreadsheet ID or URL first in the automation section.");
+        uploadBtn.textContent = originalBtnText;
+        uploadBtn.disabled = false;
+        return;
+    }
+    const match = spreadsheetId.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    if (match) {
+        spreadsheetId = match[1];
+    }
+
+    const sheetName = document.getElementById('sheet-name').value.trim();
+    if (!sheetName) {
+        alert("Please enter a Sheet Name.");
+        uploadBtn.textContent = originalBtnText;
+        uploadBtn.disabled = false;
+        return;
+    }
+
+    try {
+        const result = await new Promise(resolve => chrome.storage.local.get('orderData', resolve));
+        const orderData = result.orderData || {};
+        const allOrders = [];
+        Object.values(orderData).forEach(storeData => {
+            if (storeData.orders) {
+                allOrders.push(...storeData.orders);
+            }
+        });
+
+        if (allOrders.length === 0) {
+            updateStatus('No parsed data to upload.', 'info');
+            return;
+        }
+
+        // Format data for Sheets API: array of arrays
+        const values = allOrders.map(o => [
+            o.store_name || '',
+            o.order_id || '',
+            o.track_number || '',
+            o.product_name || '',
+            o.qty || '',
+            o.color || '',
+            o.size || ''
+        ]);
+
+        // Idempotency: read existing rows and skip duplicates (by Store, Order, Track, Product, Qty)
+        let existing = [];
+        try {
+            existing = await readSheetData(spreadsheetId, sheetName) || [];
+        } catch (e) {
+            console.warn('Could not read existing sheet for dedupe, will append all.', e);
+        }
+
+        const headerOffset = existing.length > 0 && existing[0].length > 1 && /store/i.test(existing[0][0] || '') ? 1 : 0;
+        const existingRows = existing.slice(headerOffset);
+        const existingKeys = new Set(
+            existingRows.map(r => [r[0]||'', r[1]||'', r[2]||'', r[3]||'', r[4]||''].join('\u0001'))
+        );
+        const newValues = values.filter(r => !existingKeys.has([r[0], r[1], r[2], r[3], r[4]].join('\u0001')));
+
+        if (newValues.length === 0) {
+            updateStatus('Nothing new to upload (all items already present).', 'info');
+            uploadBtn.textContent = originalBtnText;
+            uploadBtn.disabled = false;
+            return;
+        }
+
+        await writeDataToSheet(spreadsheetId, sheetName, newValues);
+
+        updateStatus(`✅ Uploaded ${newValues.length} new items (skipped ${values.length - newValues.length} duplicates).`, 'success');
+        uploadBtn.textContent = '✓ Uploaded!';
+        setTimeout(() => {
+            uploadBtn.textContent = originalBtnText;
+        }, 3000);
+
+    } catch (error) {
+        console.error("Upload failed:", error);
+        updateStatus(`Upload Error: ${error.message}`, 'error');
+        uploadBtn.textContent = 'Upload Failed!';
+    } finally {
+        uploadBtn.disabled = false;
+    }
+}
+
+// --- GOOGLE SHEETS SYNC LOGIC ---
+async function startSync() {
+    console.log("Starting sync with Google Sheets...");
+    let spreadsheetId = document.getElementById('spreadsheet-id').value.trim();
+    if (!spreadsheetId) {
+        alert("Please enter a Spreadsheet ID or URL.");
+        return;
+    }
+
+    const match = spreadsheetId.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    if (match) {
+        spreadsheetId = match[1];
+        console.log(`Extracted Spreadsheet ID from URL: ${spreadsheetId}`);
+    }
+
+    // read toggles
+    const skipProcessed = document.getElementById('skip-processed').checked;
+    const colorProcessed = document.getElementById('color-processed').checked;
+    const limitRows = document.getElementById('limit-rows').checked;
+
+    try {
+        updateStatus('Reading Google Sheet...', 'info');
+        const sheetData = await readSheetData(spreadsheetId, "Лист1");
+        console.log("Data from Google Sheet:", sheetData);
+        if (sheetData && sheetData.length > 0) {
+            updateStatus(`Read ${sheetData.length - 1} rows. Starting automation...`, 'success');
+            
+            chrome.runtime.sendMessage({
+                action: "startPochtoyAutomation",
+                data: sheetData,
+                options: { spreadsheetId, sheetName: 'Лист1', skipProcessed, colorProcessed, limitRows }
+            }, (response) => {
+                if (chrome.runtime.lastError) {
+                    console.error("Error sending start message to background:", chrome.runtime.lastError.message);
+                    updateStatus('Failed to start automation. See popup console.', 'error');
+                } else {
+                    console.log("Background script acknowledged start.", response);
+                }
+            });
+
+        } else {
+            updateStatus("Could not find any data in the sheet.", 'error');
+        }
+    } catch (error) {
+        console.error("Failed to read Google Sheet:", error);
+        updateStatus(`Error: ${error.message}. Check popup console.`, 'error');
+    }
+}
+
+function resetMarks(){
+    const spreadsheetIdInput = document.getElementById('spreadsheet-id');
+    let spreadsheetId = (spreadsheetIdInput.value || '').trim();
+    if (!spreadsheetId) return alert('Enter Spreadsheet ID or URL first.');
+    const match = spreadsheetId.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    if (match) spreadsheetId = match[1];
+
+    chrome.runtime.sendMessage({ action: 'resetSheetMarks', options: { spreadsheetId, sheetName: 'Лист1' }}, (res)=>{
+        if (chrome.runtime.lastError) {
+            console.error('Reset marks error:', chrome.runtime.lastError.message);
+            updateStatus('Failed to reset marks.', 'error');
+        } else {
+            updateStatus('Marks reset completed.', 'success');
+        }
+    });
+}
+
+// --- PROGRESS BAR LOGIC ---
+
+// --- Listener for all messages from background scripts ---
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.action === 'updatePopup') {
+        updateCopyButtonState();
+    } else if (request.action === 'progress') {
+        updateStoreProgress(request.store, request.current, request.total, request.status, request.found);
+    } else if (request.action === 'automationProgress') {
+        updateAutomationProgress(request.data);
+    } else if (request.action === 'allStoresCompleted') {
+         updateStatus('🚀 Все магазины обработаны! Автозагрузка в Google Sheets...', 'info');
+    } else if (request.action === 'uploadComplete') {
+        updateStatus(request.message, request.status);
+    } else if (request.action === 'complete') {
+        // Aggregate summary for all stores
+        chrome.storage.local.get('orderData', (result) => {
+            const orderData = result.orderData || {};
+            const ebay = orderData['eBay']?.orders?.length || 0;
+            const iherb = orderData['iHerb']?.orders?.length || 0;
+            const amazon = orderData['Amazon']?.orders?.length || 0;
+            const total = ebay + iherb + amazon;
+            updateStatus(`Готово. eBay: ${ebay}, iHerb: ${iherb}, Amazon: ${amazon}. Всего: ${total}`, 'success');
+            const copyBtn = document.getElementById('copyToSheets');
+            if (copyBtn) copyBtn.textContent = `📋 Copy ${total} items for Google Sheets`;
+        });
+    }
+});
+
+function updateStoreProgress(storeName, current, total, status, found) {
+  const storeKey = storeName.toLowerCase();
+  const multiProgress = document.getElementById('multiProgress');
+  const progressBar = document.getElementById(`${storeKey}-progress-bar`);
+  const progressText = document.getElementById(`${storeKey}-progress-text`);
+
+  if (!progressBar || !progressText) return;
+
+    if (multiProgress) multiProgress.style.display = 'block';
+
+    const percent = total > 0 ? Math.min((current / total) * 100, 100) : 0;
+  progressBar.style.width = `${percent}%`;
+    const foundSuffix = (typeof found === 'number') ? ` — Найдено: ${found}` : '';
+    progressText.textContent = (status || `${current}/${total}`) + foundSuffix;
+    
+    if ((percent >= 100) || status === "Done ✅" || status === "Error" || (current >= total && total > 0)) {
+         progressBar.style.background = status === "Error" ? '#e53e3e' : '#28a745';
+         progressText.style.color = status === "Error" ? '#e53e3e' : '#28a745';
+  } else {
+         progressBar.style.background = '#667eea';
+         progressText.style.color = '#667eea';
+    }
+    // No storage write here - background handles it
+}
+
+function restoreProgressState() {
+    chrome.storage.local.get(['progressState'], (result) => {
+        if (!result.progressState) return;
+
+        const progressState = result.progressState;
+        let hasActiveProgress = false;
+
+        // Correct store name mapping
+        const storeNameMap = {
+            'ebay': 'Ebay',
+            'iherb': 'iHerb',
+            'amazon': 'Amazon'
+        };
+
+        ['ebay', 'iherb', 'amazon'].forEach(storeKey => {
+            const state = progressState[storeKey];
+            // Keep report visible until Clear Data
+            if (!state) return;
+
+            hasActiveProgress = true;
+            const storeName = storeNameMap[storeKey];
+            updateStoreProgress(storeName, state.current, state.total, state.status, state.found);
+        });
+
+        const multiProgress = document.getElementById('multiProgress');
+        if (hasActiveProgress && multiProgress) {
+            multiProgress.style.display = 'block';
+        }
+    });
+}
+
+// --- AUTOMATION UI LOGIC ---
+
+function stopSync() {
+    chrome.runtime.sendMessage({ action: "stopPochtoyAutomation" });
+}
+
+function restoreAutomationState() {
+    chrome.storage.local.get('automationState', (result) => {
+        if (result.automationState) {
+            updateAutomationProgress(result.automationState);
+        }
+    });
+}
+
+function updateAutomationProgress(state) {
+    const { isRunning, current, total, currentTask, summary, found } = state;
+    
+    const progressSection = document.getElementById('automation-progress-section');
+    const startBtn = document.getElementById('start-sync-btn');
+    const progressBar = document.getElementById('automation-progress-bar');
+    const progressText = document.getElementById('automation-progress-text');
+    const currentTaskEl = document.getElementById('automation-current-task');
+    const progressLabelEl = document.getElementById('automation-progress-label');
+
+    // Always show section during run or when summary exists
+    if (isRunning || summary) {
+        progressSection.style.display = 'block';
+        startBtn.style.display = 'none';
+    }
+
+    if (!isRunning && !summary) { // Stopped or cleared explicitly
+        progressSection.style.display = 'none';
+        startBtn.style.display = 'block';
+        return;
+    }
+
+    if (summary) { // Final report (persistent)
+        progressLabelEl.textContent = `Завершено: ${summary.success} найдено, ${summary.failure} не найдено.`;
+        currentTaskEl.textContent = `(Всего: ${summary.total})`;
+        progressText.textContent = '';
+        progressBar.style.width = '100%';
+        progressBar.style.backgroundColor = summary.failure > 0 ? '#f6ad55' : '#48bb78';
+        return; // keep summary visible
+    }
+
+    // In progress (instant feedback)
+    const percent = total > 0 ? Math.min((current / total) * 100, 100) : 0;
+    progressBar.style.width = `${percent}%`;
+    const foundSuffix = typeof found === 'number' ? ` — Найдено: ${found}` : '';
+    progressText.textContent = (total > 0 ? `${current}/${total}` : '') + foundSuffix;
+    progressLabelEl.textContent = total > 0 ? 'Выполняется...' : 'Подготовка...';
+    progressBar.style.backgroundColor = '#28a745';
+    currentTaskEl.textContent = currentTask ? `Трек: ${currentTask.trackNumber}` : 'Подготовка...';
+}
