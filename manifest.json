@@ -1,15 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Pochtoy Parsing",
-  "version": "6.10.17",
+  "version": "7.3.0",
   "description": "🇧🇾 Parse orders from eBay, iHerb, Amazon and export to Google Sheets",
   "permissions": ["storage", "identity", "tabs", "scripting"],
   "host_permissions": [
     "https://secure.iherb.com/*",
     "https://www.ebay.com/*",
     "https://www.amazon.com/*",
-    "https://www.pochtoy.com/*",
-    "https://api.telegram.org/*"
+    "https://www.pochtoy.com/*"
   ],
   "oauth2": {
     "client_id": "294811721052-4fkb0f5cea2qsek0cfm46jq6i7n3r25t.apps.googleusercontent.com",
@@ -52,7 +51,6 @@
     }
   ],
   "background": {
-    "service_worker": "background.js",
-    "type": "module"
+    "service_worker": "background.js"
   }
 }

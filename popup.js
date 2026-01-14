@@ -1,4 +1,4 @@
-import { readSheetData, writeDataToSheet } from './google-auth.js';
+import { readSheetData, writeDataToSheet, getAuthToken } from './google-auth.js';
 
 // Fixed default Google Sheet ID (Pochtoy sheet)
 const DEFAULT_SPREADSHEET_ID = '1w1QOzGWc_CNovlezuxyLta-h1kM3pgPXc_GoHYaOA98';
@@ -27,52 +27,102 @@ function initialize() {
     document.getElementById('upload-btn')?.addEventListener('click', uploadToSheets);
     
     // --- NEW: Automation Listeners ---
-    document.getElementById('start-sync-btn').addEventListener('click', startSync);
-    document.getElementById('stop-sync-btn').addEventListener('click', stopSync);
+    document.getElementById('start-sync-btn')?.addEventListener('click', startSync);
+    document.getElementById('stop-sync-btn')?.addEventListener('click', stopSync);
 
     const pagesToParseInput = document.getElementById('pagesToParse');
-    pagesToParseInput.addEventListener('change', (event) => {
-        chrome.storage.local.set({ savedPagesToParse: event.target.value });
-    });
+    if (pagesToParseInput) {
+        pagesToParseInput.addEventListener('change', (event) => {
+            chrome.storage.local.set({ savedPagesToParse: event.target.value });
+        });
+    }
 
-    // New controls
-    document.getElementById('skip-processed').addEventListener('change', (e)=>{
+    // New controls (with null checks)
+    document.getElementById('skip-processed')?.addEventListener('change', (e)=>{
         chrome.storage.local.set({ skipProcessed: e.target.checked });
     });
-    document.getElementById('color-processed').addEventListener('change', (e)=>{
+    document.getElementById('color-processed')?.addEventListener('change', (e)=>{
         chrome.storage.local.set({ colorProcessed: e.target.checked });
     });
-    document.getElementById('limit-rows').addEventListener('change', (e)=>{
+    document.getElementById('limit-rows')?.addEventListener('change', (e)=>{
         chrome.storage.local.set({ limitRows: e.target.checked });
     });
-    document.getElementById('chain-pochtoy').addEventListener('change', (e)=>{
+    document.getElementById('chain-pochtoy')?.addEventListener('change', (e)=>{
         chrome.storage.local.set({ chainPochtoy: e.target.checked });
     });
-    document.getElementById('save-tg-settings').addEventListener('click', () => {
-        const token = document.getElementById('tg-bot-token').value.trim();
-        const chatId = document.getElementById('tg-chat-id').value.trim();
+    document.getElementById('save-tg-settings')?.addEventListener('click', () => {
+        const token = document.getElementById('tg-bot-token')?.value.trim();
+        const chatId = document.getElementById('tg-chat-id')?.value.trim();
         chrome.storage.local.set({ tgBotToken: token, tgChatId: chatId }, () => {
             const btn = document.getElementById('save-tg-settings');
-            btn.textContent = '✓';
-            setTimeout(() => btn.textContent = '💾', 1000);
+            if (btn) {
+                btn.textContent = '✓';
+                setTimeout(() => btn.textContent = '💾', 1000);
+            }
             // Notify background to reload settings
             chrome.runtime.sendMessage({ action: 'reloadTgSettings' });
         });
     });
 
-    document.getElementById('reset-marks-btn').addEventListener('click', resetMarks);
+    document.getElementById('reset-marks-btn')?.addEventListener('click', resetMarks);
+
+    // --- NEW: Financial Mode Logic ---
+    const modeRadios = document.getElementsByName('parseMode');
+    const testParseBtn = document.getElementById('testParseFinancial');
+
+    if (testParseBtn) {
+        function updateModeUI(mode) {
+            if (mode === 'financial') {
+                testParseBtn.style.display = 'block';
+            } else {
+                testParseBtn.style.display = 'none';
+            }
+        }
+
+        Array.from(modeRadios).forEach(radio => {
+            radio.addEventListener('change', (e) => {
+                const mode = e.target.value;
+                chrome.storage.local.set({ parseMode: mode });
+                updateModeUI(mode);
+            });
+        });
+
+        testParseBtn.addEventListener('click', () => {
+            // Trigger Financial Test Parse for Amazon (defaulting to Amazon for now as it's the most complex)
+            const store = stores.find(s => s.name === 'Amazon');
+            if (store) {
+                 parseStore(store, { isTest: true, pages: 3 });
+            }
+        });
+    }
 
     // Restore saved toggles and default spreadsheet
-    chrome.storage.local.get(['skipProcessed','colorProcessed','limitRows','chainPochtoy','savedPagesToParse','spreadsheetId','sheetName','tgBotToken','tgChatId'], (res)=>{
-        if (typeof res.skipProcessed === 'boolean') document.getElementById('skip-processed').checked = res.skipProcessed;
-        // default true
-        document.getElementById('color-processed').checked = (typeof res.colorProcessed === 'boolean') ? res.colorProcessed : true;
-        document.getElementById('limit-rows').checked = (typeof res.limitRows === 'boolean') ? res.limitRows : true;
-        document.getElementById('chain-pochtoy').checked = (typeof res.chainPochtoy === 'boolean') ? res.chainPochtoy : false;
+    chrome.storage.local.get(['skipProcessed','colorProcessed','limitRows','chainPochtoy','savedPagesToParse','spreadsheetId','sheetName','tgBotToken','tgChatId', 'parseMode'], (res)=>{
+        if (res.parseMode && testParseBtn) {
+            const radio = document.querySelector(`input[name="parseMode"][value="${res.parseMode}"]`);
+            if (radio) radio.checked = true;
+            // updateModeUI is inside if(testParseBtn) block, skip if button doesn't exist
+        }
         
-        if (res.tgBotToken) document.getElementById('tg-bot-token').value = res.tgBotToken;
-        if (res.tgChatId) document.getElementById('tg-chat-id').value = res.tgChatId;
-        if (res.savedPagesToParse) pagesToParseInput.value = res.savedPagesToParse;
+        const skipProcessedEl = document.getElementById('skip-processed');
+        if (skipProcessedEl && typeof res.skipProcessed === 'boolean') skipProcessedEl.checked = res.skipProcessed;
+
+        const colorProcessedEl = document.getElementById('color-processed');
+        if (colorProcessedEl) colorProcessedEl.checked = (typeof res.colorProcessed === 'boolean') ? res.colorProcessed : true;
+
+        const limitRowsEl = document.getElementById('limit-rows');
+        if (limitRowsEl) limitRowsEl.checked = (typeof res.limitRows === 'boolean') ? res.limitRows : true;
+
+        const chainPochtoyEl = document.getElementById('chain-pochtoy');
+        if (chainPochtoyEl) chainPochtoyEl.checked = (typeof res.chainPochtoy === 'boolean') ? res.chainPochtoy : false;
+        
+        const tgTokenEl = document.getElementById('tg-bot-token');
+        if (res.tgBotToken && tgTokenEl) tgTokenEl.value = res.tgBotToken;
+
+        const tgChatEl = document.getElementById('tg-chat-id');
+        if (res.tgChatId && tgChatEl) tgChatEl.value = res.tgChatId;
+
+        if (res.savedPagesToParse && pagesToParseInput) pagesToParseInput.value = res.savedPagesToParse;
 
         // Restore Spreadsheet ID (or use hardcoded default)
         const ssInput = document.getElementById('spreadsheet-id');
@@ -145,12 +195,17 @@ function urlMatchesAnyPattern(url, patterns) {
     });
 }
 
-async function parseStore(store) {
+async function parseStore(store, overrides = {}) {
     const button = document.getElementById(store.id);
-    button.classList.add('loading');
-    button.disabled = true;
+    if(button) {
+        button.classList.add('loading');
+        button.disabled = true;
+    }
 
     try {
+        // Get current mode
+        const mode = document.querySelector('input[name="parseMode"]:checked')?.value || 'warehouse';
+
         // Clear any previous stop flag when we explicitly start parsing
         await new Promise(resolve => chrome.storage.local.set({ stopAllParsers: false }, resolve));
 
@@ -179,21 +234,27 @@ async function parseStore(store) {
         // Wait a moment for the page to be ready, especially if we just created/switched
         await new Promise(resolve => setTimeout(resolve, 1000));
         
-        console.log(`Sending parse message to ${store.name} on tab ${tabToUse.id}`);
+        console.log(`Sending parse message to ${store.name} on tab ${tabToUse.id} (Mode: ${mode})`);
+        
+        const options = { 
+            pages: (store.name === 'Amazon') ? (parseInt(document.getElementById('pagesToParse')?.value, 10) || 30) : undefined,
+            mode: mode,
+            ...overrides
+        };
+
         chrome.tabs.sendMessage(tabToUse.id, { 
             action: store.action,
-            // Pass pagesToParse value in case it's Amazon
-            options: { 
-                pages: (store.name === 'Amazon') ? (parseInt(document.getElementById('pagesToParse')?.value, 10) || 10) : undefined
-            }
+            options: options
         });
 
     } catch (error) {
         console.error(`Error parsing ${store.name}:`, error);
         updateStatus(`Error with ${store.name}: ${error.message}`, 'error');
     } finally {
-        button.classList.remove('loading');
-        button.disabled = false;
+        if(button) {
+            button.classList.remove('loading');
+            button.disabled = false;
+        }
     }
 }
 
@@ -241,7 +302,7 @@ async function parseAllStores() {
                 // Fire and forget: send the message but don't wait for the long parsing process to finish
                 chrome.tabs.sendMessage(tab.id, { 
                     action: store.action,
-                    options: store.name === 'Amazon' ? { pages: (parseInt(document.getElementById('pagesToParse')?.value, 10) || 10) } : undefined
+                    options: store.name === 'Amazon' ? { pages: (parseInt(document.getElementById('pagesToParse')?.value, 10) || 30) } : undefined
                 });
                 console.log(`✅ Sent parse command to ${store.name} (Tab ID: ${tab.id})`);
             } catch (error) {
@@ -464,7 +525,7 @@ async function uploadToSheets() {
             o.size || ''
         ]);
 
-        // Idempotency: read existing rows and skip duplicates (by Store, Order, Track, Product, Qty)
+        // Idempotency: read existing rows, update qty if changed, skip exact duplicates
         let existing = [];
         try {
             existing = await readSheetData(spreadsheetId, sheetName) || [];
@@ -474,21 +535,67 @@ async function uploadToSheets() {
 
         const headerOffset = existing.length > 0 && existing[0].length > 1 && /store/i.test(existing[0][0] || '') ? 1 : 0;
         const existingRows = existing.slice(headerOffset);
-        const existingKeys = new Set(
-            existingRows.map(r => [r[0]||'', r[1]||'', r[2]||'', r[3]||'', r[4]||''].join('\u0001'))
-        );
-        const newValues = values.filter(r => !existingKeys.has([r[0], r[1], r[2], r[3], r[4]].join('\u0001')));
+        
+        // Key WITHOUT qty: store + order + track + product
+        const existingMap = new Map();
+        existingRows.forEach((r, idx) => {
+            const key = [r[0]||'', r[1]||'', r[2]||'', r[3]||''].join('\u0001');
+            const existingQty = r[4] || '1';
+            existingMap.set(key, { rowIndex: idx + headerOffset + 1, qty: existingQty });
+        });
+        
+        const newValues = [];
+        const rowsToUpdate = [];
+        
+        for (const r of values) {
+            const key = [r[0], r[1], r[2], r[3]].join('\u0001');
+            const newQty = r[4] || '1';
+            
+            if (existingMap.has(key)) {
+                const existing = existingMap.get(key);
+                if (existing.qty !== newQty) {
+                    rowsToUpdate.push({ row: existing.rowIndex, qty: newQty }); // rowIndex already 1-based
+                }
+            } else {
+                newValues.push(r);
+            }
+        }
 
-        if (newValues.length === 0) {
+        // Update existing rows with new qty
+        if (rowsToUpdate.length > 0) {
+            console.log(`📝 Updating ${rowsToUpdate.length} rows with new qty...`);
+            const authToken = await getAuthToken(true);
+            const updateData = rowsToUpdate.map(u => ({
+                range: `${sheetName}!E${u.row}`,
+                values: [[u.qty]]
+            }));
+            
+            await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchUpdate`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${authToken}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ valueInputOption: 'USER_ENTERED', data: updateData })
+            });
+        }
+
+        if (newValues.length === 0 && rowsToUpdate.length === 0) {
             updateStatus('Nothing new to upload (all items already present).', 'info');
             uploadBtn.textContent = originalBtnText;
+            uploadBtn.disabled = false;
+            return;
+        }
+        
+        if (newValues.length === 0) {
+            updateStatus(`✅ Updated qty in ${rowsToUpdate.length} rows.`, 'success');
+            uploadBtn.textContent = '✓ Updated!';
+            setTimeout(() => { uploadBtn.textContent = originalBtnText; }, 3000);
             uploadBtn.disabled = false;
             return;
         }
 
         await writeDataToSheet(spreadsheetId, sheetName, newValues);
 
-        updateStatus(`✅ Uploaded ${newValues.length} new items (skipped ${values.length - newValues.length} duplicates).`, 'success');
+        const updatedMsg = rowsToUpdate.length > 0 ? `, updated qty in ${rowsToUpdate.length}` : '';
+        updateStatus(`✅ Uploaded ${newValues.length} new items${updatedMsg}.`, 'success');
         uploadBtn.textContent = '✓ Uploaded!';
         setTimeout(() => {
             uploadBtn.textContent = originalBtnText;
@@ -573,9 +680,12 @@ function resetMarks(){
 
 // --- Listener for all messages from background scripts ---
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    console.log('📨 POPUP received message:', request.action, request);
+
     if (request.action === 'updatePopup') {
         updateCopyButtonState();
     } else if (request.action === 'progress') {
+        console.log('📊 Progress update:', request.store, request.current, '/', request.total, request.status);
         updateStoreProgress(request.store, request.current, request.total, request.status, request.found);
     } else if (request.action === 'automationProgress') {
         updateAutomationProgress(request.data);
@@ -653,6 +763,30 @@ function restoreProgressState() {
         }
     });
 }
+
+// REAL-TIME PROGRESS POLLING (check storage every second)
+let progressPollingInterval = null;
+
+function startProgressPolling() {
+    if (progressPollingInterval) return; // Already running
+
+    console.log('🔄 Starting real-time progress polling...');
+
+    progressPollingInterval = setInterval(() => {
+        restoreProgressState(); // Read from storage and update UI
+    }, 1000); // Poll every 1 second
+}
+
+function stopProgressPolling() {
+    if (progressPollingInterval) {
+        clearInterval(progressPollingInterval);
+        progressPollingInterval = null;
+        console.log('⏹️ Stopped progress polling');
+    }
+}
+
+// Start polling when popup opens
+startProgressPolling();
 
 // --- AUTOMATION UI LOGIC ---
 

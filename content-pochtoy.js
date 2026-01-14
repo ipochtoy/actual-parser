@@ -45,6 +45,33 @@ if (typeof window.pochtoyAutomationLoaded === 'undefined') {
         }
     }
 
+    // Normalize tracking number: remove 4871 prefix if present
+    function normalizeTrackingNumber(track) {
+        const trimmed = track.trim();
+        // If starts with 4871, return both versions (with and without prefix)
+        if (trimmed.startsWith('4871') && trimmed.length > 4) {
+            return {
+                original: trimmed,
+                withoutPrefix: trimmed.substring(4),
+                withPrefix: trimmed
+            };
+        }
+        return {
+            original: trimmed,
+            withoutPrefix: trimmed,
+            withPrefix: '4871' + trimmed
+        };
+    }
+
+    // Check if two tracking numbers match (handling 4871 prefix)
+    function trackingNumbersMatch(track1, track2) {
+        const norm1 = normalizeTrackingNumber(track1);
+        const norm2 = normalizeTrackingNumber(track2);
+        
+        // Always compare withoutPrefix versions - this handles 4871 prefix correctly
+        return norm1.withoutPrefix === norm2.withoutPrefix;
+    }
+
     async function findAndFill(task) {
         if (await shouldStop()) {
             console.log('🛑 Stopped before task start');
@@ -54,16 +81,49 @@ if (typeof window.pochtoyAutomationLoaded === 'undefined') {
         console.log(`--- Starting task for track: ${trackNumber} ---`);
 
         try {
-            const inputs = document.querySelectorAll('input.shop-tracking');
+            // Try multiple selectors to find tracking input fields
+            let inputs = document.querySelectorAll('input.shop-tracking');
+            if (inputs.length === 0) {
+                // Fallback: try other possible selectors
+                inputs = document.querySelectorAll('input[type="text"][value*="4871"], input[type="text"][value*="940"], input[value*="4871"], input[value*="940"]');
+                console.log(`⚠️ No inputs with "shop-tracking" class, trying fallback selectors: found ${inputs.length}`);
+            }
             let targetInput = null;
+            const normalized = normalizeTrackingNumber(trackNumber);
+            console.log(`🔍 Looking for track: "${trackNumber}" (normalized: "${normalized.withoutPrefix}" or "${normalized.withPrefix}")`);
+            console.log(`📋 Found ${inputs.length} input fields to check`);
+            
             for (const input of inputs) {
-                if (input.value.trim() === trackNumber.trim()) {
+                const inputValue = input.value.trim();
+                const inputPlaceholder = (input.placeholder || '').trim();
+                const inputTitle = (input.title || '').trim();
+                
+                console.log(`  Checking input: value="${inputValue}", placeholder="${inputPlaceholder}", title="${inputTitle}"`);
+                
+                // Check value, placeholder, and title
+                if (trackingNumbersMatch(trackNumber, inputValue) || 
+                    (inputPlaceholder && trackingNumbersMatch(trackNumber, inputPlaceholder)) ||
+                    (inputTitle && trackingNumbersMatch(trackNumber, inputTitle))) {
                     targetInput = input;
+                    console.log(`✅ Found matching input: "${inputValue}" matches "${trackNumber}"`);
                     break;
+                } else {
+                    const norm1 = normalizeTrackingNumber(trackNumber);
+                    const norm2 = normalizeTrackingNumber(inputValue);
+                    console.log(`  ❌ No match: "${norm1.withoutPrefix}" vs "${norm2.withoutPrefix}"`);
                 }
             }
 
-            if (!targetInput) throw new Error(`Input field with track number "${trackNumber}" not found.`);
+            if (!targetInput) {
+                // Try to find by searching in nearby text as fallback
+                console.log(`⚠️ Not found in inputs, trying fallback search...`);
+                const allText = document.body.innerText || '';
+                const searchPattern = new RegExp(`(4871)?${normalized.withoutPrefix.replace(/\d/g, '\\d')}`, 'g');
+                if (searchPattern.test(allText)) {
+                    console.log(`⚠️ Found track number in page text, but couldn't find input field`);
+                }
+                throw new Error(`Input field with track number "${trackNumber}" not found. Searched ${inputs.length} inputs.`);
+            }
             console.log("Found input field.");
 
             const packageContainer = targetInput.closest('article.unassigned-item'); 

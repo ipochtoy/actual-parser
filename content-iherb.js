@@ -75,7 +75,7 @@ function checkIfLoggedIn() {
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   console.log('📨 Message received:', request);
 
-  if (request.action === 'autoParse' || request.action === 'exportIherbOrders') {
+  if (request.action === 'autoParse' || request.action === 'exportIherbOrders' || request.action === 'parseIherb') {
     console.log('🚀 Manual parse triggered');
     exportOrders()
       .then(result => {
@@ -96,35 +96,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 });
 
-async function checkAndClickTryAgain() {
-    const buttons = Array.from(document.querySelectorAll('button, a'));
-    // Match "Try again" or "Try Again" exactly or contained
-    const tryAgainBtn = buttons.find(b => {
-        const text = b.textContent?.trim().toLowerCase() || '';
-        return text === 'try again' || text.includes('try again');
-    });
-    
-    if (tryAgainBtn) {
-        console.log('⚠️ Found "Try again" button. Clicking it and waiting for reload...');
-        tryAgainBtn.click();
-        // Wait for reload to happen or content to appear
-        await new Promise(resolve => setTimeout(resolve, 5000));
-        return true; 
-    }
-    return false;
-}
-
-async function slowProgressiveScroll(limit = 25) {
+async function slowProgressiveScroll(limit = 76) {
     console.log(`📜 Starting SLOW progressive scroll (limit: ${limit} orders)...`);
     console.log('⚠️  Scrolling slowly to avoid 429 errors - please wait!');
 
     // Send initial progress
     chrome?.runtime?.sendMessage?.({
-        action: 'progress',
-        store: 'iHerb',
-        current: 0,
-        total: limit,
-        status: 'Starting scroll...'
+        action: 'parsingProgress',
+        data: {
+            store: 'iHerb',
+            current: 0,
+            total: limit,
+            status: 'Starting scroll...'
+        }
     });
 
     let previousUniqueCount = 0;
@@ -177,11 +161,14 @@ async function slowProgressiveScroll(limit = 25) {
 
         // Send progress update
         chrome?.runtime?.sendMessage?.({
-            action: 'progress',
-            store: 'iHerb',
-            current: currentUniqueCount,
-            total: limit,
-            status: `Loading orders ${currentUniqueCount}/${limit}...`
+            action: 'parsingProgress',
+            data: {
+                store: 'iHerb',
+                current: currentUniqueCount,
+                total: limit,
+                status: `Loading orders ${currentUniqueCount}/${limit}...`,
+                found: currentUniqueCount
+            }
         });
 
         // Check if we reached the limit
@@ -360,10 +347,10 @@ function parseOrders() {
     }
 
     // STEP 2: For each order header, find its container and extract products
-    console.log('\n📦 STEP 2: Processing each order (limit: 25)...');
+    console.log('\n📦 STEP 2: Processing each order (limit: 76)...');
 
     const processedOrders = new Set();
-    const MAX_ORDERS = 25;
+    const MAX_ORDERS = 76;
 
     // Send initial processing progress
     chrome?.runtime?.sendMessage?.({
@@ -553,17 +540,19 @@ function parseOrders() {
     console.log(`  ✓ Products being exported: ${shippedOrders.length}`);
     console.log(`  ✓ Average products per order: ${(shippedOrders.length / (uniqueOrderIds.size || 1)).toFixed(1)}`);
 
-    // Send completion progress
+    // Send completion progress (with parsingProgress wrapper for background.js)
     chrome?.runtime?.sendMessage?.({
-        action: 'progress',
-        store: 'iHerb',
-        current: uniqueOrderIds.size,
-        total: uniqueOrderIds.size,
-        status: 'Done ✅', // Explicit 'Done ✅' for background.js to detect completion
-        found: shippedOrders ? shippedOrders.length : 0
+        action: 'parsingProgress',
+        data: {
+            store: 'iHerb',
+            current: uniqueOrderIds.size,
+            total: uniqueOrderIds.size,
+            status: 'Done ✅', // Match eBay/Amazon format for auto-upload trigger
+            found: shippedOrders.length
+        }
     });
 
-    if (!shippedOrders || shippedOrders.length === 0) {
+    if (shippedOrders.length === 0) {
         console.error('\n❌ NO SHIPPED ORDERS FOUND!');
         console.log('💡 All orders may be in "Fulfilling" status (no tracking yet)');
         console.log(`  Total orders found: ${orders.length}`);
@@ -679,6 +668,8 @@ async function saveOrdersWithDeduplication(newOrders, storeName) {
             chrome.storage.local.set({ orderData }, () => {
                 console.log(`💾 Storage updated: ${addedCount} new, ${updatedCount} updated, ${mergedOrders.length} total products`);
                 console.log(`📊 Unique orders: ${uniqueOrderIds.size}`);
+                // Notify popup to refresh UI (enables Copy buttons)
+                try { chrome.runtime.sendMessage({ action: 'updatePopup' }); } catch (_) {}
 
                 resolve({
                     addedCount,
@@ -696,16 +687,6 @@ async function exportOrders() {
         console.log('🚀 exportOrders() started');
         console.log('📍 URL check:', window.location.href);
         console.log('📍 Expected URL pattern: https://secure.iherb.com/myaccount/orders*');
-
-        // CHECK FOR "TRY AGAIN" BUTTON AND CLICK IT
-        const clickedTryAgain = await checkAndClickTryAgain();
-        if (clickedTryAgain) {
-             // If we clicked try again, the page is reloading. 
-             // We can't proceed immediately in this context usually, 
-             // but if it was an AJAX reload, we wait and proceed.
-             // If full reload, this script re-runs.
-             console.log('🔄 Page reloading after Try Again click...');
-        }
 
         // CHECK LOGIN FIRST
         if (!checkIfLoggedIn()) {

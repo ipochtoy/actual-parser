@@ -1,6 +1,94 @@
-import { readSheetData, writeDataToSheet } from './google-auth.js';
+// Background script for Pochtoy Parser - v6.10.5 (Service Worker Fix)
 
-// Background script for Pochtoy Parser - v6.10.4 (Debug Logs Added)
+// --- Google Auth Functions (inlined to avoid import issues) ---
+function getAuthToken(interactive) {
+    return new Promise((resolve, reject) => {
+        chrome.identity.getAuthToken({ interactive: interactive }, (token) => {
+            if (chrome.runtime.lastError) {
+                reject(chrome.runtime.lastError);
+            } else {
+                resolve(token);
+            }
+        });
+    });
+}
+
+async function removeToken(token) {
+    return new Promise(resolve => chrome.identity.removeCachedAuthToken({ token }, resolve));
+}
+
+async function readSheetData(spreadsheetId, sheetName) {
+    async function attemptRead(interactive) {
+        const token = await getAuthToken(interactive);
+        if (!token) throw new Error("Authorization failed. No token received.");
+
+        const range = `${sheetName}!A:Z`;
+        const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${range}`;
+
+        const response = await fetch(url, {
+            headers: { 'Authorization': `Bearer ${token}` },
+        });
+
+        if (!response.ok) {
+            await removeToken(token);
+            const text = await response.text().catch(() => '');
+            throw new Error(`Google Sheets API status ${response.status}: ${text || 'no body'}`);
+        }
+        const data = await response.json();
+        return data.values;
+    }
+
+    try {
+        return await attemptRead(true);
+    } catch (err) {
+        console.warn('First read attempt failed, retrying with fresh auth...', err);
+        try {
+            return await attemptRead(true);
+        } catch (finalErr) {
+            console.error("Error reading Google Sheet:", finalErr);
+            throw finalErr;
+        }
+    }
+}
+
+async function writeDataToSheet(spreadsheetId, sheetName, values) {
+    const authToken = await getAuthToken(true);
+    if (!authToken) {
+        throw new Error("Authentication failed. Cannot write to sheet.");
+    }
+
+    const range = `${sheetName}!A1`;
+    const valueInputOption = 'USER_ENTERED';
+    const insertDataOption = 'INSERT_ROWS';
+
+    const body = { values };
+
+    try {
+        const response = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${range}:append?valueInputOption=${valueInputOption}&insertDataOption=${insertDataOption}`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(body)
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            console.error('Google Sheets API write error response:', errorData);
+            await removeToken(authToken);
+            throw new Error(`Google Sheets API Error: ${errorData?.error?.message || response.status}`);
+        }
+
+        const result = await response.json();
+        console.log('Successfully wrote data to sheet:', result);
+        return result;
+
+    } catch (error) {
+        console.error('Error writing data to sheet:', error);
+        throw error;
+    }
+}
 
 // --- State Variables ---
 let automationQueue = [];
@@ -21,8 +109,16 @@ let tgPollingInterval = null;
 
 // Initialize cache on startup
 let cachedProgressState = {};
-chrome.storage.local.get(['progressState', 'tgBotToken', 'tgChatId', 'lastUpdateId'], (result) => {
+chrome.storage.local.get(['progressState', 'tgBotToken', 'tgChatId', 'lastUpdateId', 'parsingState'], (result) => {
     cachedProgressState = result.progressState || {};
+
+    // RESTORE PARSING STATE (critical for Service Worker that goes inactive!)
+    if (result.parsingState) {
+        isParsingAllStores = result.parsingState.isParsingAllStores || false;
+        storesCompleted = result.parsingState.storesCompleted || { ebay: false, iherb: false, amazon: false };
+        console.log('🔄 Restored parsing state:', { isParsingAllStores, storesCompleted });
+    }
+
     // Prefer saved token if exists and not empty, otherwise use default
     if (result.tgBotToken && result.tgBotToken.length > 10) {
         tgBotToken = result.tgBotToken;
@@ -30,18 +126,18 @@ chrome.storage.local.get(['progressState', 'tgBotToken', 'tgChatId', 'lastUpdate
         // Ensure default is saved if nothing was there
         chrome.storage.local.set({ tgBotToken });
     }
-    
+
     tgChatId = result.tgChatId;
     lastUpdateId = result.lastUpdateId || 0;
-    
+
     console.log('🚀 Background Script Init');
-    console.log('📱 Telegram Config:', { 
-        hasToken: !!tgBotToken, 
+    console.log('📱 Telegram Config:', {
+        hasToken: !!tgBotToken,
         tokenPrefix: tgBotToken ? tgBotToken.substring(0, 10) + '...' : 'N/A',
-        chatId: tgChatId, 
-        lastUpdateId 
+        chatId: tgChatId,
+        lastUpdateId
     });
-    
+
     // Start Telegram polling if configured
     if (tgBotToken) startTelegramPolling();
     else console.warn('⚠️ No Telegram Token - polling disabled');
@@ -52,6 +148,64 @@ let totalTasks = 0;
 let tasksStarted = 0;
 let successCount = 0;
 let failureCount = 0;
+
+// --- Progress Handler Function ---
+function handleProgressMessage(request) {
+    // Persist progress to storage so popup can restore it when reopened
+    const storeKey = request.store.toLowerCase();
+    console.log(`📊 [BACKGROUND] Progress from ${request.store}:`, request.current, '/', request.total, request.status);
+
+    // Update completion status
+    if (isParsingAllStores && (request.status === 'Done ✅' || request.status === 'Error')) {
+        // Update cache with found count BEFORE checking completion
+        cachedProgressState[storeKey] = {
+            current: request.current,
+            total: request.total,
+            status: request.status,
+            percent: 100,
+            found: request.found !== undefined ? request.found : (cachedProgressState[storeKey]?.found || 0),
+            timestamp: Date.now()
+        };
+        console.log(`💾 [BACKGROUND] Saving COMPLETE state for ${storeKey}:`, cachedProgressState[storeKey]);
+        chrome.storage.local.set({ progressState: cachedProgressState });
+
+        if (storeKey in storesCompleted) {
+            storesCompleted[storeKey] = true;
+
+            // Send completion message to Telegram
+            const count = request.found || 0;
+            const emoji = request.status === 'Error' ? '❌' : '✅';
+            sendTelegramMessage(`${emoji} ${storeKey.charAt(0).toUpperCase() + storeKey.slice(1)}: Готово (${count} заказов)`);
+
+            checkAllStoresCompleted();
+        }
+    }
+
+    // Update cache synchronously (if not already updated above)
+    if (!(isParsingAllStores && (request.status === 'Done ✅' || request.status === 'Error'))) {
+        cachedProgressState[storeKey] = {
+            current: request.current,
+            total: request.total,
+            status: request.status,
+            percent: request.total > 0 ? Math.min((request.current / request.total) * 100, 100) : 0,
+            found: request.found,
+            timestamp: Date.now()
+        };
+
+        console.log(`💾 [BACKGROUND] Saving progress state for ${storeKey}:`, cachedProgressState[storeKey]);
+
+        // Save parsing state if needed (redundant but safe)
+        if (isParsingAllStores) saveParsingState();
+
+        // Write entire cache to storage
+        chrome.storage.local.set({ progressState: cachedProgressState });
+    }
+
+    // FIX: Forward progress message to popup for real-time updates!
+    chrome.runtime.sendMessage(request).catch(() => {
+        // Popup might be closed, ignore error
+    });
+}
 
 // --- Message Listener ---
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -84,60 +238,34 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         isParsingAllStores = true;
         storesCompleted = { ebay: false, iherb: false, amazon: false };
         saveParsingState();
-        
+
         // Reset progress cache
-        cachedProgressState = {}; 
+        cachedProgressState = {};
         chrome.storage.local.set({ progressState: cachedProgressState });
-        
+
         sendTelegramMessage(`🚀 Запущен парсинг всех магазинов (eBay, iHerb, Amazon)...`);
         sendResponse({status: "started"});
-    } else if (request.action === "progress") {
-        // Persist progress to storage so popup can restore it when reopened
-        const storeKey = request.store.toLowerCase();
-        
-        // Update completion status
-        if (isParsingAllStores && (request.status === 'Done ✅' || request.status === 'Error')) {
-            // Update cache with found count BEFORE checking completion
-            cachedProgressState[storeKey] = {
-                current: request.current,
-                total: request.total,
-                status: request.status,
-                percent: 100,
-                found: request.found !== undefined ? request.found : (cachedProgressState[storeKey]?.found || 0),
-                timestamp: Date.now()
-            };
-            chrome.storage.local.set({ progressState: cachedProgressState });
+    } else if (request.action === "parsingProgress") {
+        // Handle parsingProgress from content scripts (convert to progress format)
+        const progressData = request.data || {};
+        const progressMsg = {
+            action: 'progress',
+            store: progressData.store,
+            current: progressData.current,
+            total: progressData.total,
+            status: progressData.status,
+            found: progressData.found
+        };
 
-            if (storeKey in storesCompleted) {
-                storesCompleted[storeKey] = true;
-                
-                // Send completion message to Telegram
-                const count = request.found || 0;
-                const emoji = request.status === 'Error' ? '❌' : '✅';
-                sendTelegramMessage(`${emoji} ${storeKey.charAt(0).toUpperCase() + storeKey.slice(1)}: Готово (${count} заказов)`);
-                
-                checkAllStoresCompleted();
+        // Process it as progress message
+        chrome.runtime.sendMessage(progressMsg, () => {
+            // Handle progress internally
+            if (progressMsg.action === "progress") {
+                handleProgressMessage(progressMsg);
             }
-        }
-
-        // Update cache synchronously (if not already updated above)
-        if (!(isParsingAllStores && (request.status === 'Done ✅' || request.status === 'Error'))) {
-            cachedProgressState[storeKey] = {
-                current: request.current,
-                total: request.total,
-                status: request.status,
-                percent: request.total > 0 ? Math.min((request.current / request.total) * 100, 100) : 0,
-                found: request.found,
-                timestamp: Date.now()
-            };
-            
-            // Save parsing state if needed (redundant but safe)
-            if (isParsingAllStores) saveParsingState();
-            
-            // Write entire cache to storage
-            chrome.storage.local.set({ progressState: cachedProgressState });
-        }
-
+        });
+    } else if (request.action === "progress") {
+        handleProgressMessage(request);
     } else if (request.action === "reloadTgSettings") {
         chrome.storage.local.get(['tgBotToken', 'tgChatId'], (res) => {
             console.log('🔄 Reloading Telegram Settings from popup update:', res);
@@ -145,6 +273,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             tgChatId = res.tgChatId;
             if (tgBotToken) startTelegramPolling();
         });
+    } else if (request.action === "parserStarted") {
+        // Notify Telegram that parser actually started working
+        const storeEmoji = {
+            'eBay': '🛒',
+            'iHerb': '🌿',
+            'Amazon': '📦'
+        }[request.store] || '🔄';
+        sendTelegramMessage(`${storeEmoji} ${request.store}: Парсинг успешно начался!`);
+        console.log(`✅ ${request.store} parser started successfully`);
     }
     return true; // Keep channel open for async responses
 });
@@ -189,14 +326,17 @@ async function checkAllStoresCompleted() {
 async function uploadToSheets() {
     try {
         // Get settings from storage
-        const result = await chrome.storage.local.get(['spreadsheetId', 'sheetName', 'orderData', 'chainPochtoy', 'skipProcessed', 'colorProcessed', 'limitRows']);
+        const result = await chrome.storage.local.get(['spreadsheetId', 'sheetName', 'orderData', 'chainPochtoy', 'skipProcessed', 'colorProcessed', 'limitRows', 'parseMode']);
         let spreadsheetId = result.spreadsheetId || DEFAULT_SPREADSHEET_ID;
-        const sheetName = result.sheetName || 'Лист1';
+        const parseMode = result.parseMode || 'warehouse';
+        const sheetName = (parseMode === 'financial') ? 'Financial_Log' : (result.sheetName || 'Лист1');
         
-        // FORCE chainPochtoy to true if undefined
+        console.log(`📤 Uploading to Sheet: ${sheetName} (Mode: ${parseMode})`);
+
+        // Default chainPochtoy to false (disabled - using custom solution)
         if (result.chainPochtoy === undefined) {
-            console.log('🔗 chainPochtoy is undefined, defaulting to TRUE');
-            result.chainPochtoy = true;
+            console.log('🔗 chainPochtoy is undefined, defaulting to FALSE');
+            result.chainPochtoy = false;
         }
         console.log(`🔗 Chain Pochtoy flag: ${result.chainPochtoy}`);
         
@@ -218,27 +358,46 @@ async function uploadToSheets() {
             console.log('No parsed data to upload.');
             sendTelegramMessage(`ℹ️ Нет данных для загрузки.`);
             
-            // Always trigger chain if enabled, even if no new orders parsed
-            // because we might want to process existing rows in the sheet
-            if (result.chainPochtoy) {
+            // Always trigger chain if enabled (ONLY IN WAREHOUSE MODE)
+            if (parseMode === 'warehouse' && result.chainPochtoy) {
                  console.log('🔗 Chaining Pochtoy automation (no new data)...');
                  setTimeout(() => triggerPochtoyAutoStart(spreadsheetId, sheetName, result), 1500);
             }
             return;
         }
 
-        // Format data for Sheets API: array of arrays
-        const values = allOrders.map(o => [
-            o.store_name || '',
-            o.order_id || '',
-            o.track_number || '',
-            o.product_name || '',
-            o.qty || '',
-            o.color || '',
-            o.size || ''
-        ]);
+        // Format data for Sheets API
+        let values;
+        if (parseMode === 'financial') {
+            // Financial Mode: Expanded columns
+            // Header: Store, Order ID, Date, Total, Tax, Shipping, Items JSON, Debug Raw
+            values = allOrders.map(o => {
+                const f = o.financial || {};
+                return [
+                    o.store_name || '',
+                    o.order_id || '',
+                    new Date().toISOString().split('T')[0], // Date parsed (or real date if we extracted it)
+                    f.total_amount || o.total_amount || '',
+                    f.detected_tax || '',
+                    f.shipping || '',
+                    JSON.stringify(f), // Dump full object for debugging
+                    o.product_name || ''
+                ];
+            });
+        } else {
+            // Warehouse Mode: Standard columns
+            values = allOrders.map(o => [
+                o.store_name || '',
+                o.order_id || '',
+                o.track_number || '',
+                o.product_name || '',
+                o.qty || '',
+                o.color || '',
+                o.size || ''
+            ]);
+        }
 
-        // Idempotency: read existing rows and skip duplicates
+        // Idempotency: read existing rows, update qty if changed, skip exact duplicates
         let existing = [];
         try {
             existing = await readSheetData(spreadsheetId, sheetName) || [];
@@ -246,46 +405,98 @@ async function uploadToSheets() {
             console.warn('Could not read existing sheet for dedupe, will append all.', e);
         }
 
-        const headerOffset = existing.length > 0 && existing[0].length > 1 && /store/i.test(existing[0][0] || '') ? 1 : 0;
-        const existingRows = existing.slice(headerOffset);
-        const existingKeys = new Set(
-            existingRows.map(r => [r[0]||'', r[1]||'', r[2]||'', r[3]||'', r[4]||''].join('\u0001'))
-        );
-        const newValues = values.filter(r => !existingKeys.has([r[0], r[1], r[2], r[3], r[4]].join('\u0001')));
+        let newValues = [];
+        let rowsToUpdate = []; // {row: 1-based index, qty: new qty value}
+        
+        if (parseMode === 'financial') {
+             const existingKeys = new Set(existing.map(r => (r[0]||'') + '_' + (r[1]||'')));
+             newValues = values.filter(r => !existingKeys.has(r[0] + '_' + r[1]));
+        } else {
+             const headerOffset = existing.length > 0 && existing[0].length > 1 && /store/i.test(existing[0][0] || '') ? 1 : 0;
+             const existingRows = existing.slice(headerOffset);
+             
+             // Key WITHOUT qty: store + order + track + product
+             const existingMap = new Map();
+             existingRows.forEach((r, idx) => {
+                 const key = [r[0]||'', r[1]||'', r[2]||'', r[3]||''].join('\u0001');
+                 const existingQty = r[4] || '1';
+                 existingMap.set(key, { rowIndex: idx + headerOffset + 1, qty: existingQty }); // 1-based row in sheet
+             });
+             
+             for (const r of values) {
+                 const key = [r[0], r[1], r[2], r[3]].join('\u0001');
+                 const newQty = r[4] || '1';
+                 
+                 if (existingMap.has(key)) {
+                     const existing = existingMap.get(key);
+                     // Check if qty changed
+                     if (existing.qty !== newQty) {
+                         rowsToUpdate.push({ row: existing.rowIndex, qty: newQty }); // rowIndex already 1-based
+                         console.log(`📝 Will update row ${existing.rowIndex}: qty ${existing.qty} → ${newQty}`);
+                     }
+                     // Skip adding as new (it exists)
+                 } else {
+                     newValues.push(r);
+                 }
+             }
+        }
 
-        if (newValues.length === 0) {
+        // Update existing rows with new qty
+        if (rowsToUpdate.length > 0) {
+            console.log(`📝 Updating ${rowsToUpdate.length} rows with new qty...`);
+            const authToken = await getAuthToken(true);
+            const updateData = rowsToUpdate.map(u => ({
+                range: `${sheetName}!E${u.row}`,
+                values: [[u.qty]]
+            }));
+            
+            await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchUpdate`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${authToken}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ valueInputOption: 'USER_ENTERED', data: updateData })
+            });
+            console.log(`✅ Updated ${rowsToUpdate.length} qty values`);
+            sendTelegramMessage(`📝 Обновлено количество в ${rowsToUpdate.length} строках.`);
+        }
+
+        if (newValues.length === 0 && rowsToUpdate.length === 0) {
             console.log('Nothing new to upload.');
             chrome.runtime.sendMessage({ action: 'uploadComplete', status: 'info', message: 'Nothing new to upload (duplicates).' });
             sendTelegramMessage(`ℹ️ Дубликаты пропущены. Новых записей нет.`);
             
-            // Chain execution if enabled - KEY FIX: ensure this runs!
-            if (result.chainPochtoy) {
+            if (parseMode === 'warehouse' && result.chainPochtoy) {
                  console.log('🔗 Chaining Pochtoy automation (duplicates only)...');
                  setTimeout(() => triggerPochtoyAutoStart(spreadsheetId, sheetName, result), 1500);
-            } else {
-                 console.log('❌ Chaining DISABLED. Robot will not start.');
-                 sendTelegramMessage('ℹ️ Робот Pochtoy не запущен (авто-запуск выключен).');
+            }
+            return;
+        }
+        
+        if (newValues.length === 0) {
+            // Only updates, no new rows
+            chrome.runtime.sendMessage({ action: 'uploadComplete', status: 'success', message: `✅ Updated qty in ${rowsToUpdate.length} rows.` });
+            
+            if (parseMode === 'warehouse' && result.chainPochtoy) {
+                 console.log('🔗 Chaining Pochtoy automation...');
+                 setTimeout(() => triggerPochtoyAutoStart(spreadsheetId, sheetName, result), 2000);
             }
             return;
         }
 
         await writeDataToSheet(spreadsheetId, sheetName, newValues);
 
-        console.log(`✅ Uploaded ${newValues.length} new items.`);
+        console.log(`✅ Uploaded ${newValues.length} new items, updated ${rowsToUpdate.length} qty.`);
+        const updatedMsg = rowsToUpdate.length > 0 ? `, updated qty in ${rowsToUpdate.length}` : '';
         chrome.runtime.sendMessage({ 
             action: 'uploadComplete', 
             status: 'success', 
-            message: `✅ Uploaded ${newValues.length} new items (skipped ${values.length - newValues.length} duplicates).` 
+            message: `✅ Uploaded ${newValues.length} new items${updatedMsg}.` 
         });
-        sendTelegramMessage(`✅ Успешно загружено ${newValues.length} новых товаров.`);
+        sendTelegramMessage(`✅ Загружено ${newValues.length} новых${rowsToUpdate.length > 0 ? `, обновлено qty в ${rowsToUpdate.length}` : ''}.`);
 
-        // Chain execution if enabled
-        if (result.chainPochtoy) {
+        // Chain execution ONLY in warehouse mode
+        if (parseMode === 'warehouse' && result.chainPochtoy) {
              console.log('🔗 Chaining Pochtoy automation...');
              setTimeout(() => triggerPochtoyAutoStart(spreadsheetId, sheetName, result), 2000);
-        } else {
-             console.log('❌ Chaining DISABLED. Robot will not start.');
-             sendTelegramMessage('ℹ️ Робот Pochtoy не запущен (авто-запуск выключен).');
         }
 
     } catch (error) {
@@ -335,6 +546,17 @@ function resetProgress() {
     failureCount = 0;
 }
 
+// Normalize tracking number: remove 4871 prefix for grouping
+function normalizeTrackingForGrouping(track) {
+    if (!track) return null;
+    const trimmed = track.trim();
+    // Remove 4871 prefix if present
+    if (trimmed.startsWith('4871') && trimmed.length > 4) {
+        return trimmed.substring(4);
+    }
+    return trimmed;
+}
+
 // --- Core Automation Logic ---
 function startPochtoyAutomation(sheetData) {
     if (isAutomationRunning) return;
@@ -354,6 +576,7 @@ function startPochtoyAutomation(sheetData) {
 
     const groupedByTrack = new Map();
     const groupedRowIndices = new Map();
+    const originalTrackNumbers = new Map(); // Store original track number for each normalized key
 
     // sheet columns: 0 store, 1 order_id, 2 track, 3 product, 4 qty, 5 status (optional)
     for (let i = startIndex; i < sheetData.length; i++) {
@@ -370,19 +593,29 @@ function startPochtoyAutomation(sheetData) {
         if (automationOptions.skipProcessed && !automationOptions.limitRows && status.toUpperCase().startsWith('DONE')) continue;
         
         if (trackNumber && trackNumber.length > 5) { // Basic validation for track number
-            if (!groupedByTrack.has(trackNumber)) groupedByTrack.set(trackNumber, []);
-            groupedByTrack.get(trackNumber).push({
+            // Normalize for grouping (remove 4871 prefix)
+            const normalizedKey = normalizeTrackingForGrouping(trackNumber);
+            
+            if (!groupedByTrack.has(normalizedKey)) {
+                groupedByTrack.set(normalizedKey, []);
+                // Store first original track number for this group
+                originalTrackNumbers.set(normalizedKey, trackNumber);
+            }
+            groupedByTrack.get(normalizedKey).push({
                 store: storeName,
                 order_id: orderId,
                 product_name: row[3] || '',
                 qty: row[4] || '1'
             });
-            if (!groupedRowIndices.has(trackNumber)) groupedRowIndices.set(trackNumber, new Set());
-            groupedRowIndices.get(trackNumber).add(i+1); // 1-based row index in Sheets
+            if (!groupedRowIndices.has(normalizedKey)) groupedRowIndices.set(normalizedKey, new Set());
+            groupedRowIndices.get(normalizedKey).add(i+1); // 1-based row index in Sheets
         }
     }
 
-    for (const [trackNumber, items] of groupedByTrack.entries()) {
+    for (const [normalizedKey, items] of groupedByTrack.entries()) {
+        // Use original track number for searching (first one encountered)
+        const trackNumber = originalTrackNumbers.get(normalizedKey) || normalizedKey;
+        
         // Human-friendly header lines
         const validItems = items.filter(item => item.order_id && item.order_id.length > 0);
         const uniqueOrderIds = new Set(validItems.map(item => item.order_id));
@@ -417,7 +650,7 @@ function startPochtoyAutomation(sheetData) {
         });
 
         const note = headerLines.join('\n');
-        const rowIndices = Array.from(groupedRowIndices.get(trackNumber) || []);
+        const rowIndices = Array.from(groupedRowIndices.get(normalizedKey) || []);
         const hasWarning = uniqueOrderIds.size > 1;
         automationQueue.push({ trackNumber, note: note.trim(), rowIndices, hasWarning });
     }
@@ -674,6 +907,7 @@ async function launchParsersFromBackground() {
 
     for (const store of stores) {
         console.log(`🌐 Opening tab for ${store.key}...`);
+        sendTelegramMessage(`${store.emoji} ${store.key.toUpperCase()}: Открываю страницу заказов...`);
         // Open tab - content script will read storage and start
         await chrome.tabs.create({ url: store.url, active: false });
         // No need to inject or send messages manually!
@@ -725,18 +959,10 @@ async function sendTelegramMessage(text) {
     }
 }
 
-// ... Google Sheets helpers (existing code) ...
-function gsGetAuthToken(interactive=true){
-    return new Promise((resolve, reject)=>{
-        chrome.identity.getAuthToken({ interactive }, (token)=>{
-            if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
-            else resolve(token);
-        });
-    });
-}
+// ... Google Sheets helpers use getAuthToken() defined above ...
 
 async function getSheetId(spreadsheetId, sheetName){
-    const token = await gsGetAuthToken(true);
+    const token = await getAuthToken(true);
     const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?fields=sheets(properties(sheetId,title))`, {
         headers: { Authorization: `Bearer ${token}` }
     });
@@ -749,7 +975,7 @@ async function getSheetId(spreadsheetId, sheetName){
 
 async function markRowsDone(spreadsheetId, sheetName, rowIndices, colorProcessed, hasWarning){
     // Write status to column F for given rows; then color rows accordingly
-    const token = await gsGetAuthToken(true);
+    const token = await getAuthToken(true);
 
     // Decide value & color
     const statusValue = hasWarning ? '⚠️ РАЗНЫЕ ЗАКАЗЫ' : `DONE ${new Date().toISOString().replace('T',' ').slice(0,16)}`;
@@ -800,7 +1026,7 @@ async function markRowsDone(spreadsheetId, sheetName, rowIndices, colorProcessed
 }
 
 async function resetSheetMarks({ spreadsheetId, sheetName }){
-    const token = await gsGetAuthToken(true);
+    const token = await getAuthToken(true);
     const sheetId = await getSheetId(spreadsheetId, sheetName);
 
     // Clear F2:F1000

@@ -1,7 +1,7 @@
-/* content-amazon.js — v7.0-STABLE-RELEASE (Простая рабочая версия) */
+/* content-amazon.js — v7.3 (Quantity fix - product-image__qty) */
 
 (function () {
-  console.log("🚀 Amazon Parser v7.0 (AUTO-PAGINATION 4 pages, parseAmazonOrders UNTOUCHED)");
+  console.log("🚀 Amazon Parser v7.3 (+ Quantity via .product-image__qty)");
 
   // Check for auto-parse flag on page load
   (async function checkAutoParse() {
@@ -21,8 +21,13 @@
       
       setTimeout(() => {
         console.log('🚀 Starting auto-parse with pagination...');
-        // Auto-mode: Parse up to 10 pages
-        parseAmazonOrdersWithPagination({ pages: 10 });
+        // Notify background that parsing actually started
+        chrome.runtime.sendMessage({
+          action: 'parserStarted',
+          store: 'Amazon'
+        });
+        // Auto-mode: Parse up to 30 pages
+        parseAmazonOrdersWithPagination({ pages: 30 });
       }, 3000); // Increased delay to 3s
     } else {
       console.log('ℹ️ No auto-parse flag (or expired)');
@@ -62,27 +67,64 @@
     el.style.display = 'block';
   }
 
+  let PARSE_MODE = 'warehouse'; // 'warehouse' or 'financial'
+
   // NEW: Listener for explicit parse command (backup trigger)
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    // Update Mode
+    if (request.options && request.options.mode) {
+        PARSE_MODE = request.options.mode;
+        console.log(`ℹ️ SET PARSE_MODE = ${PARSE_MODE}`);
+    }
+
     // Handle forced parse
     if (request.action === "parse" || request.action === "autoParse") {
         console.log("📨 Forced parse command received!", request);
-        showOverlay("🚀 ЗАПУСК (forced)...", "#d35400");
+        showOverlay(`🚀 ЗАПУСК (${PARSE_MODE})...`, "#d35400");
         // Use a small delay to ensure overlay renders
-        setTimeout(() => parseAmazonOrdersWithPagination({ pages: 10 }), 100);
+        setTimeout(() => parseAmazonOrdersWithPagination(request.options || { pages: 30 }), 100);
         sendResponse({ status: "started" });
         return;
     }
     // Handle legacy parse
     if (request.action === "parseAmazon" || request.action === "parseAmazonOrders") {
          console.log("📨 Legacy parse command received!");
-         showOverlay("🚀 ЗАПУСК (legacy)...", "#d35400");
-         setTimeout(() => parseAmazonOrdersWithPagination(request.options || { pages: 10 }), 100);
+         showOverlay(`🚀 ЗАПУСК (${PARSE_MODE})...`, "#d35400");
+         setTimeout(() => parseAmazonOrdersWithPagination(request.options || { pages: 30 }), 100);
          sendResponse({ status: "started" });
     }
   });
 
-  function getProductLinksSafe(root) {
+  // ... (helpers) ...
+
+  function extractFinancialDetails(card, orderId) {
+      console.log(`\n💰 [FINANCIAL DEBUG] Analyzing Order ${orderId}`);
+      
+      // 1. Log raw text for user inspection
+      const text = card.innerText || "";
+      console.log(`📄 RAW TEXT:\n${text.substring(0, 200)}...`);
+      
+      // 2. Try to find price
+      const priceMatch = text.match(/Total\s*[\$:]([\d,]+\.\d{2})/i) || text.match(/[\$:]([\d,]+\.\d{2})/);
+      const total = priceMatch ? priceMatch[1] : "???";
+      
+      // 3. Try to find hidden JSON (often in data-yo-serp-item or similar)
+      const dataset = Object.assign({}, card.dataset);
+      console.log(`💾 DATASET:`, dataset);
+      
+      // 4. Look for hidden inputs
+      const hiddenInputs = Array.from(card.querySelectorAll('input[type="hidden"]')).map(i => `${i.name}=${i.value}`);
+      if(hiddenInputs.length) console.log(`HIDDEN INPUTS:`, hiddenInputs);
+
+      return {
+          total_amount: total,
+          currency: "$", // Assumption
+          detected_tax: "0.00", // Placeholder
+          raw_debug: text.substring(0, 100)
+      };
+  }
+
+  function findProductAnchors(root) {
     const anchors = Array.from((root || document).getElementsByTagName("a"));
     const rx = /\/(?:dp|gp\/product)\//i;
     return anchors.filter(a => {
@@ -111,6 +153,116 @@
     const img = scope.querySelector("img[alt]"); 
     if (img && img.alt && img.alt.trim().length > 10) return img.alt.trim();
     return "";
+  }
+
+  // v7.3: Extract quantity from product card (badge on image or text)
+  function extractQuantityFromDOM(scope) {
+    // 1. ПЕРВЫМ ДЕЛОМ: Ищем span.product-image__qty (точный селектор Amazon)
+    const qtySpan = scope.querySelector('span.product-image__qty, .product-image__qty');
+    if (qtySpan) {
+      const text = qtySpan.textContent?.trim();
+      if (text && /^\d+$/.test(text)) {
+        console.log(`  📊 QTY found via .product-image__qty: ${text}`);
+        return text;
+      }
+    }
+    
+    // 2. Ищем в родительских элементах (если scope слишком узкий)
+    let parent = scope.parentElement;
+    for (let i = 0; i < 5 && parent; i++) {
+      const qtyInParent = parent.querySelector('span.product-image__qty, .product-image__qty');
+      if (qtyInParent) {
+        const text = qtyInParent.textContent?.trim();
+        if (text && /^\d+$/.test(text)) {
+          console.log(`  📊 QTY found via parent .product-image__qty: ${text}`);
+          return text;
+        }
+      }
+      parent = parent.parentElement;
+    }
+    
+    // 3. Ищем картинку товара и число рядом с ней
+    const img = scope.querySelector('img[alt]');
+    if (img) {
+      // Ищем в родительских элементах картинки (до 5 уровней)
+      let container = img.parentElement;
+      for (let i = 0; i < 5 && container; i++) {
+        // Ищем все текстовые узлы и элементы с числами
+        const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null, false);
+        let node;
+        while (node = walker.nextNode()) {
+          const text = node.textContent?.trim();
+          // Число от 2 до 99, стоящее отдельно
+          if (/^[2-9]\d?$/.test(text)) {
+            console.log(`  📊 Quantity found via text node near image: ${text}`);
+            return text;
+          }
+        }
+        container = container.parentElement;
+      }
+    }
+    
+    // 2. Ищем span/div с числом внутри item контейнера
+    const itemContainers = [
+      '.yohtmlc-item',
+      '.a-fixed-left-grid-inner',
+      '.a-row.shipment',
+      '[class*="item"]'
+    ];
+    
+    for (const sel of itemContainers) {
+      const itemEl = scope.closest(sel) || scope.querySelector(sel);
+      if (itemEl) {
+        // Ищем элементы которые содержат только число
+        const allElements = itemEl.querySelectorAll('span, div');
+        for (const el of allElements) {
+          const text = el.textContent?.trim();
+          // Число 2-99, элемент содержит ТОЛЬКО это число
+          if (/^[2-9]\d?$/.test(text) && el.children.length === 0) {
+            // Убедимся что это не часть цены
+            const parentText = el.parentElement?.textContent || '';
+            if (!parentText.includes('$') && !parentText.includes('price')) {
+              console.log(`  📊 Quantity found via element in item container: ${text}`);
+              return text;
+            }
+          }
+        }
+      }
+    }
+    
+    // 3. Ищем паттерн "Qty: X" или "Quantity: X" в тексте
+    const scopeText = scope.textContent || '';
+    const qtyMatch = scopeText.match(/(?:Qty|Quantity)[:\s]*(\d+)/i);
+    if (qtyMatch && parseInt(qtyMatch[1]) > 0) {
+      console.log(`  📊 Quantity found via Qty text pattern: ${qtyMatch[1]}`);
+      return qtyMatch[1];
+    }
+    
+    // 4. Поиск в item-view-left-col (где картинка)
+    const leftCol = scope.querySelector('.item-view-left-col-inner, .a-fixed-left-grid-col, [class*="left-col"]');
+    if (leftCol) {
+      const text = leftCol.textContent?.trim();
+      // Извлекаем все числа
+      const numbers = text.match(/\b([2-9]\d?)\b/g);
+      if (numbers && numbers.length === 1) {
+        console.log(`  📊 Quantity found in left column: ${numbers[0]}`);
+        return numbers[0];
+      }
+    }
+    
+    // 5. Последняя попытка - найти любой элемент с классом содержащим qty/quantity/count
+    const qtyElements = scope.querySelectorAll('[class*="qty"], [class*="quantity"], [class*="count"], [class*="badge"]');
+    for (const el of qtyElements) {
+      const text = el.textContent?.trim();
+      const match = text?.match(/^(\d+)$/);
+      if (match && parseInt(match[1]) > 1) {
+        console.log(`  📊 Quantity found via qty-class element: ${match[1]}`);
+        return match[1];
+      }
+    }
+    
+    console.log('  📊 Quantity not found, defaulting to 1');
+    return "1"; // default
   }
 
   function extractASINFromLink(href) {
@@ -298,12 +450,16 @@
     console.log(`  🔗 ASIN: ${asin || "—"}`);
     console.log(`  ✅ TRACK: ${trackNumber}`);
 
+    // v7.1: Extract actual quantity
+    const qty = extractQuantityFromDOM(scope);
+    console.log(`  📊 QTY: ${qty}`);
+
     return {
       store_name: "Amazon",
       order_id: individualOrderId,  // ← Use INDIVIDUAL Order ID!
       track_number: trackNumber,
       product_name: title,
-      qty: "1",
+      qty: qty,
       color: isMultiOrderShipment ? "⚠️ РАЗНЫЕ ЗАКАЗЫ" : "",  // ← WARNING in color field!
       size: ""
     };
@@ -398,12 +554,16 @@
 
     console.log(`  ✅ TRACK: ${trackNumber}`);
 
+    // v7.1: Extract actual quantity
+    const qty = extractQuantityFromDOM(scope);
+    console.log(`  📊 QTY: ${qty}`);
+
     return {
       store_name: 'Amazon',
       order_id: orderId,
       track_number: trackNumber,
       product_name: title,
-      qty: '1',
+      qty: qty,
       source_url: productLink?.href || '',
     };
   }
@@ -454,6 +614,14 @@
           console.log("⚠️ Order ID не найден, пропускаем");
           continue;
         }
+
+        // --- FINANCIAL MODE HOOK ---
+        let financialData = {};
+        if (PARSE_MODE === 'financial') {
+            financialData = extractFinancialDetails(card, orderId);
+            console.log(`💰 EXTRACTED: Total=${financialData.total_amount}`);
+        }
+        // ---------------------------
 
         // Find all Track package buttons (each button = one shipment)
         const trackButtons = card.querySelectorAll('a[href*="ship-track"], a[href*="track-package"], a[href*="progress-tracker"]');
@@ -569,6 +737,14 @@
               const prod = productsToProcess[prodIdx];
               const order = await parseIndividualItemSimpleByTrackUrl(card, prod, orderId, trackUrl);
               if (order) {
+                // --- FINANCIAL MERGE ---
+                if (PARSE_MODE === 'financial') {
+                    order.financial = financialData;
+                    order.total_amount = financialData.total_amount;
+                    // Log for user verification
+                    console.log(`  💰 Order attached financial data: ${JSON.stringify(financialData)}`);
+                }
+                // -----------------------
                 allOrders.push(order);
                 cardOrders++;
                 console.log(`  ✅ Товар ${prodIdx + 1}/${productsToProcess.length}: ${order.product_name.substring(0, 50)}... | Трек: ${order.track_number}`);

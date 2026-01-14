@@ -1,5 +1,7 @@
 console.log('🔧 eBay Parser WITH PAGINATION loaded');
 
+let PARSE_MODE = 'warehouse'; // 'warehouse' or 'financial'
+
 // Check for auto-parse flag on page load
 (async function checkAutoParse() {
   console.log('🔍 Checking for auto-parse flag...');
@@ -22,6 +24,11 @@ console.log('🔧 eBay Parser WITH PAGINATION loaded');
     // Wait for page to fully load
     setTimeout(() => {
       console.log('🚀 Starting auto-parse...');
+      // Notify background that parsing actually started
+      chrome.runtime.sendMessage({
+        action: 'parserStarted',
+        store: 'eBay'
+      });
       parseEbayOrders();
     }, 2000);
   } else {
@@ -132,6 +139,12 @@ function checkIfLoggedIn() {
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   console.log('📨 Message received:', request);
 
+  // SET MODE
+  if (request.options && request.options.mode) {
+      PARSE_MODE = request.options.mode;
+      console.log(`ℹ️ SET PARSE_MODE = ${PARSE_MODE}`);
+  }
+
   if (request.action === 'debugLogin') {
     console.log('🔍 Running login debug...');
     const result = checkIfLoggedIn();
@@ -157,7 +170,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 async function parseEbayOrders() {
-  console.log('🚀 parseEbayOrders() started');
+  console.log(`🚀 parseEbayOrders() started (Mode: ${PARSE_MODE})`);
   console.log('📍 Current URL:', window.location.href);
 
   // Wait a bit for page to fully load
@@ -198,7 +211,7 @@ async function parseEbayOrders() {
   let allOrders = [];
   let page = 1;
   let hasMore = true;
-  const MAX_PAGES = 10;
+  const MAX_PAGES = 20;
 
   try {
     while (hasMore && page <= MAX_PAGES) {
@@ -320,6 +333,26 @@ async function parseEbayOrders() {
 
 function parseItem(item) {
   try {
+    let financial = {};
+    // --- FINANCIAL MODE EXTRACTION ---
+    if (PARSE_MODE === 'financial') {
+        console.log('💰 [FINANCIAL DEBUG] Raw eBay Item:', item);
+        
+        // Try to find totals
+        if (item.pricingSummary) {
+            const ps = item.pricingSummary;
+            financial.total_amount = ps.total?.value || ps.total?.text;
+            financial.subtotal = ps.priceSubtotal?.value || ps.priceSubtotal?.text;
+            financial.shipping = ps.deliveryCost?.value || ps.deliveryCost?.text;
+            financial.tax = ps.tax?.value || ps.tax?.text; // Sometimes available
+        } else if (item.totalPrice) {
+            financial.total_amount = item.totalPrice.value || item.totalPrice.text;
+        }
+        
+        console.log('💰 Extracted Financial:', financial);
+    }
+    // ----------------------------
+
     const cards = Array.isArray(item?.itemCards) ? item.itemCards : (item?.itemCards ? [item.itemCards] : []);
     if (cards.length === 0) return null;
 
@@ -443,7 +476,9 @@ function parseItem(item) {
         product_name: title,
         qty: quantity,
         color: color || '',
-        size: size || ''
+        size: size || '',
+        financial: financial, // Add financial object
+        total_amount: financial.total_amount // Add for direct access
       };
     });
 

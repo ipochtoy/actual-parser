@@ -97,10 +97,6 @@
 
     <button id="parseAllStores" class="button primary-button">🚀 Parse All Stores</button>
     
-    <div style="margin-bottom: 15px; font-size: 12px;">
-        <!-- Auto-start checkbox moved to automation section -->
-    </div>
-
     <div id="multiProgress" style="display: none;">
         <div class="progress-container" id="ebay-progress-container">
             <div class="progress-label-container" style="display: flex; justify-content: space-between; align-items: center;">
@@ -153,26 +149,8 @@
     <!-- Google Sheets Sync Section -->
     <div id="google-sync-section">
         <h3 style="text-align: center; font-size: 16px; margin-bottom: 10px;">🤖 Автоматизация Pochtoy.com</h3>
-        
-        <!-- Telegram Settings -->
-        <details style="margin-bottom: 10px; font-size: 12px; border: 1px solid #eee; border-radius: 4px; padding: 5px;">
-            <summary style="cursor: pointer; color: #667eea;">📱 Telegram Bot Settings</summary>
-            <div style="margin-top: 8px; display: flex; flex-direction: column; gap: 5px;">
-                <input type="text" id="tg-bot-token" placeholder="Bot Token" style="padding: 6px; border: 1px solid #ddd; border-radius: 4px;">
-                <div style="display: flex; gap: 5px;">
-                    <input type="text" id="tg-chat-id" placeholder="Chat ID" style="flex: 1; padding: 6px; border: 1px solid #ddd; border-radius: 4px;">
-                    <button id="save-tg-settings" class="button" style="width: auto; padding: 0 10px; margin: 0; background-color: #4a5568; color: white;">💾</button>
-                </div>
-                <div style="font-size: 10px; color: #666;">Команда для запуска: <b>/start_parser</b></div>
-            </div>
-        </details>
-
-        <div style="display: flex; gap: 5px; margin-bottom: 10px;">
-            <input type="text" id="spreadsheet-id" placeholder="Вставь ID твоей Google-таблицы" value="1w1QOzGWc_CNovlezuxyLta-h1kM3pgPXc_GoHYaOA98" style="flex: 1; padding: 10px; border-radius: 8px; border: 1px solid #ddd; box-sizing: border-box;">
-            <button id="save-spreadsheet-id" class="button" style="width: auto; padding: 0 15px; margin: 0; background-color: #4a5568; color: white;" title="Сохранить ID">💾</button>
-        </div>
+        <input type="text" id="spreadsheet-id" placeholder="Вставь ID твоей Google-таблицы" style="width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #ddd; margin-bottom: 10px; box-sizing: border-box;">
         <button id="start-sync-btn" class="button" style="background-color: #28a745; color: white;">▶️ Запустить синхронизацию</button>
-        <button id="run-robot-only-btn" class="button" style="background-color: #2b6cb0; color: white; margin-top: 5px;">🤖 Запустить робота (без парсинга)</button>
         
         <div style="margin-top: 8px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
             <label style="display:flex; align-items:center; gap:6px; font-size:12px;">
@@ -182,18 +160,6 @@
                 <input type="checkbox" id="color-processed" checked /> Color processed rows
             </label>
             <button id="reset-marks-btn" class="button" style="background:#e2e8f0; color:#333; padding:6px 10px;">↺ Reset marks</button>
-        </div>
-        
-        <div style="margin-top: 8px; font-size: 12px;">
-            <label style="display:flex; align-items:center; gap:6px;">
-                <input type="checkbox" id="limit-rows" checked /> Обрабатывать только последние 800 строк
-            </label>
-        </div>
-        
-        <div style="margin-top: 8px; font-size: 12px;">
-            <label style="display:flex; align-items:center; gap:6px;">
-                <input type="checkbox" id="chain-pochtoy" checked /> 🔄 Затем авто-запустить Pochtoy.com
-            </label>
         </div>
         
         <div id="automation-progress-section" style="display: none; margin-top: 15px;">
