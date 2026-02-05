@@ -1,5 +1,21 @@
 # Order Parser Pro - Changelog
 
+## Version 7.5 - Multi-Account & Stability (2026-02-05)
+
+### 🔧 Amazon Parser
+- **UPS tracking NOT supported** - intentionally excluded due to issues with regex pattern breaking TBA detection
+- Supported carriers: TBA (Amazon Logistics), USPS only
+- Multi-account parsing with automatic account switching
+- Pagination up to 20 pages
+- Multi-order shipment detection (products from different orders in same package)
+- Deduplication by order_id + track_number + product_name
+
+### 📝 Known Limitations
+- UPS tracking numbers (1Z...) are NOT extracted - fetch returns page without tracking visible in HTML
+- Some delivered orders may not have accessible tracking info
+
+---
+
 ## Version 3.1 - Enhanced Edition
 
 ### 🎯 Major Improvements

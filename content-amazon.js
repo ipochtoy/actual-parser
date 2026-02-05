@@ -1,24 +1,92 @@
-/* content-amazon.js — v7.3 (Quantity fix - product-image__qty) */
+/* content-amazon.js — v7.5 (Fix: multi-product deduplication) */
 
 (function () {
-  console.log("🚀 Amazon Parser v7.3 (+ Quantity via .product-image__qty)");
+  console.log("🚀 Amazon Parser v7.5 (Fix: multi-product deduplication)");
+  
+  // Get current Amazon account name for logs
+  function getAmazonAccountName() {
+    return new Promise(resolve => {
+      chrome.storage.local.get(['multiAccountState'], result => {
+        const account = result.multiAccountState?.currentAmazonAccount;
+        if (account) {
+          resolve(`Amazon (${account.split('@')[0]})`);
+        } else {
+          resolve('Amazon');
+        }
+      });
+    });
+  }
+  
+  // Current page number for logging
+  let currentLogPage = 1;
+  
+  // Save log entry directly to storage (more reliable than sendMessage)
+  async function sendLog(orderId, trackNumber, status, details, page = null) {
+    try {
+      const store = await getAmazonAccountName();
+      const pageInfo = page || currentLogPage;
+      const timestamp = new Date().toLocaleString('ru-RU', { 
+        hour: '2-digit', 
+        minute: '2-digit', 
+        second: '2-digit',
+        day: '2-digit',
+        month: '2-digit'
+      });
+      
+      const logEntry = {
+        timestamp,
+        store,
+        orderId: orderId || '-',
+        trackNumber: trackNumber || '-',
+        status,
+        details: `[Стр.${pageInfo}] ${details || ''}`
+      };
+      
+      // Save directly to chrome.storage.local
+      const result = await chrome.storage.local.get(['parsingLogs']);
+      const logs = result.parsingLogs || [];
+      logs.push(logEntry);
+      await chrome.storage.local.set({ parsingLogs: logs });
+      
+      console.log(`📝 Log: ${status} | ${orderId} | ${trackNumber?.substring(0, 15) || '-'}`);
+    } catch (e) {
+      console.error('Failed to save log:', e);
+    }
+  }
 
   // Check for auto-parse flag on page load
   (async function checkAutoParse() {
     console.log('🔍 Checking for auto-parse flag...');
     
-    const data = await chrome.storage.local.get(['autoParsePending', 'autoParse_amazon', 'autoParseTimestamp']);
+    const data = await chrome.storage.local.get(['autoParsePending', 'autoParse_amazon', 'autoParseTimestamp', 'accountSwitchInProgress', 'switchedToEmail']);
     
+    // Check if this is after account switch (multi-account parsing)
+    if (data.accountSwitchInProgress) {
+      console.log(`✅ Account switch detected! Now parsing as: ${data.switchedToEmail}`);
+      
+      await chrome.storage.local.remove(['accountSwitchInProgress', 'switchedToEmail']);
+      
+      setTimeout(() => {
+        console.log('🚀 Starting parse after account switch...');
+        chrome.runtime.sendMessage({
+          action: 'parserStarted',
+          store: 'Amazon'
+        });
+        parseAmazonOrdersWithPagination({ pages: 20 });
+      }, 3000);
+      return;
+    }
+
     const shouldAutoParse = (data.autoParsePending === 'amazon') || data.autoParse_amazon;
     const timestamp = data.autoParseTimestamp || data.autoParse_amazon;
-    
+
     const isRecent = timestamp && (Date.now() - timestamp < 10000);
-    
+
     if (shouldAutoParse && isRecent) {
       console.log('✅ Auto-parse flag found! Starting parse in 2 seconds...');
-      
+
       await chrome.storage.local.remove(['autoParsePending', 'autoParse_amazon', 'autoParseTimestamp']);
-      
+
       setTimeout(() => {
         console.log('🚀 Starting auto-parse with pagination...');
         // Notify background that parsing actually started
@@ -26,8 +94,8 @@
           action: 'parserStarted',
           store: 'Amazon'
         });
-        // Auto-mode: Parse up to 30 pages
-        parseAmazonOrdersWithPagination({ pages: 30 });
+        // Auto-mode: Parse up to 20 pages
+        parseAmazonOrdersWithPagination({ pages: 20 });
       }, 3000); // Increased delay to 3s
     } else {
       console.log('ℹ️ No auto-parse flag (or expired)');
@@ -82,7 +150,7 @@
         console.log("📨 Forced parse command received!", request);
         showOverlay(`🚀 ЗАПУСК (${PARSE_MODE})...`, "#d35400");
         // Use a small delay to ensure overlay renders
-        setTimeout(() => parseAmazonOrdersWithPagination(request.options || { pages: 30 }), 100);
+        setTimeout(() => parseAmazonOrdersWithPagination(request.options || { pages: 20 }), 100);
         sendResponse({ status: "started" });
         return;
     }
@@ -90,7 +158,7 @@
     if (request.action === "parseAmazon" || request.action === "parseAmazonOrders") {
          console.log("📨 Legacy parse command received!");
          showOverlay(`🚀 ЗАПУСК (${PARSE_MODE})...`, "#d35400");
-         setTimeout(() => parseAmazonOrdersWithPagination(request.options || { pages: 30 }), 100);
+         setTimeout(() => parseAmazonOrdersWithPagination(request.options || { pages: 20 }), 100);
          sendResponse({ status: "started" });
     }
   });
@@ -409,8 +477,70 @@
       const img = scope.querySelector("img[alt]");
       if (img && img.alt && img.alt.trim().length > 10) title = img.alt.trim();
     }
+    // Fallback: try to get title from productLink directly
+    if (!title && productLink) {
+      // Try link text
+      const linkText = productLink.textContent?.trim();
+      if (linkText && linkText.length > 5 && linkText.length < 300) {
+        title = linkText;
+        console.log("  📦 Title from link text");
+      }
+      // Try title attribute
+      if (!title && productLink.title) {
+        title = productLink.title.trim();
+        console.log("  📦 Title from link title attr");
+      }
+      // Try nearby img alt
+      if (!title) {
+        const nearbyImg = productLink.querySelector('img[alt]') || productLink.closest('div')?.querySelector('img[alt]');
+        if (nearbyImg && nearbyImg.alt && nearbyImg.alt.length > 5) {
+          title = nearbyImg.alt.trim();
+          console.log("  📦 Title from nearby img alt");
+        }
+      }
+      // Try to find ANY product link in delivery-box with text
+      if (!title) {
+        const deliveryBox = productLink.closest('.delivery-box, .a-box');
+        if (deliveryBox) {
+          const allLinks = deliveryBox.querySelectorAll('a[href*="/dp/"], a[href*="/gp/product/"]');
+          for (const link of allLinks) {
+            const txt = link.textContent?.trim();
+            if (txt && txt.length > 5 && txt.length < 300) {
+              title = txt;
+              console.log("  📦 Title from delivery-box link");
+              break;
+            }
+            // Also check img inside
+            const img = link.querySelector('img[alt]');
+            if (img && img.alt && img.alt.length > 5) {
+              title = img.alt.trim();
+              console.log("  📦 Title from delivery-box img alt");
+              break;
+            }
+          }
+        }
+      }
+      // Last resort: extract from URL
+      if (!title && productLink.href) {
+        // Try to extract product name from URL like /Product-Name-Here/dp/ASIN
+        const match = productLink.href.match(/amazon\.com\/([^\/]+)\/dp\/([A-Z0-9]+)/i);
+        if (match && match[1] && match[1] !== 'dp' && match[1] !== 'gp') {
+          title = decodeURIComponent(match[1].replace(/-/g, ' ').replace(/_/g, ' '));
+          console.log("  📦 Title from URL path:", title.substring(0, 50));
+        }
+        // Also try /dp/ASIN format (no name in URL) - use ASIN as last resort
+        if (!title) {
+          const asinMatch = productLink.href.match(/\/dp\/([A-Z0-9]+)/i);
+          if (asinMatch) {
+            title = `Product ASIN: ${asinMatch[1]}`;
+            console.log("  📦 Title from ASIN (fallback)");
+          }
+        }
+      }
+    }
     if (!title) {
-      console.log("  ❌ No product name found");
+      console.log("  ❌ No product name found, productLink:", productLink?.href);
+      sendLog(orderId, '-', '❌ No name', 'Не найдено название товара');
       return null;
     }
     title = htmlDecode(title);
@@ -435,6 +565,7 @@
     
     if (!trackResults || trackResults.length === 0) {
       console.log('  ❌ No tracking number');
+      sendLog(individualOrderId || orderId, '-', '❌ No track', title?.substring(0, 80) || 'Unknown product');
       return null;
     }
     
@@ -542,6 +673,7 @@
 
     if (!tracks.length) {
       console.log('  ❌ No tracking number');
+      sendLog(orderId, '-', '❌ No track', title?.substring(0, 80) || 'Unknown product');
       return null;
     }
 
@@ -748,6 +880,8 @@
                 allOrders.push(order);
                 cardOrders++;
                 console.log(`  ✅ Товар ${prodIdx + 1}/${productsToProcess.length}: ${order.product_name.substring(0, 50)}... | Трек: ${order.track_number}`);
+                // Log success
+                sendLog(order.order_id, order.track_number, '✅ Found', order.product_name.substring(0, 80));
               }
             }
           } catch (itemError) {
@@ -875,40 +1009,116 @@
       console.log("  ✅ Multi-order shipments не найдены");
     }
     
-    // Final save
+    // Final save - APPEND to existing orders (for multi-account) with deduplication
     const timestamp = new Date().toISOString();
-    const uniqueOrderIds = new Set(state.allOrders.map(o => o.order_id));
     chrome.storage.local.get(['orderData'], (result) => {
       const orderData = result.orderData || {};
+      const existingOrders = orderData['Amazon']?.orders || [];
+      
+      // Combine existing + new orders
+      const allCombinedOrders = [...existingOrders, ...state.allOrders];
+      
+      // Deduplicate by order_id + track_number + product_name combo
+      // IMPORTANT: Include product_name to allow multiple DIFFERENT products in same shipment!
+      const seen = new Set();
+      const uniqueOrders = allCombinedOrders.filter(order => {
+        const key = `${order.order_id}_${order.track_number}_${order.product_name || ''}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      
+      const uniqueOrderIds = new Set(uniqueOrders.map(o => o.order_id));
+      
       orderData['Amazon'] = {
-        orders: state.allOrders,
+        orders: uniqueOrders,
         lastParsed: timestamp,
-        totalOrders: state.allOrders.length,
-        totalProductsCount: state.allOrders.length,
+        totalOrders: uniqueOrders.length,
+        totalProductsCount: uniqueOrders.length,
         uniqueOrdersCount: uniqueOrderIds.size
       };
       chrome.storage.local.set({ orderData }, () => {
-        console.log(`💾 Финальное сохранение: ${state.allOrders.length} заказов`);
+        console.log(`💾 Финальное сохранение: ${state.allOrders.length} новых + ${existingOrders.length} существующих = ${uniqueOrders.length} уникальных`);
       });
     });
     
     chrome.storage.local.set({ amazonOrders: state.allOrders });
     await clearPaginationState();
     
+    // НАДЕЖНЫЙ механизм: записываем флаг завершения напрямую в storage
+    // чтобы background.js мог его проверить даже если sendMessage потеряется
+    await new Promise(resolve => {
+      chrome.storage.local.set({
+        amazonParsingComplete: {
+          timestamp: Date.now(),
+          found: state.allOrders.length
+        }
+      }, resolve);
+    });
+    console.log('🚩 Флаг завершения Amazon записан в storage');
+    
+    // Отправляем сообщение (может потеряться, но storage уже есть)
     chrome.runtime.sendMessage({ 
       action: 'progress', 
       store: 'Amazon', 
       current: state.allOrders.length, 
       total: state.allOrders.length, 
-      status: 'Done ✅', // Explicit 'Done ✅' for background.js to detect completion
+      status: 'Done ✅',
       found: state.allOrders ? state.allOrders.length : 0
-    });
+    }).catch(() => console.log('⚠️ sendMessage failed, but storage flag is set'));
     
     chrome.runtime.sendMessage({ 
       action: 'complete',  
       store: 'Amazon', 
       orders: state.allOrders 
-    });
+    }).catch(() => {});
+    
+    // ДУБЛИРУЮЩИЙ МЕХАНИЗМ: content script сам проверяет и переключает аккаунт
+    // Это работает надежно т.к. content script активен пока страница открыта
+    setTimeout(async () => {
+      console.log('🔄 Content script backup: checking for next account...');
+      const stored = await new Promise(resolve => 
+        chrome.storage.local.get(['multiAccountState', 'amazonParsingComplete'], resolve)
+      );
+      
+      // Если флаг всё еще есть (background не обработал) и есть следующий аккаунт
+      if (stored.amazonParsingComplete && stored.multiAccountState) {
+        const { isMultiAccountParsing, amazonAccountsQueue, currentAmazonAccount } = stored.multiAccountState;
+        
+        if (isMultiAccountParsing && amazonAccountsQueue && amazonAccountsQueue.length > 0) {
+          const nextEmail = amazonAccountsQueue[0];
+          console.log(`🔄 Content script: Background не обработал, переключаюсь на ${nextEmail}`);
+          
+          // Обновляем очередь
+          const newQueue = amazonAccountsQueue.slice(1);
+          await new Promise(resolve => {
+            chrome.storage.local.set({
+              amazonParsingComplete: null,
+              amazonPaginationState: null,
+              multiAccountState: {
+                isMultiAccountParsing: true,
+                amazonAccountsQueue: newQueue,
+                currentAmazonAccount: nextEmail
+              }
+            }, resolve);
+          });
+          
+          // Переходим на страницу смены аккаунта
+          const switchUrl = 'https://www.amazon.com/ap/signin?openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.amazon.com%2F%3Fref_%3Dnav_youraccount_switchacct&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.assoc_handle=usflex&openid.mode=checkid_setup&marketPlaceId=ATVPDKIKX0DER&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&switch_account=picker&ignoreAuthState=1&_encoding=UTF8';
+          window.location.href = switchUrl;
+        } else if (isMultiAccountParsing && (!amazonAccountsQueue || amazonAccountsQueue.length === 0)) {
+          console.log('✅ Content script: Последний аккаунт, завершаю multi-account');
+          await new Promise(resolve => {
+            chrome.storage.local.set({
+              amazonParsingComplete: null,
+              multiAccountState: null
+            }, resolve);
+          });
+        }
+      } else {
+        console.log('✅ Background обработал флаг или нет multi-account режима');
+      }
+    }, 5000); // Ждём 5 секунд, даём шанс background
     
     return { success: true, orders: state.allOrders };
   }
@@ -941,6 +1151,9 @@
     
     try {
       console.log(`\n📄 === СТРАНИЦА ${state.currentPage}/${state.totalPages} ===`);
+      
+      // Update page number for logging
+      currentLogPage = state.currentPage;
 
       if (await shouldStop()) {
         console.log('🛑 Stopped during pagination');
@@ -966,20 +1179,8 @@
       state.allOrders.push(...pageOrders);
       state.currentPage++;
       
-      // Промежуточное сохранение
-      const timestamp = new Date().toISOString();
-      const uniqueOrderIds = new Set(state.allOrders.map(o => o.order_id));
-      chrome.storage.local.get(['orderData'], (result) => {
-        const orderData = result.orderData || {};
-        orderData['Amazon'] = {
-          orders: state.allOrders,
-          lastParsed: timestamp,
-          totalOrders: state.allOrders.length,
-          totalProductsCount: state.allOrders.length,
-          uniqueOrdersCount: uniqueOrderIds.size
-        };
-        chrome.storage.local.set({ orderData });
-      });
+      // Промежуточное сохранение - save current account progress only (NOT appending)
+      // Appending happens only in final save
       chrome.storage.local.set({ amazonOrders: state.allOrders });
       
       // Переходим на следующую страницу?
@@ -1015,8 +1216,34 @@
   // Old listener removed because it's handled in the top merged listener now
   
   // AUTO-RESUME: Продолжаем пагинацию после reload
+  // НО: если это новый multi-account парсинг — начинаем заново!
   (async function checkAutoResume() {
     await sleep(1500);
+    
+    // Проверяем, есть ли активный multi-account парсинг
+    const multiState = await new Promise(resolve => 
+      chrome.storage.local.get(['multiAccountState'], resolve)
+    );
+    
+    // Если multi-account активен — проверяем начат ли уже парсинг
+    if (multiState.multiAccountState && multiState.multiAccountState.isMultiAccountParsing) {
+      // Проверяем есть ли уже активное состояние пагинации (парсинг уже идёт)
+      const existingState = await getPaginationState();
+      if (existingState && existingState.currentPage >= 1) {
+        // Парсинг уже идёт — продолжаем через обычный auto-resume ниже
+        console.log('🔄 Multi-account: парсинг уже идёт, продолжаем...');
+      } else {
+        // Первый запуск — начинаем с чистого листа
+        console.log('🔄 Multi-account mode active, starting fresh parse...');
+        showOverlay("🔄 Multi-account: Начинаю парсинг...", "#3498db");
+        parseAmazonOrdersWithPagination({ pages: 20 }).catch(err => {
+          console.error('❌ Ошибка multi-account парсинга:', err);
+          showOverlay("❌ Ошибка парсинга", "#c0392b");
+        });
+        return;
+      }
+    }
+    
     const state = await getPaginationState();
     if (state && state.currentPage > 1 && state.currentPage <= state.totalPages) {
       console.log(`🔄 AUTO-RESUME: Продолжаем парсинг страницы ${state.currentPage}/${state.totalPages}`);
