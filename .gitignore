@@ -4,3 +4,14 @@ node_modules/
 .idea/
 .vscode/
 
+# Секреты
+.env
+
+# Локальные данные (большие файлы)
+scratch/data/pochtoy-stats.json
+scratch/data/competitors-*.json
+scratch/data/video-metrics-*.json
+
+# Временные отчеты
+scratch/data/*-report-*.md
+
