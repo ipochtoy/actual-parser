@@ -1691,11 +1691,18 @@ async function processScreenshotQueue() {
 async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountName }, current, total) {
     if (!trackUrl) return;
 
-    console.log(`📸 [${current}/${total}] Capturing: ${orderId} / ${trackNumber}`);
+    let fullUrl = trackUrl;
+    if (fullUrl.startsWith('/')) {
+        fullUrl = 'https://www.amazon.com' + fullUrl;
+    } else if (!fullUrl.startsWith('http')) {
+        fullUrl = 'https://www.amazon.com/' + fullUrl;
+    }
+
+    console.log(`📸 [${current}/${total}] Capturing: ${orderId} / ${trackNumber} -> ${fullUrl.substring(0, 80)}`);
 
     let tab;
     try {
-        tab = await chrome.tabs.create({ url: trackUrl, active: true });
+        tab = await chrome.tabs.create({ url: fullUrl, active: true });
 
         await new Promise(resolve => {
             function onUpdated(tabId, info) {
