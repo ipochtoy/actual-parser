@@ -374,9 +374,10 @@ async function handleProgressMessage(request) {
         currentAmazonAccount = stored.multiAccountState.currentAmazonAccount;
     }
 
-    // Update completion status (for Parse All Stores OR Multi-Account Amazon)
+    // Update completion status
     const isCompleted = request.status === 'Done ✅' || request.status === 'Error';
     const shouldHandleCompletion = isCompleted && (isParsingAllStores || (storeKey === 'amazon' && isMultiAccountParsing));
+    const shouldNotifyTelegram = isCompleted && !shouldHandleCompletion;
     
     console.log(`🔍 [DEBUG] isCompleted: ${isCompleted}, isParsingAllStores: ${isParsingAllStores}, isMultiAccountParsing: ${isMultiAccountParsing}, shouldHandle: ${shouldHandleCompletion}`);
     
@@ -422,6 +423,13 @@ async function handleProgressMessage(request) {
 
             checkAllStoresCompleted();
         }
+    }
+
+    // Standalone parse (not multi-account, not parse-all): still notify Telegram
+    if (shouldNotifyTelegram) {
+        const count = request.found || 0;
+        const emoji = request.status === 'Error' ? '❌' : '✅';
+        sendTelegramMessage(`${emoji} ${request.store || storeKey}: Готово (${count} заказов)`);
     }
 
     // Update cache synchronously (if not already updated above)

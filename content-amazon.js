@@ -54,6 +54,11 @@
     }
   }
 
+  async function getSavedPageCount() {
+    const res = await chrome.storage.local.get(['savedPagesToParse']);
+    return parseInt(res.savedPagesToParse, 10) || 10;
+  }
+
   // Check for auto-parse flag on page load
   (async function checkAutoParse() {
     console.log('🔍 Checking for auto-parse flag...');
@@ -66,13 +71,14 @@
       
       await chrome.storage.local.remove(['accountSwitchInProgress', 'switchedToEmail']);
       
-      setTimeout(() => {
-        console.log('🚀 Starting parse after account switch...');
+      setTimeout(async () => {
+        const pages = await getSavedPageCount();
+        console.log(`🚀 Starting parse after account switch (${pages} pages)...`);
         chrome.runtime.sendMessage({
           action: 'parserStarted',
           store: 'Amazon'
         });
-        parseAmazonOrdersWithPagination({ pages: 20 });
+        parseAmazonOrdersWithPagination({ pages });
       }, 3000);
       return;
     }
@@ -87,16 +93,15 @@
 
       await chrome.storage.local.remove(['autoParsePending', 'autoParse_amazon', 'autoParseTimestamp']);
 
-      setTimeout(() => {
-        console.log('🚀 Starting auto-parse with pagination...');
-        // Notify background that parsing actually started
+      setTimeout(async () => {
+        const pages = await getSavedPageCount();
+        console.log(`🚀 Starting auto-parse (${pages} pages)...`);
         chrome.runtime.sendMessage({
           action: 'parserStarted',
           store: 'Amazon'
         });
-        // Auto-mode: Parse up to 20 pages
-        parseAmazonOrdersWithPagination({ pages: 20 });
-      }, 3000); // Increased delay to 3s
+        parseAmazonOrdersWithPagination({ pages });
+      }, 3000);
     } else {
       console.log('ℹ️ No auto-parse flag (or expired)');
     }
@@ -150,7 +155,10 @@
         console.log("📨 Forced parse command received!", request);
         showOverlay(`🚀 ЗАПУСК (${PARSE_MODE})...`, "#d35400");
         // Use a small delay to ensure overlay renders
-        setTimeout(() => parseAmazonOrdersWithPagination(request.options || { pages: 20 }), 100);
+        (async () => {
+          const opts = request.options || { pages: await getSavedPageCount() };
+          parseAmazonOrdersWithPagination(opts);
+        })();
         sendResponse({ status: "started" });
         return;
     }
@@ -158,7 +166,10 @@
     if (request.action === "parseAmazon" || request.action === "parseAmazonOrders") {
          console.log("📨 Legacy parse command received!");
          showOverlay(`🚀 ЗАПУСК (${PARSE_MODE})...`, "#d35400");
-         setTimeout(() => parseAmazonOrdersWithPagination(request.options || { pages: 20 }), 100);
+         (async () => {
+          const opts = request.options || { pages: await getSavedPageCount() };
+          parseAmazonOrdersWithPagination(opts);
+        })();
          sendResponse({ status: "started" });
     }
   });
@@ -1257,7 +1268,7 @@
         // Первый запуск — начинаем с чистого листа
         console.log('🔄 Multi-account mode active, starting fresh parse...');
         showOverlay("🔄 Multi-account: Начинаю парсинг...", "#3498db");
-        parseAmazonOrdersWithPagination({ pages: 20 }).catch(err => {
+        getSavedPageCount().then(pages => parseAmazonOrdersWithPagination({ pages })).catch(err => {
           console.error('❌ Ошибка multi-account парсинга:', err);
           showOverlay("❌ Ошибка парсинга", "#c0392b");
         });
