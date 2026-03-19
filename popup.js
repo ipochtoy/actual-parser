@@ -255,7 +255,7 @@ async function parseStore(store, overrides = {}) {
         }
         
         const options = {
-            pages: (store.name === 'Amazon') ? (parseInt(document.getElementById('pagesToParse')?.value, 10) || 10) : undefined,
+            pages: (store.name === 'Amazon') ? (parseInt(document.getElementById('pagesToParse')?.value, 10) || 1) : undefined,
             mode: mode,
             ...overrides
         };

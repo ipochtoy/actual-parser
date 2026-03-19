@@ -56,7 +56,7 @@
 
   async function getSavedPageCount() {
     const res = await chrome.storage.local.get(['savedPagesToParse']);
-    return parseInt(res.savedPagesToParse, 10) || 10;
+    return parseInt(res.savedPagesToParse, 10) || 1;
   }
 
   // Check for auto-parse flag on page load

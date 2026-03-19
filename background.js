@@ -430,6 +430,10 @@ async function handleProgressMessage(request) {
         const count = request.found || 0;
         const emoji = request.status === 'Error' ? '❌' : '✅';
         sendTelegramMessage(`${emoji} ${request.store || storeKey}: Готово (${count} заказов)`);
+        // Process screenshot queue for standalone parse too
+        if (screenshotsEnabled && trackScreenshotQueue.length > 0) {
+            setTimeout(() => processScreenshotQueue(), 2000);
+        }
     }
 
     // Update cache synchronously (if not already updated above)
@@ -819,6 +823,13 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             
             // Clear the flag so we don't process again
             await chrome.storage.local.set({ amazonParsingComplete: null, accountSwitchStartedAt: null });
+            
+            // Process screenshots if no more accounts
+            if (!(isMultiAccountParsing && amazonAccountsQueue.length > 0)) {
+                if (screenshotsEnabled && trackScreenshotQueue.length > 0) {
+                    setTimeout(() => processScreenshotQueue(), 2000);
+                }
+            }
             
             // If multi-account parsing and more accounts remain
             if (isMultiAccountParsing && amazonAccountsQueue.length > 0) {
