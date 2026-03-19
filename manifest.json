@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Pochtoy Parsing",
-  "version": "7.3.0",
+  "version": "7.5.0",
   "description": "🇧🇾 Parse orders from eBay, iHerb, Amazon and export to Google Sheets",
-  "permissions": ["storage", "identity", "tabs", "scripting"],
+  "permissions": ["storage", "identity", "tabs", "scripting", "alarms"],
   "host_permissions": [
     "https://secure.iherb.com/*",
     "https://www.ebay.com/*",
@@ -47,6 +47,16 @@
         "https://www.amazon.com/your-orders*"
       ],
       "js": ["content-amazon.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.amazon.com/ap/signin*"],
+      "js": ["content-switch-account.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.amazon.com/", "https://www.amazon.com/?*"],
+      "js": ["content-amazon-redirect.js"],
       "run_at": "document_idle"
     }
   ],

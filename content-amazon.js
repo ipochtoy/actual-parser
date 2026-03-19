@@ -426,10 +426,13 @@
       const response = await fetch(url, { credentials: 'include' });
       const html = await response.text();
 
-      // Simple patterns - TBA and USPS only (UPS removed)
+      // Simple patterns - TBA, USPS, and UPS
+      // UPS format: 1Z + 6 alphanumeric + 2 DIGITS (service code) + 8 alphanumeric
+      // This strict pattern avoids false positives like "1ZAUXFMSEBKUFEFJRA"
       const patterns = [
         { re: /(TBA\d{6,})/, label: 'TBA' },
         { re: /(9\d{21,})/, label: 'USPS' },
+        { re: /(1Z[A-Z0-9]{6}\d{2}[A-Z0-9]{8})/, label: 'UPS' },
       ];
 
       for (const { re, label } of patterns) {

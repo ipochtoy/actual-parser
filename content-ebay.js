@@ -1,28 +1,69 @@
-console.log('🔧 eBay Parser WITH PAGINATION loaded');
+/* content-ebay.js — v7.5.1 (Reliable auto-parse with retry fallback) */
+console.log('🔧 eBay Parser v7.5.1 loaded');
 
 let PARSE_MODE = 'warehouse'; // 'warehouse' or 'financial'
+// Guard against double-parse (both flag + message could trigger)
+let isParsingInProgress = false;
+
+// Save log entry directly to storage
+async function sendLog(orderId, trackNumber, status, details) {
+  try {
+    const timestamp = new Date().toLocaleString('ru-RU', { 
+      hour: '2-digit', 
+      minute: '2-digit', 
+      second: '2-digit',
+      day: '2-digit',
+      month: '2-digit'
+    });
+    
+    const logEntry = {
+      timestamp,
+      store: 'eBay',
+      orderId: orderId || '-',
+      trackNumber: trackNumber || '-',
+      status,
+      details: details || ''
+    };
+    
+    const result = await chrome.storage.local.get(['parsingLogs']);
+    const logs = result.parsingLogs || [];
+    logs.push(logEntry);
+    await chrome.storage.local.set({ parsingLogs: logs });
+  } catch (e) {
+    console.error('Failed to save log:', e);
+  }
+}
 
 // Check for auto-parse flag on page load
 (async function checkAutoParse() {
   console.log('🔍 Checking for auto-parse flag...');
 
-  const data = await chrome.storage.local.get(['autoParsePending', 'autoParse_ebay', 'autoParseTimestamp']);
+  const data = await chrome.storage.local.get(['autoParsePending', 'autoParse_ebay', 'autoParseTimestamp', 'ebay_should_autoparse']);
 
-  // Check both old and new flag formats
-  const shouldAutoParse = (data.autoParsePending === 'ebay') || data.autoParse_ebay;
+  // Check both old and new flag formats + dedicated retry flag
+  const retryAutoParse = data.ebay_should_autoparse === true;
+  const standardAutoParse = (data.autoParsePending === 'ebay') || data.autoParse_ebay;
   const timestamp = data.autoParseTimestamp || data.autoParse_ebay;
 
-  // Only auto-parse if flag is recent (within last 10 seconds)
-  const isRecent = timestamp && (Date.now() - timestamp < 10000);
+  // Increased timeout to 120 seconds (eBay pages load slowly)
+  const isRecent = timestamp && (Date.now() - timestamp < 120000);
 
-  if (shouldAutoParse && isRecent) {
-    console.log('✅ Auto-parse flag found! Starting parse in 2 seconds...');
+  const shouldAutoParse = retryAutoParse || (standardAutoParse && isRecent);
+
+  if (shouldAutoParse) {
+    console.log('✅ Auto-parse flag found! Starting parse in 3 seconds...');
+    console.log(`   (retryFlag: ${retryAutoParse}, standardFlag: ${standardAutoParse}, isRecent: ${isRecent})`);
 
     // Clear the flag
-    await chrome.storage.local.remove(['autoParsePending', 'autoParse_ebay', 'autoParseTimestamp']);
+    await chrome.storage.local.remove(['autoParsePending', 'autoParse_ebay', 'autoParseTimestamp', 'ebay_should_autoparse']);
 
     // Wait for page to fully load
     setTimeout(() => {
+      if (isParsingInProgress) {
+        console.log('⚠️ Parse already in progress (triggered by message?), skipping auto-parse');
+        return;
+      }
+      isParsingInProgress = true;
       console.log('🚀 Starting auto-parse...');
       // Notify background that parsing actually started
       chrome.runtime.sendMessage({
@@ -30,9 +71,10 @@ let PARSE_MODE = 'warehouse'; // 'warehouse' or 'financial'
         store: 'eBay'
       });
       parseEbayOrders();
-    }, 2000);
+    }, 3000);
   } else {
     console.log('ℹ️ No auto-parse flag (or expired)');
+    console.log(`   (retryFlag: ${retryAutoParse}, standardFlag: ${standardAutoParse}, timestamp: ${timestamp}, isRecent: ${isRecent})`);
   }
 })();
 
@@ -135,9 +177,16 @@ function checkIfLoggedIn() {
   return false;
 }
 
-// Keep existing message listener as backup
+// Message listener for manual parse triggers (from popup or background)
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   console.log('📨 Message received:', request);
+
+  // Ping - respond immediately to confirm content script is alive
+  if (request.action === 'ping') {
+    console.log('🏓 Ping received - responding pong');
+    sendResponse({ pong: true, store: 'eBay' });
+    return;
+  }
 
   // SET MODE
   if (request.options && request.options.mode) {
@@ -155,17 +204,36 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === 'autoParse' || request.action === 'exportEbayOrders' || request.action === 'parseEbay') {
-    console.log('🚀 Parse triggered');
+    // Guard: don't start if already parsing
+    if (isParsingInProgress) {
+      console.log('⚠️ Parse already in progress, ignoring duplicate trigger');
+      sendResponse({ received: true, store: 'eBay', alreadyParsing: true });
+      return false;
+    }
+    isParsingInProgress = true;
+    console.log('🚀 Parse triggered via message');
+
+    // Respond IMMEDIATELY to confirm receipt (so popup knows script is alive)
+    sendResponse({ received: true, store: 'eBay' });
+
+    // Notify background that parsing actually started
+    chrome.runtime.sendMessage({ action: 'parserStarted', store: 'eBay' });
+
+    // Start parsing asynchronously
     parseEbayOrders()
       .then(orders => {
         console.log('✅ Complete:', orders.length, 'orders');
-        sendResponse({ success: true, orders: orders });
       })
       .catch(error => {
         console.error('❌ Error:', error);
-        sendResponse({ success: false, error: error.message });
+        // Notify background about error
+        chrome.runtime.sendMessage({
+          action: 'parseError',
+          store: 'eBay',
+          error: error.message
+        });
       });
-    return true;
+    return false; // Don't keep channel open - we already responded
   }
 });
 
@@ -211,7 +279,7 @@ async function parseEbayOrders() {
   let allOrders = [];
   let page = 1;
   let hasMore = true;
-  const MAX_PAGES = 20;
+  const MAX_PAGES = 40;
 
   try {
     while (hasMore && page <= MAX_PAGES) {
@@ -240,7 +308,34 @@ async function parseEbayOrders() {
         headers: { 'Accept': 'application/json' }
       });
 
-      const data = await response.json();
+      // Check if response is valid JSON before parsing
+      const responseText = await response.text();
+
+      // Handle eBay upstream errors (temporary server issues)
+      if (responseText.includes('upstream connect error') || responseText.includes('error') && responseText.length < 200) {
+        console.warn(`⚠️ eBay API error on page ${page}: ${responseText.substring(0, 100)}`);
+        sendLog('-', '-', '⚠️ API Error', `Page ${page}: ${responseText.substring(0, 50)}`);
+        // Retry this page after a delay
+        if (page <= 2) {
+          console.log('⏳ Retrying page in 3 seconds...');
+          await new Promise(r => setTimeout(r, 3000));
+          continue; // Retry same page
+        }
+        // For later pages, just skip and continue
+        page++;
+        continue;
+      }
+
+      let data;
+      try {
+        data = JSON.parse(responseText);
+      } catch (parseError) {
+        console.error(`❌ JSON parse error on page ${page}:`, responseText.substring(0, 100));
+        sendLog('-', '-', '❌ Parse Error', `Page ${page}: Invalid JSON response`);
+        page++;
+        continue; // Skip this page
+      }
+
       let items = data.modules?.RIVER?.[0]?.data?.items || data.data?.modules?.RIVER?.[0]?.data?.items;
 
       if (!items || items.length === 0) {
@@ -262,6 +357,11 @@ async function parseEbayOrders() {
         });
 
         console.log(`✅ Parsed ${orders.length} orders`);
+        // Send logs for each order
+        orders.forEach(o => {
+          const status = o.track_number ? '✅ Found' : '⚠️ No track';
+          sendLog(o.order_id, o.track_number || '-', status, o.product_name?.substring(0, 80) || '');
+        });
         allOrders = allOrders.concat(orders);
 
         // Send updated count

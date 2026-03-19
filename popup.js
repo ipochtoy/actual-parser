@@ -19,6 +19,7 @@ function initialize() {
     });
 
     document.getElementById('parseAllStores')?.addEventListener('click', parseAllStores);
+    document.getElementById('parseMultiAmazon')?.addEventListener('click', parseMultiAccountAmazon);
     document.getElementById('exportBtn')?.addEventListener('click', exportToCsv);
     document.getElementById('copyToSheets')?.addEventListener('click', () => copyForAllStores(false));
     // copyAndOpen button removed; keep code resilient if absent
@@ -202,6 +203,21 @@ async function parseStore(store, overrides = {}) {
         button.disabled = true;
     }
 
+    // For Amazon, use multi-account parsing (photopochtoy + ipochtoy)
+    if (store.name === 'Amazon' && !overrides.skipMultiAccount) {
+        console.log('🔄 Starting multi-account Amazon parsing from regular button');
+        chrome.runtime.sendMessage({ action: "startMultiAccountAmazon" }, (response) => {
+            if (response?.status === 'started') {
+                updateStatus('🔄 Multi-account Amazon parsing started', 'success');
+            }
+        });
+        if(button) {
+            button.classList.remove('loading');
+            button.disabled = false;
+        }
+        return;
+    }
+
     try {
         // Get current mode
         const mode = document.querySelector('input[name="parseMode"]:checked')?.value || 'warehouse';
@@ -231,21 +247,47 @@ async function parseStore(store, overrides = {}) {
             }
         }
         
-        // Wait a moment for the page to be ready, especially if we just created/switched
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        
-        console.log(`Sending parse message to ${store.name} on tab ${tabToUse.id} (Mode: ${mode})`);
-        
-        const options = { 
-            pages: (store.name === 'Amazon') ? (parseInt(document.getElementById('pagesToParse')?.value, 10) || 30) : undefined,
+        const options = {
+            pages: (store.name === 'Amazon') ? (parseInt(document.getElementById('pagesToParse')?.value, 10) || 10) : undefined,
             mode: mode,
             ...overrides
         };
 
-        chrome.tabs.sendMessage(tabToUse.id, { 
-            action: store.action,
-            options: options
-        });
+        // ROBUST: Retry sendMessage until content script is ready
+        // Content scripts on SPA pages (iHerb, eBay) may not be loaded yet
+        const maxRetries = 10;
+        let sent = false;
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            // Wait longer for newly created tabs
+            const waitMs = attempt === 1 ? 1500 : 2000;
+            await new Promise(resolve => setTimeout(resolve, waitMs));
+
+            console.log(`📤 [Attempt ${attempt}/${maxRetries}] Sending parse message to ${store.name} (tab ${tabToUse.id})...`);
+
+            try {
+                await new Promise((resolve, reject) => {
+                    chrome.tabs.sendMessage(tabToUse.id, {
+                        action: store.action,
+                        options: options
+                    }, (response) => {
+                        if (chrome.runtime.lastError) {
+                            console.warn(`⚠️ Attempt ${attempt}: ${chrome.runtime.lastError.message}`);
+                            reject(chrome.runtime.lastError);
+                        } else {
+                            console.log(`✅ Message delivered to ${store.name} on attempt ${attempt}`, response);
+                            resolve(response);
+                        }
+                    });
+                });
+                sent = true;
+                break;
+            } catch (e) {
+                if (attempt === maxRetries) {
+                    console.error(`❌ Failed to send message to ${store.name} after ${maxRetries} attempts`);
+                    updateStatus(`❌ ${store.name}: content script not responding. Try refreshing the page.`, 'error');
+                }
+            }
+        }
 
     } catch (error) {
         console.error(`Error parsing ${store.name}:`, error);
@@ -276,38 +318,75 @@ async function parseAllStores() {
         });
     }
 
-    const storeConfigs = [
-        { name: 'Ebay', url: 'https://www.ebay.com/mye/myebay/purchase', action: 'exportEbayOrders' },
-        { name: 'iHerb', url: 'https://secure.iherb.com/myaccount/orders', action: 'exportIherbOrders' },
-        { name: 'Amazon', url: 'https://www.amazon.com/gp/your-account/order-history', action: 'parseAmazonOrders' }
-    ];
+    // Helper: retry sending message until content script responds
+    async function sendMessageWithRetry(tabId, message, storeName, maxRetries = 12) {
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            const waitMs = attempt <= 3 ? 2000 : 3000;
+            await new Promise(resolve => setTimeout(resolve, waitMs));
 
-    try {
-        // Step 1: Create all tabs in parallel and get their IDs
-        const tabPromises = storeConfigs.map(store => {
-            updateStoreProgress(store.name, 0, 1, "Opening...");
-            return chrome.tabs.create({ url: store.url, active: false });
-        });
-        const tabs = await Promise.all(tabPromises);
+            console.log(`📤 [${storeName}] Attempt ${attempt}/${maxRetries} sending message...`);
+            updateStoreProgress(storeName, 0, 1, `Connecting... (${attempt}/${maxRetries})`);
 
-        // Step 2: Wait for all tabs to likely have loaded
-        updateStatus('Opened tabs, waiting for them to load...', 'info');
-        await new Promise(resolve => setTimeout(resolve, 3000)); // 3-second wait
-
-        // Step 3: Send all parsing messages in parallel (NO AWAIT IN LOOP)
-        tabs.forEach((tab, i) => {
-            const store = storeConfigs[i];
             try {
-                updateStoreProgress(store.name, 0, 1, "Starting parse...");
-                // Fire and forget: send the message but don't wait for the long parsing process to finish
-                chrome.tabs.sendMessage(tab.id, { 
-                    action: store.action,
-                    options: store.name === 'Amazon' ? { pages: (parseInt(document.getElementById('pagesToParse')?.value, 10) || 30) } : undefined
+                const response = await new Promise((resolve, reject) => {
+                    chrome.tabs.sendMessage(tabId, message, (resp) => {
+                        if (chrome.runtime.lastError) {
+                            reject(chrome.runtime.lastError);
+                        } else {
+                            resolve(resp);
+                        }
+                    });
                 });
-                console.log(`✅ Sent parse command to ${store.name} (Tab ID: ${tab.id})`);
-            } catch (error) {
-                console.error(`❌ Could not send message to ${store.name} (Tab ID: ${tab.id}).`, error);
-                updateStoreProgress(store.name, 1, 1, "Error");
+                console.log(`✅ [${storeName}] Message delivered on attempt ${attempt}`, response);
+                updateStoreProgress(storeName, 0, 1, "Parsing...");
+                return true;
+            } catch (e) {
+                console.warn(`⚠️ [${storeName}] Attempt ${attempt}: ${e.message}`);
+            }
+        }
+        console.error(`❌ [${storeName}] Failed after ${maxRetries} attempts`);
+        updateStoreProgress(storeName, 1, 1, "Error - no response");
+        return false;
+    }
+
+    // Only eBay and iHerb are opened directly - Amazon uses multi-account via background.js
+    try {
+        // Step 1: Open eBay tab
+        updateStoreProgress('Ebay', 0, 1, "Opening...");
+        const ebayTab = await chrome.tabs.create({ url: 'https://www.ebay.com/mye/myebay/purchase', active: false });
+        console.log(`🌐 eBay tab created: ${ebayTab.id}`);
+
+        // Step 2: Open iHerb tab
+        updateStoreProgress('iHerb', 0, 1, "Opening...");
+        const iherbTab = await chrome.tabs.create({ url: 'https://secure.iherb.com/myaccount/orders', active: false });
+        console.log(`🌐 iHerb tab created: ${iherbTab.id}`);
+
+        // Step 3: Wait for initial page load
+        updateStatus('Waiting for pages to load...', 'info');
+        await new Promise(resolve => setTimeout(resolve, 5000));
+
+        // Step 4: Refresh iHerb to avoid "Service unavailable" issue
+        updateStoreProgress('iHerb', 0, 1, "Refreshing...");
+        await chrome.tabs.reload(iherbTab.id);
+        console.log('🔄 iHerb tab refreshed');
+
+        // Step 5: Send parse commands with retry (in parallel)
+        console.log('📤 Sending parse commands with retry...');
+        const [ebayResult, iherbResult] = await Promise.all([
+            sendMessageWithRetry(ebayTab.id, { action: 'exportEbayOrders' }, 'Ebay'),
+            sendMessageWithRetry(iherbTab.id, { action: 'exportIherbOrders' }, 'iHerb')
+        ]);
+
+        console.log(`📊 Parse commands: eBay=${ebayResult}, iHerb=${iherbResult}`);
+
+        // Step 6: Amazon uses multi-account parsing via background.js
+        updateStoreProgress('Amazon', 0, 1, "Starting multi-account...");
+        chrome.runtime.sendMessage({ action: "startMultiAccountAmazon" }, (response) => {
+            if (response?.status === 'started') {
+                console.log('✅ Multi-account Amazon parsing started');
+            } else {
+                console.error('❌ Failed to start multi-account Amazon parsing');
+                updateStoreProgress('Amazon', 1, 1, "Error");
             }
         });
 
@@ -317,6 +396,26 @@ async function parseAllStores() {
         console.error('Error in parseAllStores:', error);
         updateStatus('Failed to open or command tabs.', 'error');
     }
+}
+
+// Multi-account Amazon parsing (photopochtoy + ipochtoy)
+async function parseMultiAccountAmazon() {
+    updateStatus('🔄 Starting multi-account Amazon parsing...', 'info');
+    
+    const multiProgress = document.getElementById('multiProgress');
+    if (multiProgress) {
+        multiProgress.style.display = 'block';
+        updateStoreProgress('Amazon', 0, 1, 'Switching accounts...');
+    }
+    
+    // Send message to background to start multi-account parsing
+    chrome.runtime.sendMessage({ action: "startMultiAccountAmazon" }, (response) => {
+        if (response?.status === 'started') {
+            updateStatus('🔄 Multi-account parsing started. Check Amazon tabs.', 'success');
+        } else {
+            updateStatus('Failed to start multi-account parsing.', 'error');
+        }
+    });
 }
 
 

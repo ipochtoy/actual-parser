@@ -1,48 +1,255 @@
-console.log('🟢 iHerb content script loaded!', window.location.href);
+/* content-iherb.js — v7.5.1 (Reliable auto-parse with retry fallback) */
+console.log('🟢 iHerb Parser v7.5.1 loaded!', window.location.href);
 console.log('📄 Page title:', document.title);
 console.log('📄 Page HTML length:', document.body?.innerHTML?.length || 0);
 
-// Debug: Check if page contains "Order #"
-setTimeout(() => {
-  const allText = document.body.innerText;
-  const hasOrders = allText.includes('Order #');
-  console.log('🔍 Page contains "Order #":', hasOrders);
+// Guard against double-parse (both flag + message could trigger)
+let isParsingInProgress = false;
 
-  if (hasOrders) {
-    // Find sample elements
-    const orderElements = Array.from(document.querySelectorAll('*'))
-      .filter(el => el.textContent.includes('Order #') && el.textContent.length < 500)
-      .slice(0, 5);
-    console.log('📦 Sample elements with "Order #":', orderElements.length);
-    orderElements.forEach((el, i) => {
-      console.log(`  [${i}] ${el.tagName}.${el.className}:`, el.textContent.substring(0, 100));
+// Save log entry directly to storage
+async function sendLog(orderId, trackNumber, status, details) {
+  try {
+    const timestamp = new Date().toLocaleString('ru-RU', { 
+      hour: '2-digit', 
+      minute: '2-digit', 
+      second: '2-digit',
+      day: '2-digit',
+      month: '2-digit'
     });
+    
+    const logEntry = {
+      timestamp,
+      store: 'iHerb',
+      orderId: orderId || '-',
+      trackNumber: trackNumber || '-',
+      status,
+      details: details || ''
+    };
+    
+    const result = await chrome.storage.local.get(['parsingLogs']);
+    const logs = result.parsingLogs || [];
+    logs.push(logEntry);
+    await chrome.storage.local.set({ parsingLogs: logs });
+  } catch (e) {
+    console.error('Failed to save log:', e);
   }
+}
+
+// Debug: Quick check if page contains "Order #" (lightweight version)
+setTimeout(() => {
+  const hasOrders = document.body?.innerText?.includes('Order #') || false;
+  console.log('🔍 Page contains "Order #":', hasOrders);
 }, 2000);
 
-// Check for auto-parse flag on page load
+// Check for "Service unavailable" error and retry
+// Returns: { isUnavailable: boolean, reason: string, debug: object }
+function checkServiceUnavailable() {
+  // Use lighter weight checks - avoid heavy DOM operations
+  const pageText = document.body?.innerText || '';
+
+  // Only get HTML length, not the full content (faster)
+  const htmlLength = document.body?.innerHTML?.length || 0;
+
+  const debug = {
+    htmlLength: htmlLength,
+    textLength: pageText.length,
+    hasOrderHash: pageText.includes('Order #'),
+    hasServiceUnavailable: pageText.includes('Service unavailable'),
+    hasTryAgainLater: pageText.includes('Please try again later'),
+    hasTemporarilyUnavailable: pageText.includes('temporarily unavailable'),
+    title: document.title
+  };
+
+  console.log('🔍 Service check debug:', debug);
+
+  // If page has orders, it's definitely working - ignore any "service unavailable" text
+  if (debug.hasOrderHash) {
+    console.log('✅ Page has orders - not treating as service unavailable');
+    return { isUnavailable: false, reason: 'has_orders', debug };
+  }
+
+  // If HTML is very small (<10KB), it's likely an error page
+  if (debug.htmlLength < 10000) {
+    if (debug.hasServiceUnavailable || debug.hasTryAgainLater || debug.hasTemporarilyUnavailable) {
+      return { isUnavailable: true, reason: 'small_page_with_error', debug };
+    }
+  }
+
+  // If HTML is large but no orders found, might be loading issue - wait more
+  if (debug.htmlLength > 100000 && !debug.hasOrderHash) {
+    // Large page without orders - could be SPA still loading
+    console.log('⚠️ Large page without orders - may need more time to load');
+    return { isUnavailable: false, reason: 'large_page_loading', debug };
+  }
+
+  // Check for explicit error messages only on small/medium pages
+  if (debug.hasServiceUnavailable || debug.hasTryAgainLater || debug.hasTemporarilyUnavailable) {
+    return { isUnavailable: true, reason: 'error_text_found', debug };
+  }
+
+  return { isUnavailable: false, reason: 'no_errors', debug };
+}
+
+// Retry page reload with exponential backoff
+async function retryOnServiceUnavailable(maxRetries = 3, baseDelay = 10000) {
+  const storageKey = 'iherb_retry_count';
+  const timestampKey = 'iherb_retry_timestamp';
+
+  const data = await chrome.storage.local.get([storageKey, timestampKey, 'autoParsePending', 'autoParse_iherb', 'iherb_should_autoparse']);
+  let retryCount = data[storageKey] || 0;
+  const lastRetryTime = data[timestampKey] || 0;
+
+  // Reset retry count if last retry was more than 5 minutes ago
+  if (Date.now() - lastRetryTime > 5 * 60 * 1000) {
+    retryCount = 0;
+  }
+
+  if (retryCount >= maxRetries) {
+    console.log(`❌ Max retries (${maxRetries}) reached. Service still unavailable.`);
+    await chrome.storage.local.remove([storageKey, timestampKey, 'iherb_should_autoparse']);
+
+    // Log the failure
+    await sendLog('-', '-', '❌ Service Unavailable', `Failed after ${maxRetries} retries`);
+
+    // Notify background script about failure (so chain continues!)
+    chrome.runtime.sendMessage({
+      action: 'parseError',
+      store: 'iHerb',
+      error: 'Service unavailable after ' + maxRetries + ' retries'
+    });
+
+    return false;
+  }
+
+  // Preserve auto-parse flag for after reload (use dedicated flag that doesn't expire)
+  const shouldAutoParse = data.autoParsePending === 'iherb' || data.autoParse_iherb || data.iherb_should_autoparse;
+
+  retryCount++;
+  const delay = baseDelay * retryCount; // 10s, 20s, 30s
+
+  console.log(`⚠️ Service unavailable! Retry ${retryCount}/${maxRetries} in ${delay/1000}s...`);
+  await sendLog('-', '-', '⚠️ Retry', `Service unavailable, retry ${retryCount}/${maxRetries}`);
+
+  // Notify Telegram about retry
+  chrome.runtime.sendMessage({
+    action: 'addLog',
+    store: 'iHerb',
+    orderId: '-',
+    trackNumber: '-',
+    status: '⚠️ Retry',
+    details: `Service unavailable, retry ${retryCount}/${maxRetries} in ${delay/1000}s`
+  });
+
+  // Save retry state with dedicated auto-parse flag (doesn't expire based on timestamp)
+  await chrome.storage.local.set({
+    [storageKey]: retryCount,
+    [timestampKey]: Date.now(),
+    // Use dedicated flag that persists across reloads
+    iherb_should_autoparse: shouldAutoParse ? true : false
+  });
+
+  // Wait and reload
+  setTimeout(() => {
+    console.log('🔄 Reloading page...');
+    window.location.reload();
+  }, delay);
+
+  return true; // Retry scheduled
+}
+
+// Check for auto-parse flag on page load (with retry for slow page loads)
 (async function checkAutoParse() {
   console.log('🔍 Checking for auto-parse flag...');
 
-  const data = await chrome.storage.local.get(['autoParsePending', 'autoParse_iherb', 'autoParseTimestamp']);
+  // Try up to 3 times with delays (page might load before flag is set)
+  let shouldAutoParse = false;
+  let retryAutoParse = false;
+  let standardAutoParse = false;
+  let isRecent = false;
 
-  const shouldAutoParse = (data.autoParsePending === 'iherb') || data.autoParse_iherb;
-  const timestamp = data.autoParseTimestamp || data.autoParse_iherb;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const data = await chrome.storage.local.get(['autoParsePending', 'autoParse_iherb', 'autoParseTimestamp', 'iherb_should_autoparse']);
 
-  const isRecent = timestamp && (Date.now() - timestamp < 10000);
+    retryAutoParse = data.iherb_should_autoparse === true;
+    standardAutoParse = (data.autoParsePending === 'iherb') || data.autoParse_iherb;
+    const timestamp = data.autoParseTimestamp || data.autoParse_iherb;
+    // Increased timeout to 180 seconds (iHerb pages load slowly at night)
+    isRecent = timestamp && (Date.now() - timestamp < 180000);
 
-  if (shouldAutoParse && isRecent) {
-    console.log('✅ Auto-parse flag found! Starting parse in 2 seconds...');
+    shouldAutoParse = retryAutoParse || (standardAutoParse && isRecent);
 
-    await chrome.storage.local.remove(['autoParsePending', 'autoParse_iherb', 'autoParseTimestamp']);
+    if (shouldAutoParse) {
+      console.log(`✅ Auto-parse flag found on attempt ${attempt}!`);
+      break;
+    }
 
-    setTimeout(() => {
-      console.log('🚀 Starting auto-parse...');
-      exportOrders();
-    }, 2000);
-  } else {
-    console.log('ℹ️ No auto-parse flag (or expired)');
+    if (attempt < 3) {
+      console.log(`🔍 Attempt ${attempt}: No flag yet, waiting 3 seconds...`);
+      await new Promise(r => setTimeout(r, 3000));
+    }
   }
+
+  if (!shouldAutoParse) {
+    console.log('ℹ️ No auto-parse flag (or expired after 3 attempts) - skipping all checks');
+    return; // Exit early - don't do any heavy operations if not needed
+  }
+
+  console.log(`   (retryFlag: ${retryAutoParse}, standardFlag: ${standardAutoParse}, isRecent: ${isRecent})`);
+
+  // Clear flags early to prevent double-runs
+  await chrome.storage.local.remove(['autoParsePending', 'autoParse_iherb', 'autoParseTimestamp', 'iherb_should_autoparse']);
+
+  // Wait for React/SPA to fully load content
+  console.log('⏳ Waiting 5 seconds for page to fully load...');
+  await new Promise(resolve => setTimeout(resolve, 5000));
+
+  // Quick check if orders loaded
+  const hasOrders = document.body?.innerText?.includes('Order #') || false;
+  console.log('🔍 Quick check - has orders:', hasOrders);
+
+  if (!hasOrders) {
+    // Orders not loaded yet - wait more
+    console.log('⏳ No orders yet, waiting 5 more seconds...');
+    await new Promise(resolve => setTimeout(resolve, 5000));
+
+    const hasOrdersSecondCheck = document.body?.innerText?.includes('Order #') || false;
+    console.log('🔍 Second check - has orders:', hasOrdersSecondCheck);
+
+    if (!hasOrdersSecondCheck) {
+      // Still no orders - check if it's a real error
+      const pageText = document.body?.innerText || '';
+      const isServiceError = pageText.includes('Service unavailable') ||
+                             pageText.includes('Please try again later') ||
+                             pageText.includes('temporarily unavailable');
+
+      if (isServiceError) {
+        console.log('⚠️ Service unavailable detected!');
+        await sendLog('-', '-', '⚠️ Service Check', 'Service unavailable detected');
+        const willRetry = await retryOnServiceUnavailable();
+        if (willRetry) {
+          return;
+        }
+      } else {
+        // Just log the issue but continue anyway
+        console.log('⚠️ No orders found after 10s wait, but no error - will try to parse anyway');
+        await sendLog('-', '-', '⚠️ Warning', 'No orders after 10s wait, attempting parse anyway');
+      }
+    }
+  }
+
+  // Clear retry counter on successful load
+  await chrome.storage.local.remove(['iherb_retry_count', 'iherb_retry_timestamp']);
+
+  // Start parsing (with guard)
+  if (isParsingInProgress) {
+    console.log('⚠️ Parse already in progress (triggered by message?), skipping auto-parse');
+    return;
+  }
+  isParsingInProgress = true;
+  console.log('🚀 Starting auto-parse...');
+  // Notify background that parsing actually started
+  chrome.runtime.sendMessage({ action: 'parserStarted', store: 'iHerb' });
+  exportOrders();
 })();
 
 function checkIfLoggedIn() {
@@ -54,49 +261,94 @@ function checkIfLoggedIn() {
     return false;
   }
 
-  // Check for order history elements
-  const orderHistory = document.querySelector('.order-history-root, article[data-order-number]');
-  const accountMenu = document.querySelector('[class*="account"], [class*="user-menu"]');
-  const myAccountText = document.body.textContent.includes('My Account');
+  // Check for order history elements (lightweight selectors only)
+  const orderHistory = document.querySelector('article[data-order-number]');
+  const sidebar = document.querySelector('.my-account-sidebar, [class*="sidebar"]');
 
-  const isLoggedIn = !!(orderHistory || accountMenu || myAccountText);
+  // Check title instead of full body textContent (much faster)
+  const isOrdersPage = document.title.includes('Orders') || window.location.pathname.includes('/orders');
+
+  const isLoggedIn = !!(orderHistory || sidebar || isOrdersPage);
 
   console.log('🔐 Login check result:', {
     orderHistory: !!orderHistory,
-    accountMenu: !!accountMenu,
-    myAccountText: myAccountText,
+    sidebar: !!sidebar,
+    isOrdersPage: isOrdersPage,
     isLoggedIn: isLoggedIn
   });
 
   return isLoggedIn;
 }
 
-// Keep existing message listener as backup
+// Helper: Wait for orders to appear on page
+async function waitForOrdersToLoad(maxWaitMs = 15000) {
+  const startTime = Date.now();
+  const checkInterval = 500;
+
+  while (Date.now() - startTime < maxWaitMs) {
+    const hasOrders = document.querySelector('article[data-order-number]') !== null;
+    if (hasOrders) {
+      console.log('✅ Orders found on page!');
+      return true;
+    }
+    console.log('⏳ Waiting for orders to load...');
+    await new Promise(r => setTimeout(r, checkInterval));
+  }
+
+  console.log('⚠️ Timeout waiting for orders');
+  return false;
+}
+
+// Message listener for manual parse triggers (from popup or background)
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   console.log('📨 Message received:', request);
 
+  // Ping - respond immediately to confirm content script is alive
+  if (request.action === 'ping') {
+    console.log('🏓 Ping received - responding pong');
+    sendResponse({ pong: true, store: 'iHerb' });
+    return;
+  }
+
   if (request.action === 'autoParse' || request.action === 'exportIherbOrders' || request.action === 'parseIherb') {
-    console.log('🚀 Manual parse triggered');
-    exportOrders()
+    // Guard: don't start if already parsing
+    if (isParsingInProgress) {
+      console.log('⚠️ Parse already in progress, ignoring duplicate trigger');
+      sendResponse({ received: true, store: 'iHerb', alreadyParsing: true });
+      return false;
+    }
+    isParsingInProgress = true;
+    console.log('🚀 Manual parse triggered via message');
+
+    // Respond IMMEDIATELY to confirm receipt (so popup knows script is alive)
+    sendResponse({ received: true, store: 'iHerb' });
+
+    // Notify background that parsing actually started
+    chrome.runtime.sendMessage({ action: 'parserStarted', store: 'iHerb' });
+
+    // Start parsing asynchronously
+    waitForOrdersToLoad(15000).then(() => {
+      return exportOrders();
+    })
       .then(result => {
         console.log('✅ Complete:', result.orders.length, 'orders');
         console.log(`📊 Stats: ${result.stats.addedCount} new, ${result.stats.updatedCount} updated`);
-        sendResponse({
-          success: true,
-          orders: result.orders,
-          stats: result.stats
-        });
       })
       .catch(error => {
         console.error('❌ Export Error:', error);
         console.error('❌ Error stack:', error.stack);
-        sendResponse({ success: false, error: error.message });
+        // Notify background about error
+        chrome.runtime.sendMessage({
+          action: 'parseError',
+          store: 'iHerb',
+          error: error.message
+        });
       });
-    return true;
+    return false; // Don't keep channel open - we already responded
   }
 });
 
-async function slowProgressiveScroll(limit = 76) {
+async function slowProgressiveScroll(limit = 150) {
     console.log(`📜 Starting SLOW progressive scroll (limit: ${limit} orders)...`);
     console.log('⚠️  Scrolling slowly to avoid 429 errors - please wait!');
 
@@ -132,7 +384,7 @@ async function slowProgressiveScroll(limit = 76) {
     console.log(`📊 Starting with ${initialCount} orders visible`);
 
     let scrollAttempts = 0;
-    const maxScrollAttempts = 30; // Maximum 30 scroll attempts
+    const maxScrollAttempts = 60; // Increased from 30 to 60 scroll attempts
 
     while (scrollAttempts < maxScrollAttempts) {
         scrollAttempts++;
@@ -306,51 +558,73 @@ function extractTrackingFromDOM(orderContainer, orderId, isFirstOrder = false) {
 function parseOrders() {
     const orders = [];
 
-    console.log('🧪 === IHERB PARSER (REAL STRUCTURE - Oct 2025) ===');
+    console.log('🧪 === IHERB PARSER (REAL STRUCTURE - Jan 2026) ===');
     console.log('🕐 Parse time:', new Date().toISOString());
     console.log('📍 Current URL:', window.location.href);
 
-    // STEP 1: Find all order headers with pattern "Order #939168115"
-    console.log('\n📦 STEP 1: Finding order headers...');
-    const allElements = document.querySelectorAll('*');
-    console.log(`  Scanning ${allElements.length} elements`);
+    // STEP 1: Find all order containers using article[data-order-number] (fast, specific selector)
+    console.log('\n📦 STEP 1: Finding order containers...');
 
-    const orderHeaders = Array.from(allElements).filter(el => {
-        const text = el.textContent || '';
-        // Match "Order #" followed by 9-10 digits, but text should be relatively short
-        return /Order\s+#\d{9,10}/.test(text) && text.length < 200;
-    });
+    // Primary method: Use data-order-number attribute (fast and reliable)
+    let orderContainers = Array.from(document.querySelectorAll('article[data-order-number]'));
+    console.log(`  Found ${orderContainers.length} articles with data-order-number`);
+
+    // Fallback: If no articles found, try to extract from page text
+    if (orderContainers.length === 0) {
+        console.log('  ⚠️ No article elements found, trying text-based extraction...');
+
+        // Get all order IDs from page text (fast regex on innerText)
+        const pageText = document.body?.innerText || '';
+        const orderMatches = pageText.match(/Order\s+#(\d{9,10})/g);
+
+        if (orderMatches && orderMatches.length > 0) {
+            console.log(`  📋 Found ${orderMatches.length} order references in text`);
+            // Create pseudo-containers for each unique order
+            const uniqueOrderIds = [...new Set(orderMatches.map(m => m.match(/\d{9,10}/)[0]))];
+            console.log(`  📋 Unique orders: ${uniqueOrderIds.length}`);
+
+            // For text-based extraction, we need to find elements differently
+            // Look for elements containing specific order IDs
+            uniqueOrderIds.slice(0, 150).forEach(orderId => {
+                // Try to find a container for this order
+                const selector = `[data-order-number="${orderId}"], [data-order-id="${orderId}"]`;
+                const container = document.querySelector(selector);
+                if (container) {
+                    orderContainers.push(container);
+                }
+            });
+
+            console.log(`  Found ${orderContainers.length} containers via ID lookup`);
+        }
+    }
+
+    // Build orderHeaders array from containers for compatibility with rest of code
+    const orderHeaders = orderContainers.map(container => {
+        const orderId = container.getAttribute('data-order-number') ||
+                       container.getAttribute('data-order-id') ||
+                       (container.textContent.match(/Order\s+#(\d{9,10})/) || [])[1];
+        return { element: container, orderId: orderId };
+    }).filter(h => h.orderId);
 
     console.log(`  ✅ Found ${orderHeaders.length} order header elements`);
 
     // Show sample headers for debugging
     orderHeaders.slice(0, 3).forEach((header, i) => {
-        const match = header.textContent.match(/Order\s+#(\d{9,10})/);
-        console.log(`    [${i}] Order #${match ? match[1] : 'N/A'} - ${header.tagName}.${header.className}`);
+        console.log(`    [${i}] Order #${header.orderId}`);
     });
 
     if (orderHeaders.length === 0) {
         console.error('❌ No order headers found!');
-
-        // Debug: Check if page contains "Order #" at all
-        const pageText = document.body.innerText;
-        const hasOrderText = pageText.includes('Order #');
+        const hasOrderText = (document.body?.innerText || '').includes('Order #');
         console.log('  🔍 Page contains "Order #":', hasOrderText);
-
-        if (hasOrderText) {
-            const orderMatches = pageText.match(/Order\s+#\d{9,10}/g);
-            console.log('  📋 Found in page text:', orderMatches?.slice(0, 5));
-            console.log('  ⚠️ Pattern exists but elements not detected - try adjusting filter');
-        }
-
         return orders;
     }
 
     // STEP 2: For each order header, find its container and extract products
-    console.log('\n📦 STEP 2: Processing each order (limit: 76)...');
+    console.log('\n📦 STEP 2: Processing each order (limit: 150)...');
 
     const processedOrders = new Set();
-    const MAX_ORDERS = 76;
+    const MAX_ORDERS = 150;
 
     // Send initial processing progress
     chrome?.runtime?.sendMessage?.({
@@ -361,18 +635,16 @@ function parseOrders() {
         status: 'Processing orders...'
     });
 
-    orderHeaders.forEach((header, headerIndex) => {
-        // LIMIT: Stop at 25 orders
+    orderHeaders.forEach((headerObj, headerIndex) => {
+        // LIMIT: Stop at 76 orders
         if (processedOrders.size >= MAX_ORDERS) {
             console.log(`\n⏹️  Reached ${MAX_ORDERS} orders limit - stopping processing`);
             return;
         }
 
-        // Extract order ID
-        const orderMatch = header.textContent.match(/Order\s+#(\d{9,10})/);
-        if (!orderMatch) return;
-
-        const orderId = orderMatch[1];
+        // Extract order ID from our preprocessed object
+        const orderId = headerObj.orderId;
+        if (!orderId) return;
 
         // Skip duplicates
         if (processedOrders.has(orderId)) {
@@ -393,24 +665,8 @@ function parseOrders() {
             status: `Processing order ${processedOrders.size}/${MAX_ORDERS}...`
         });
 
-        // Find order container by going up parent chain
-        let orderContainer = header;
-
-        // Try to find a good container - look for parent that might contain products
-        // Try multiple strategies
-        for (let i = 0; i < 10; i++) {
-            if (!orderContainer.parentElement) break;
-            orderContainer = orderContainer.parentElement;
-
-            // Check if this container has product-like elements
-            const hasQty = orderContainer.textContent.includes('Qty:');
-            const hasProducts = orderContainer.querySelectorAll('img, a[href*="/pr/"]').length > 0;
-
-            if (hasQty || hasProducts) {
-                console.log(`    📦 Found container at level ${i}: ${orderContainer.tagName}.${orderContainer.className || '(no class)'}`);
-                break;
-            }
-        }
+        // Use the element directly as container (it's already the article element)
+        let orderContainer = headerObj.element;
 
         // Extract date if available
         const dateMatch = orderContainer.textContent.match(/Placed\s+on\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})/i);
@@ -463,6 +719,7 @@ function parseOrders() {
                     color: '',
                     size: ''
                 });
+                sendLog(orderId, trackingNumber, '✅ Found', productName.substring(0, 80));
             });
         } else {
             // Process elements with Qty
@@ -513,6 +770,7 @@ function parseOrders() {
                         color: '',
                         size: ''
                     });
+                    sendLog(orderId, trackingNumber, '✅ Found', productName.substring(0, 80));
                 }
             });
         }
@@ -705,7 +963,7 @@ async function exportOrders() {
         console.log('⏳ Waiting for page to fully load...');
         await new Promise(resolve => setTimeout(resolve, 2000));
 
-        await slowProgressiveScroll(25);
+        await slowProgressiveScroll(150);
         const result = parseOrders();
 
         if (!result.orders || result.orders.length === 0) {

@@ -1,4 +1,36 @@
-// Background script for Pochtoy Parser - v6.10.5 (Service Worker Fix)
+// Background script for Pochtoy Parser - v7.5.0 (Fix: multi-product deduplication, eBay error handling)
+
+// --- Daily Auto-Parse at 1:00 AM ---
+const DAILY_PARSE_HOUR = 1; // 1:00 AM
+const DAILY_PARSE_MINUTE = 0;
+const DAILY_ALARM_NAME = 'dailyAutoParse';
+
+function setupDailyAlarm() {
+    // Calculate ms until next 1:00 AM
+    const now = new Date();
+    const next = new Date();
+    next.setHours(DAILY_PARSE_HOUR, DAILY_PARSE_MINUTE, 0, 0);
+    
+    // If it's already past 1:00 today, schedule for tomorrow
+    if (now >= next) {
+        next.setDate(next.getDate() + 1);
+    }
+    
+    const msUntilNext = next.getTime() - now.getTime();
+    const minutesUntilNext = msUntilNext / 1000 / 60;
+    
+    console.log(`⏰ Daily parse scheduled for ${next.toLocaleString('ru-RU')} (in ${Math.round(minutesUntilNext)} minutes)`);
+    
+    // Create alarm
+    chrome.alarms.create(DAILY_ALARM_NAME, {
+        delayInMinutes: minutesUntilNext,
+        periodInMinutes: 24 * 60 // Repeat every 24 hours
+    });
+}
+
+// Initialize daily alarm on extension start
+setupDailyAlarm();
+console.log('✅ Daily auto-parse ENABLED (1:00 AM)');
 
 // --- Google Auth Functions (inlined to avoid import issues) ---
 function getAuthToken(interactive) {
@@ -101,6 +133,183 @@ let storesCompleted = { ebay: false, iherb: false, amazon: false };
 let isParsingAllStores = false;
 const DEFAULT_SPREADSHEET_ID = '1w1QOzGWc_CNovlezuxyLta-h1kM3pgPXc_GoHYaOA98';
 
+// --- Multi-Account Amazon Parsing ---
+const AMAZON_ACCOUNTS_TO_PARSE = [
+  'photopochtoy@gmail.com',
+  'ipochtoy@gmail.com'
+];
+let amazonAccountsQueue = [];
+let currentAmazonAccount = null;
+let isMultiAccountParsing = false;
+
+// --- Parsing Logs ---
+const LOGS_SHEET_NAME = 'Logs';
+
+async function addParsingLog(store, orderId, trackNumber, status, details) {
+    const timestamp = new Date().toLocaleString('ru-RU', { 
+        hour: '2-digit', 
+        minute: '2-digit', 
+        second: '2-digit',
+        day: '2-digit',
+        month: '2-digit'
+    });
+    const logEntry = {
+        timestamp,
+        store,
+        orderId: orderId || '-',
+        trackNumber: trackNumber || '-',
+        status,
+        details: details || ''
+    };
+    
+    // Store in chrome.storage.local to persist across service worker restarts
+    const result = await chrome.storage.local.get(['parsingLogs']);
+    const logs = result.parsingLogs || [];
+    logs.push(logEntry);
+    await chrome.storage.local.set({ parsingLogs: logs });
+}
+
+async function clearParsingLogs() {
+    await chrome.storage.local.set({ parsingLogs: [] });
+    console.log('📋 Parsing logs cleared');
+}
+
+async function getParsingLogs() {
+    const result = await chrome.storage.local.get(['parsingLogs']);
+    return result.parsingLogs || [];
+}
+
+async function ensureLogsSheetExists(spreadsheetId, authToken) {
+    // Check if sheet exists
+    const metaResponse = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?fields=sheets.properties.title`, {
+        headers: { 'Authorization': `Bearer ${authToken}` }
+    });
+    
+    if (!metaResponse.ok) {
+        console.error('❌ Failed to get spreadsheet metadata:', await metaResponse.text());
+        return false;
+    }
+    
+    const meta = await metaResponse.json();
+    const sheetNames = meta.sheets?.map(s => s.properties.title) || [];
+    console.log(`📋 Existing sheets: ${sheetNames.join(', ')}`);
+    
+    if (!sheetNames.includes(LOGS_SHEET_NAME)) {
+        console.log(`📋 Creating "${LOGS_SHEET_NAME}" sheet...`);
+        const createResponse = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`, {
+            method: 'POST',
+            headers: { 
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                requests: [{
+                    addSheet: {
+                        properties: { title: LOGS_SHEET_NAME }
+                    }
+                }]
+            })
+        });
+        
+        if (!createResponse.ok) {
+            console.error('❌ Failed to create sheet:', await createResponse.text());
+            return false;
+        }
+        console.log(`✅ Sheet "${LOGS_SHEET_NAME}" created`);
+    }
+    return true;
+}
+
+let logsUploadInProgress = false;
+
+async function uploadLogsToSheet() {
+    // Prevent double upload
+    if (logsUploadInProgress) {
+        console.log('📋 Logs upload already in progress, skipping');
+        return;
+    }
+    logsUploadInProgress = true;
+    
+    const parsingLogs = await getParsingLogs();
+    console.log(`📋 uploadLogsToSheet called. Logs count: ${parsingLogs.length}`);
+    
+    if (parsingLogs.length === 0) {
+        console.log('📋 No logs to upload - array is empty!');
+        logsUploadInProgress = false;
+        return;
+    }
+    
+    // Debug: show first 3 logs
+    console.log('📋 First 3 logs:', parsingLogs.slice(0, 3));
+    
+    try {
+        const result = await chrome.storage.local.get(['spreadsheetId']);
+        const spreadsheetId = result.spreadsheetId || DEFAULT_SPREADSHEET_ID;
+        console.log(`📋 Uploading to spreadsheet: ${spreadsheetId}, sheet: ${LOGS_SHEET_NAME}`);
+        const authToken = await getAuthToken(true);
+        
+        // Ensure Logs sheet exists
+        const sheetReady = await ensureLogsSheetExists(spreadsheetId, authToken);
+        if (!sheetReady) {
+            throw new Error('Failed to ensure Logs sheet exists');
+        }
+        
+        // Clear existing data in Logs sheet
+        console.log('📋 Clearing old data...');
+        const clearRange = encodeURIComponent(`${LOGS_SHEET_NAME}!A:F`);
+        const clearResponse = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${clearRange}:clear`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+        
+        if (!clearResponse.ok) {
+            console.error('⚠️ Clear failed (non-critical):', await clearResponse.text());
+        }
+        
+        // Prepare data with header
+        console.log(`📋 Preparing ${parsingLogs.length} rows...`);
+        const header = ['Время', 'Магазин', 'Order ID', 'Track', 'Статус', 'Детали'];
+        const rows = parsingLogs.map(log => [
+            log.timestamp,
+            log.store,
+            log.orderId,
+            log.trackNumber,
+            log.status,
+            log.details
+        ]);
+        const values = [header, ...rows];
+        
+        // Write new data
+        console.log(`📋 Writing ${values.length} rows to ${LOGS_SHEET_NAME}!A1...`);
+        const range = encodeURIComponent(`${LOGS_SHEET_NAME}!A1`);
+        const writeResponse = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${range}?valueInputOption=USER_ENTERED`, {
+            method: 'PUT',
+            headers: { 
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ values })
+        });
+        
+        if (!writeResponse.ok) {
+            const errorText = await writeResponse.text();
+            console.error(`❌ Write failed: ${writeResponse.status}`, errorText);
+            throw new Error(`API error: ${writeResponse.status} - ${errorText}`);
+        }
+        
+        const writeResult = await writeResponse.json();
+        console.log(`✅ Write success:`, writeResult);
+        console.log(`📋 Uploaded ${parsingLogs.length} log entries to ${LOGS_SHEET_NAME} sheet`);
+        sendTelegramMessage(`📋 Логи (${parsingLogs.length}) → лист "${LOGS_SHEET_NAME}" ✅`);
+        
+        logsUploadInProgress = false;
+    } catch (error) {
+        console.error('Failed to upload logs:', error);
+        sendTelegramMessage(`⚠️ Не удалось сохранить логи: ${error.message}`);
+        logsUploadInProgress = false;
+    }
+}
+
 // --- Telegram Bot State ---
 let tgBotToken = '8274480416:AAEIvhNsqzDl-dYHMOpjTJ0b1XyS_0lW88w'; // Default token provided by user
 let tgChatId = null;
@@ -150,13 +359,26 @@ let successCount = 0;
 let failureCount = 0;
 
 // --- Progress Handler Function ---
-function handleProgressMessage(request) {
+async function handleProgressMessage(request) {
     // Persist progress to storage so popup can restore it when reopened
     const storeKey = request.store.toLowerCase();
     console.log(`📊 [BACKGROUND] Progress from ${request.store}:`, request.current, '/', request.total, request.status);
 
-    // Update completion status
-    if (isParsingAllStores && (request.status === 'Done ✅' || request.status === 'Error')) {
+    // Restore multi-account state from storage FIRST (Service Worker may have restarted)
+    const stored = await new Promise(resolve => chrome.storage.local.get(['multiAccountState'], resolve));
+    if (stored.multiAccountState) {
+        isMultiAccountParsing = stored.multiAccountState.isMultiAccountParsing;
+        amazonAccountsQueue = stored.multiAccountState.amazonAccountsQueue || [];
+        currentAmazonAccount = stored.multiAccountState.currentAmazonAccount;
+    }
+
+    // Update completion status (for Parse All Stores OR Multi-Account Amazon)
+    const isCompleted = request.status === 'Done ✅' || request.status === 'Error';
+    const shouldHandleCompletion = isCompleted && (isParsingAllStores || (storeKey === 'amazon' && isMultiAccountParsing));
+    
+    console.log(`🔍 [DEBUG] isCompleted: ${isCompleted}, isParsingAllStores: ${isParsingAllStores}, isMultiAccountParsing: ${isMultiAccountParsing}, shouldHandle: ${shouldHandleCompletion}`);
+    
+    if (shouldHandleCompletion) {
         // Update cache with found count BEFORE checking completion
         cachedProgressState[storeKey] = {
             current: request.current,
@@ -170,19 +392,38 @@ function handleProgressMessage(request) {
         chrome.storage.local.set({ progressState: cachedProgressState });
 
         if (storeKey in storesCompleted) {
-            storesCompleted[storeKey] = true;
-
             // Send completion message to Telegram
             const count = request.found || 0;
             const emoji = request.status === 'Error' ? '❌' : '✅';
-            sendTelegramMessage(`${emoji} ${storeKey.charAt(0).toUpperCase() + storeKey.slice(1)}: Готово (${count} заказов)`);
+            
+            console.log(`🔍 [DEBUG] Store completed: ${storeKey}, isMultiAccountParsing: ${isMultiAccountParsing}, amazonAccountsQueue: ${JSON.stringify(amazonAccountsQueue)}, currentAccount: ${currentAmazonAccount}`);
+            
+            // Check if Amazon has more accounts to parse
+            if (storeKey === 'amazon' && isMultiAccountParsing && amazonAccountsQueue.length > 0) {
+                const accountName = currentAmazonAccount ? currentAmazonAccount.split('@')[0] : 'current';
+                sendTelegramMessage(`${emoji} Amazon (${accountName}): Готово (${count} заказов). Переключаюсь на следующий аккаунт...`);
+                
+                // Switch to next account
+                switchToNextAmazonAccount();
+                return; // Don't mark amazon as completed yet
+            }
+            
+            storesCompleted[storeKey] = true;
+            
+            if (storeKey === 'amazon' && currentAmazonAccount) {
+                sendTelegramMessage(`${emoji} Amazon (${currentAmazonAccount.split('@')[0]}): Готово (${count} заказов)`);
+                isMultiAccountParsing = false;
+                currentAmazonAccount = null;
+            } else {
+                sendTelegramMessage(`${emoji} ${storeKey.charAt(0).toUpperCase() + storeKey.slice(1)}: Готово (${count} заказов)`);
+            }
 
             checkAllStoresCompleted();
         }
     }
 
     // Update cache synchronously (if not already updated above)
-    if (!(isParsingAllStores && (request.status === 'Done ✅' || request.status === 'Error'))) {
+    if (!shouldHandleCompletion) {
         cachedProgressState[storeKey] = {
             current: request.current,
             total: request.total,
@@ -210,8 +451,16 @@ function handleProgressMessage(request) {
 // --- Message Listener ---
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // Debug logs for messages
-    if (request.action !== 'progress') { // Reduce noise
+    if (request.action !== 'progress' && request.action !== 'addLog') { // Reduce noise
         console.log('📨 Message received:', request.action, request);
+    }
+    
+    // Handle parsing logs
+    if (request.action === 'addLog') {
+        addParsingLog(request.store, request.orderId, request.trackNumber, request.status, request.details)
+            .then(() => getParsingLogs())
+            .then(logs => console.log(`📝 Log added: ${request.store} | ${request.orderId} | ${request.status} (total: ${logs.length})`));
+        return;
     }
 
     if (request.action === "startPochtoyAutomation") {
@@ -242,9 +491,21 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         // Reset progress cache
         cachedProgressState = {};
         chrome.storage.local.set({ progressState: cachedProgressState });
+        
+        // Clear parsing logs for new session
+        clearParsingLogs();
 
         sendTelegramMessage(`🚀 Запущен парсинг всех магазинов (eBay, iHerb, Amazon)...`);
         sendResponse({status: "started"});
+    } else if (request.action === "startMultiAccountAmazon") {
+        // Start multi-account Amazon parsing
+        startMultiAccountAmazonParsing();
+        sendResponse({status: "started"});
+    } else if (request.action === "accountSwitchFailed") {
+        console.log(`❌ Account switch failed for ${request.email}: ${request.error}`);
+        sendTelegramMessage(`❌ Не удалось переключиться на ${request.email}: ${request.error}`);
+        // Try next account or finish
+        switchToNextAmazonAccount();
     } else if (request.action === "parsingProgress") {
         // Handle parsingProgress from content scripts (convert to progress format)
         const progressData = request.data || {};
@@ -282,6 +543,30 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }[request.store] || '🔄';
         sendTelegramMessage(`${storeEmoji} ${request.store}: Парсинг успешно начался!`);
         console.log(`✅ ${request.store} parser started successfully`);
+    } else if (request.action === "parseError") {
+        // Handle parsing errors (e.g., Service unavailable after retries)
+        const storeKey = request.store?.toLowerCase();
+        const errorMsg = request.error || 'Unknown error';
+
+        console.log(`❌ [BACKGROUND] Parse error from ${request.store}: ${errorMsg}`);
+        sendTelegramMessage(`❌ ${request.store}: Ошибка парсинга - ${errorMsg}`);
+
+        // Mark store as completed (with error) so the chain continues
+        if (storeKey && storeKey in storesCompleted) {
+            storesCompleted[storeKey] = true;
+            saveParsingState();
+
+            // Update progress state to show error
+            cachedProgressState[storeKey] = {
+                current: 0,
+                total: 0,
+                status: 'Error',
+                found: 0
+            };
+            chrome.storage.local.set({ progressState: cachedProgressState });
+
+            checkAllStoresCompleted();
+        }
     }
     return true; // Keep channel open for async responses
 });
@@ -294,6 +579,206 @@ function saveParsingState() {
         }
     });
 }
+
+// Switch to next Amazon account for multi-account parsing
+async function switchToNextAmazonAccount() {
+    // Restore state from storage in case Service Worker restarted
+    const stored = await chrome.storage.local.get(['multiAccountState']);
+    if (stored.multiAccountState) {
+        isMultiAccountParsing = stored.multiAccountState.isMultiAccountParsing;
+        amazonAccountsQueue = stored.multiAccountState.amazonAccountsQueue || [];
+        currentAmazonAccount = stored.multiAccountState.currentAmazonAccount;
+        console.log('🔄 Restored multi-account state:', stored.multiAccountState);
+    }
+    
+    if (amazonAccountsQueue.length === 0) {
+        console.log('📋 No more Amazon accounts to parse');
+        isMultiAccountParsing = false;
+        currentAmazonAccount = null;
+        
+        // Clear state
+        await chrome.storage.local.remove(['multiAccountState']);
+        
+        storesCompleted.amazon = true;
+        sendTelegramMessage(`✅ Все аккаунты Amazon отпарсены!`);
+        checkAllStoresCompleted();
+        return;
+    }
+    
+    const nextEmail = amazonAccountsQueue.shift();
+    currentAmazonAccount = nextEmail;
+    
+    console.log(`🔄 Switching to Amazon account: ${nextEmail}`);
+    sendTelegramMessage(`🔄 Переключаюсь на аккаунт: ${nextEmail.split('@')[0]}`);
+    
+    // Save pending switch and updated state, clear completion flag and old pagination
+    await chrome.storage.local.set({
+        pendingAccountSwitch: { email: nextEmail },
+        amazonParsingComplete: null, // Clear so watchdog doesn't trigger prematurely
+        amazonPaginationState: null, // Clear old pagination to start fresh on new account!
+        multiAccountState: {
+            isMultiAccountParsing: true,
+            amazonAccountsQueue: amazonAccountsQueue,
+            currentAmazonAccount: nextEmail
+        }
+    });
+    
+    // Find active tab or create new one
+    const tabs = await chrome.tabs.query({ url: 'https://www.amazon.com/*' });
+    
+    const switchUrl = 'https://www.amazon.com/ap/signin?openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.amazon.com%2F%3Fref_%3Dnav_youraccount_switchacct&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.assoc_handle=usflex&openid.mode=checkid_setup&marketPlaceId=ATVPDKIKX0DER&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&switch_account=picker&ignoreAuthState=1&_encoding=UTF8';
+    
+    if (tabs.length > 0) {
+        // Navigate existing Amazon tab to switch-account page
+        await chrome.tabs.update(tabs[0].id, { 
+            url: switchUrl,
+            active: true 
+        });
+    } else {
+        // Create new tab
+        await chrome.tabs.create({ 
+            url: switchUrl 
+        });
+    }
+}
+
+// Initialize multi-account Amazon parsing
+async function startMultiAccountAmazonParsing() {
+    console.log('🚀 startMultiAccountAmazonParsing called');
+    
+    // STEP 1: Close ALL existing Amazon tabs to avoid race conditions
+    const existingTabs = await chrome.tabs.query({ url: 'https://www.amazon.com/*' });
+    if (existingTabs.length > 0) {
+        console.log(`🧹 Closing ${existingTabs.length} existing Amazon tabs...`);
+        for (const tab of existingTabs) {
+            try {
+                await chrome.tabs.remove(tab.id);
+            } catch (e) {
+                console.log('Tab already closed:', e);
+            }
+        }
+        // Small delay to ensure tabs are closed
+        await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    
+    amazonAccountsQueue = [...AMAZON_ACCOUNTS_TO_PARSE];
+    isMultiAccountParsing = true;
+    currentAmazonAccount = null;
+    
+    // STEP 2: Clear ALL related flags BEFORE proceeding (with await!)
+    await new Promise(resolve => {
+        chrome.storage.local.set({ 
+            stopAllParsers: false,
+            amazonParsingComplete: null,
+            amazonPaginationState: null,
+            multiAccountState: {
+                isMultiAccountParsing: true,
+                amazonAccountsQueue: amazonAccountsQueue,
+                currentAmazonAccount: null
+            }
+        }, resolve);
+    });
+    console.log('✅ multiAccountState saved to storage');
+    
+    console.log(`🚀 Starting multi-account Amazon parsing for ${amazonAccountsQueue.length} accounts`);
+    sendTelegramMessage(`🔄 Запускаю парсинг ${amazonAccountsQueue.length} аккаунтов Amazon: ${AMAZON_ACCOUNTS_TO_PARSE.map(e => e.split('@')[0]).join(', ')}`);
+    
+    // Start watchdog timer to check for completion flag
+    startCompletionWatchdog();
+    
+    // Start with first account switch
+    switchToNextAmazonAccount();
+}
+
+// Watchdog using chrome.alarms (reliable even when Service Worker sleeps)
+const WATCHDOG_ALARM_NAME = 'amazonCompletionWatchdog';
+
+function startCompletionWatchdog() {
+    console.log('👀 Starting completion watchdog with chrome.alarms...');
+    // Create alarm that fires every 5 seconds (minimum is 0.5 minutes for production, but we use 0.1 for dev)
+    chrome.alarms.create(WATCHDOG_ALARM_NAME, { 
+        delayInMinutes: 0.05,  // First check in 3 seconds
+        periodInMinutes: 0.05  // Then every 3 seconds (0.05 min = 3 sec)
+    });
+}
+
+function stopCompletionWatchdog() {
+    chrome.alarms.clear(WATCHDOG_ALARM_NAME);
+    console.log('🛑 Watchdog alarm stopped');
+}
+
+// Alarm listener - this fires even when Service Worker wakes up
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+    // Handle daily auto-parse
+    if (alarm.name === DAILY_ALARM_NAME) {
+        console.log('⏰ Daily auto-parse alarm triggered!');
+        
+        // Check if auto-parse is enabled
+        const settings = await chrome.storage.local.get(['dailyAutoParseEnabled']);
+        if (settings.dailyAutoParseEnabled === false) {
+            console.log('⏰ Auto-parse is disabled, skipping');
+            return;
+        }
+        
+        sendTelegramMessage('⏰ Автоматический ночной парсинг запущен (1:00)...');
+        
+        // Reset states and start parsing
+        isParsingAllStores = true;
+        storesCompleted = { ebay: false, iherb: false, amazon: false };
+        saveParsingState();
+        cachedProgressState = {};
+        chrome.storage.local.set({ progressState: cachedProgressState, stopAllParsers: false });
+        await clearParsingLogs();
+        
+        // Launch parsers
+        launchParsersFromBackground();
+        return;
+    }
+    
+    if (alarm.name !== WATCHDOG_ALARM_NAME) return;
+    
+    const stored = await chrome.storage.local.get(['amazonParsingComplete', 'multiAccountState']);
+    
+    if (stored.amazonParsingComplete && stored.amazonParsingComplete.timestamp) {
+        const age = Date.now() - stored.amazonParsingComplete.timestamp;
+        // Only process if flag is fresh (less than 60 seconds old)
+        if (age < 60000) {
+            console.log('👀 Watchdog detected completion flag!', stored.amazonParsingComplete);
+            
+            // Restore multi-account state
+            if (stored.multiAccountState) {
+                isMultiAccountParsing = stored.multiAccountState.isMultiAccountParsing;
+                amazonAccountsQueue = stored.multiAccountState.amazonAccountsQueue || [];
+                currentAmazonAccount = stored.multiAccountState.currentAmazonAccount;
+            }
+            
+            // Clear the flag so we don't process again
+            await chrome.storage.local.set({ amazonParsingComplete: null });
+            
+            // If multi-account parsing and more accounts remain
+            if (isMultiAccountParsing && amazonAccountsQueue.length > 0) {
+                const count = stored.amazonParsingComplete.found || 0;
+                const accountName = currentAmazonAccount ? currentAmazonAccount.split('@')[0] : 'current';
+                sendTelegramMessage(`✅ Amazon (${accountName}): Готово (${count} заказов). Переключаюсь на следующий аккаунт...`);
+                switchToNextAmazonAccount();
+            } else if (isMultiAccountParsing) {
+                // Last account done
+                const count = stored.amazonParsingComplete.found || 0;
+                const accountName = currentAmazonAccount ? currentAmazonAccount.split('@')[0] : 'last';
+                sendTelegramMessage(`✅ Amazon (${accountName}): Готово (${count} заказов)`);
+                sendTelegramMessage(`✅ Все аккаунты Amazon отпарсены!`);
+                
+                isMultiAccountParsing = false;
+                currentAmazonAccount = null;
+                await chrome.storage.local.remove(['multiAccountState']);
+                
+                storesCompleted.amazon = true;
+                stopCompletionWatchdog();
+                checkAllStoresCompleted();
+            }
+        }
+    }
+});
 
 // Check if all stores completed and trigger auto-upload
 async function checkAllStoresCompleted() {
@@ -317,8 +802,10 @@ async function checkAllStoresCompleted() {
         chrome.runtime.sendMessage({ action: 'allStoresCompleted' });
 
         // Small delay to ensure data is settled
-        setTimeout(() => {
-            uploadToSheets();
+        setTimeout(async () => {
+            await uploadToSheets();
+            // Upload parsing logs after data
+            await uploadLogsToSheet();
         }, 1000);
     }
 }
@@ -810,7 +1297,35 @@ async function pollTelegramUpdates() {
                         console.log('🛑 Stop command received via Telegram');
                         chrome.storage.local.set({ stopAllParsers: true });
                         sendTelegramMessage('🛑 Принято! Останавливаю парсинг и автоматизацию...');
-                        // Also tell tabs? Not really needed as they poll storage or check on next page
+                        continue;
+                    }
+                    
+                    // Auto-parse commands
+                    if (text === '/autoparse on' || text === '/auto on') {
+                        await chrome.storage.local.set({ dailyAutoParseEnabled: true });
+                        setupDailyAlarm();
+                        sendTelegramMessage('⏰ Автопарсинг ВКЛЮЧЕН! Буду запускаться каждый день в 1:00 ночи.');
+                        continue;
+                    }
+                    
+                    if (text === '/autoparse off' || text === '/auto off') {
+                        await chrome.storage.local.set({ dailyAutoParseEnabled: false });
+                        chrome.alarms.clear(DAILY_ALARM_NAME);
+                        sendTelegramMessage('⏰ Автопарсинг ВЫКЛЮЧЕН.');
+                        continue;
+                    }
+                    
+                    if (text === '/status') {
+                        const settings = await chrome.storage.local.get(['dailyAutoParseEnabled']);
+                        const autoEnabled = settings.dailyAutoParseEnabled !== false; // default true
+                        const alarm = await chrome.alarms.get(DAILY_ALARM_NAME);
+                        let statusMsg = `📊 Статус:\n`;
+                        statusMsg += `⏰ Автопарсинг: ${autoEnabled ? 'ВКЛ' : 'ВЫКЛ'}\n`;
+                        if (alarm) {
+                            const nextRun = new Date(alarm.scheduledTime);
+                            statusMsg += `📅 Следующий запуск: ${nextRun.toLocaleString('ru-RU')}`;
+                        }
+                        sendTelegramMessage(statusMsg);
                         continue;
                     }
 
@@ -873,6 +1388,66 @@ async function pollTelegramUpdates() {
     }
 }
 
+// FALLBACK: Send parse commands via sendMessage with retry
+// In case auto-parse flags didn't trigger (e.g., content script loaded before flags were set)
+async function sendParseCommandsWithRetry(openedTabs) {
+    const storeConfigs = [
+        { key: 'ebay', tabId: openedTabs.ebay, action: 'exportEbayOrders', name: 'eBay' },
+        { key: 'iherb', tabId: openedTabs.iherb, action: 'exportIherbOrders', name: 'iHerb' }
+    ];
+
+    // Wait for pages to initially load
+    await new Promise(r => setTimeout(r, 10000));
+    console.log('📤 [FALLBACK] Starting sendMessage retry for eBay & iHerb...');
+
+    for (const store of storeConfigs) {
+        if (!store.tabId) continue;
+
+        // Check if this store already started parsing (flag was picked up)
+        if (storesCompleted[store.key]) {
+            console.log(`✅ [FALLBACK] ${store.name} already completed, skipping`);
+            continue;
+        }
+
+        // Check if parserStarted message was received (meaning auto-parse worked)
+        const progressState = cachedProgressState[store.key];
+        if (progressState && progressState.status && progressState.status !== 'Waiting...') {
+            console.log(`✅ [FALLBACK] ${store.name} already parsing (status: ${progressState.status}), skipping`);
+            continue;
+        }
+
+        console.log(`📤 [FALLBACK] ${store.name} hasn't started yet, sending message with retry...`);
+        sendTelegramMessage(`⚠️ ${store.name}: Автопарс не сработал, отправляю команду напрямую...`);
+
+        let sent = false;
+        for (let attempt = 1; attempt <= 15; attempt++) {
+            try {
+                await new Promise((resolve, reject) => {
+                    chrome.tabs.sendMessage(store.tabId, { action: store.action }, (response) => {
+                        if (chrome.runtime.lastError) {
+                            reject(chrome.runtime.lastError);
+                        } else {
+                            resolve(response);
+                        }
+                    });
+                });
+                console.log(`✅ [FALLBACK] ${store.name}: Message delivered on attempt ${attempt}`);
+                sendTelegramMessage(`✅ ${store.name}: Команда парсинга отправлена (попытка ${attempt})`);
+                sent = true;
+                break;
+            } catch (e) {
+                console.warn(`⚠️ [FALLBACK] ${store.name} attempt ${attempt}: ${e.message}`);
+                await new Promise(r => setTimeout(r, 3000));
+            }
+        }
+
+        if (!sent) {
+            console.error(`❌ [FALLBACK] ${store.name}: Failed after 15 attempts`);
+            sendTelegramMessage(`❌ ${store.name}: Не удалось запустить парсер после 15 попыток`);
+        }
+    }
+}
+
 async function launchParsersFromBackground() {
     console.log('🚀 launchParsersFromBackground() triggered');
     
@@ -888,48 +1463,49 @@ async function launchParsersFromBackground() {
     cachedProgressState = {}; 
     chrome.storage.local.set({ progressState: cachedProgressState });
     
-    // Open all tabs first
-    const stores = [
+    // eBay and iHerb - open tabs with auto-parse flags
+    const nonAmazonStores = [
         { key: 'ebay', url: 'https://www.ebay.com/mye/myebay/purchase', emoji: '🛒' },
-        { key: 'iherb', url: 'https://secure.iherb.com/myaccount/orders', emoji: '🌿' },
-        { key: 'amazon', url: 'https://www.amazon.com/gp/css/order-history', emoji: '📦' }
+        { key: 'iherb', url: 'https://secure.iherb.com/myaccount/orders', emoji: '🌿' }
     ];
 
     // Set flags in storage so content scripts start automatically when loaded
+    // Using BOTH timestamp flags AND boolean flags for reliability
     const now = Date.now();
     await chrome.storage.local.set({
         autoParse_ebay: now,
         autoParse_iherb: now,
-        autoParse_amazon: now
+        // Boolean flags that don't expire (cleared by content scripts after use)
+        ebay_should_autoparse: true,
+        iherb_should_autoparse: true
+        // Amazon will use multi-account parsing instead!
     });
-    console.log('🚩 Auto-parse flags set in storage');
-    sendTelegramMessage(`🏁 Флаги запуска установлены. Открываю вкладки...`);
+    console.log('🚩 Auto-parse flags set for eBay & iHerb (timestamp + boolean)');
+    sendTelegramMessage(`🏁 Запускаю eBay, iHerb и Amazon (multi-account)...`);
 
-    for (const store of stores) {
+    const openedTabs = {};
+    for (const store of nonAmazonStores) {
         console.log(`🌐 Opening tab for ${store.key}...`);
         sendTelegramMessage(`${store.emoji} ${store.key.toUpperCase()}: Открываю страницу заказов...`);
-        // Open tab - content script will read storage and start
-        await chrome.tabs.create({ url: store.url, active: false });
-        // No need to inject or send messages manually!
+        const tab = await chrome.tabs.create({ url: store.url, active: false });
+        openedTabs[store.key] = tab.id;
     }
 
-    // Watchdog: Check progress after 2 minutes
+    // FALLBACK: If auto-parse flags don't work, send message with retry after page loads
+    // This runs in background and doesn't block the rest of the flow
+    sendParseCommandsWithRetry(openedTabs);
+
+    // Amazon - use multi-account parsing (photopochtoy + ipochtoy)
+    console.log('📦 Starting multi-account Amazon parsing...');
+    sendTelegramMessage(`📦 AMAZON: Запускаю multi-account парсинг (photo + i)...`);
+    startMultiAccountAmazonParsing();
+
+    // Watchdog: Check progress after 3 minutes
     setTimeout(() => {
         if (isParsingAllStores && !storesCompleted.ebay && !storesCompleted.iherb && !storesCompleted.amazon) {
-             sendTelegramMessage(`⚠️ Внимание: Прошло 2 минуты, а парсинг не завершен. Проверьте вкладки браузера.`);
+             sendTelegramMessage(`⚠️ Внимание: Прошло 3 минуты, а парсинг не завершен. Проверьте вкладки браузера.`);
         }
-    }, 120000);
-
-    // Backup: Send explicit message to Amazon after 5 seconds (in case flag missed)
-    setTimeout(async () => {
-        if (isParsingAllStores && !storesCompleted.amazon) {
-             console.log('⚠️ Sending backup "parse" command to Amazon tab...');
-             const tabs = await chrome.tabs.query({ url: "https://www.amazon.com/gp/css/order-history*" });
-             if (tabs.length > 0) {
-                 chrome.tabs.sendMessage(tabs[0].id, { action: "autoParse" }).catch(() => {});
-             }
-        }
-    }, 7000);
+    }, 180000);
 }
 
 async function sendTelegramMessage(text) {
