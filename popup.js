@@ -66,6 +66,10 @@ function initialize() {
     });
 
     document.getElementById('reset-marks-btn')?.addEventListener('click', resetMarks);
+    document.getElementById('screenshots-enabled')?.addEventListener('change', (e) => {
+        chrome.storage.local.set({ screenshotsEnabled: e.target.checked });
+        chrome.runtime.sendMessage({ action: 'reloadScreenshotSettings' });
+    });
 
     // --- NEW: Financial Mode Logic ---
     const modeRadios = document.getElementsByName('parseMode');
@@ -98,7 +102,7 @@ function initialize() {
     }
 
     // Restore saved toggles and default spreadsheet
-    chrome.storage.local.get(['skipProcessed','colorProcessed','limitRows','chainPochtoy','savedPagesToParse','spreadsheetId','sheetName','tgBotToken','tgChatId', 'parseMode'], (res)=>{
+    chrome.storage.local.get(['skipProcessed','colorProcessed','limitRows','chainPochtoy','savedPagesToParse','spreadsheetId','sheetName','tgBotToken','tgChatId', 'parseMode', 'screenshotsEnabled'], (res)=>{
         if (res.parseMode && testParseBtn) {
             const radio = document.querySelector(`input[name="parseMode"][value="${res.parseMode}"]`);
             if (radio) radio.checked = true;
@@ -122,6 +126,9 @@ function initialize() {
 
         const tgChatEl = document.getElementById('tg-chat-id');
         if (res.tgChatId && tgChatEl) tgChatEl.value = res.tgChatId;
+
+        const screenshotsEl = document.getElementById('screenshots-enabled');
+        if (screenshotsEl) screenshotsEl.checked = res.screenshotsEnabled || false;
 
         if (res.savedPagesToParse && pagesToParseInput) pagesToParseInput.value = res.savedPagesToParse;
 

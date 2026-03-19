@@ -3,7 +3,7 @@
   "name": "Pochtoy Parsing",
   "version": "7.5.0",
   "description": "🇧🇾 Parse orders from eBay, iHerb, Amazon and export to Google Sheets",
-  "permissions": ["storage", "identity", "tabs", "scripting", "alarms"],
+  "permissions": ["storage", "identity", "tabs", "scripting", "alarms", "activeTab"],
   "host_permissions": [
     "https://secure.iherb.com/*",
     "https://www.ebay.com/*",

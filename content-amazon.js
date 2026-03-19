@@ -588,13 +588,22 @@
     const qty = extractQuantityFromDOM(scope);
     console.log(`  📊 QTY: ${qty}`);
 
+    // Queue screenshot for Telegram if enabled
+    chrome.runtime.sendMessage({
+      action: 'queueTrackScreenshot',
+      orderId: individualOrderId,
+      trackNumber: trackNumber,
+      trackUrl: trackUrl,
+      accountName: ''
+    }, () => chrome.runtime.lastError);
+
     return {
       store_name: "Amazon",
-      order_id: individualOrderId,  // ← Use INDIVIDUAL Order ID!
+      order_id: individualOrderId,
       track_number: trackNumber,
       product_name: title,
       qty: qty,
-      color: isMultiOrderShipment ? "⚠️ РАЗНЫЕ ЗАКАЗЫ" : "",  // ← WARNING in color field!
+      color: isMultiOrderShipment ? "⚠️ РАЗНЫЕ ЗАКАЗЫ" : "",
       size: ""
     };
   }
@@ -692,6 +701,15 @@
     // v7.1: Extract actual quantity
     const qty = extractQuantityFromDOM(scope);
     console.log(`  📊 QTY: ${qty}`);
+
+    // Queue screenshot for Telegram if enabled
+    chrome.runtime.sendMessage({
+      action: 'queueTrackScreenshot',
+      orderId: orderId,
+      trackNumber: trackNumber,
+      trackUrl: trackUrl,
+      accountName: ''
+    }, () => chrome.runtime.lastError);
 
     return {
       store_name: 'Amazon',

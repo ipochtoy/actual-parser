@@ -135,12 +135,14 @@ const DEFAULT_SPREADSHEET_ID = '1w1QOzGWc_CNovlezuxyLta-h1kM3pgPXc_GoHYaOA98';
 
 // --- Multi-Account Amazon Parsing ---
 const AMAZON_ACCOUNTS_TO_PARSE = [
-  'photopochtoy@gmail.com',
-  'ipochtoy@gmail.com'
+  'photopochtoy@gmail.com'
+  // 'ipochtoy@gmail.com'  // TEMPORARILY DISABLED - account suspended
 ];
 let amazonAccountsQueue = [];
 let currentAmazonAccount = null;
 let isMultiAccountParsing = false;
+const MAX_ACCOUNT_SWITCH_ATTEMPTS = 2;
+const ACCOUNT_PARSE_TIMEOUT_MS = 90000;
 
 // --- Parsing Logs ---
 const LOGS_SHEET_NAME = 'Logs';
@@ -502,10 +504,32 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         startMultiAccountAmazonParsing();
         sendResponse({status: "started"});
     } else if (request.action === "accountSwitchFailed") {
-        console.log(`❌ Account switch failed for ${request.email}: ${request.error}`);
-        sendTelegramMessage(`❌ Не удалось переключиться на ${request.email}: ${request.error}`);
-        // Try next account or finish
-        switchToNextAmazonAccount();
+        (async () => {
+            console.log(`❌ Account switch failed for ${request.email}: ${request.error}`);
+            const failData = await chrome.storage.local.get(['accountSwitchFailures']);
+            const failures = failData.accountSwitchFailures || {};
+            const email = request.email || currentAmazonAccount || 'unknown';
+            failures[email] = (failures[email] || 0) + 1;
+            await chrome.storage.local.set({ accountSwitchFailures: failures });
+            
+            if (failures[email] >= MAX_ACCOUNT_SWITCH_ATTEMPTS) {
+                console.log(`🚫 Account ${email} failed ${failures[email]} times, skipping`);
+                sendTelegramMessage(`🚫 Аккаунт ${email.split('@')[0]} недоступен (попыток: ${failures[email]}), пропускаю`);
+                await chrome.storage.local.remove(['accountSwitchStartedAt']);
+                switchToNextAmazonAccount();
+            } else {
+                sendTelegramMessage(`⚠️ Не удалось переключиться на ${email.split('@')[0]} (попытка ${failures[email]}/${MAX_ACCOUNT_SWITCH_ATTEMPTS}), пробую ещё раз...`);
+                amazonAccountsQueue.unshift(email);
+                await chrome.storage.local.set({
+                    multiAccountState: {
+                        isMultiAccountParsing: true,
+                        amazonAccountsQueue: amazonAccountsQueue,
+                        currentAmazonAccount: currentAmazonAccount
+                    }
+                });
+                switchToNextAmazonAccount();
+            }
+        })();
     } else if (request.action === "parsingProgress") {
         // Handle parsingProgress from content scripts (convert to progress format)
         const progressData = request.data || {};
@@ -527,6 +551,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         });
     } else if (request.action === "progress") {
         handleProgressMessage(request);
+    } else if (request.action === "queueTrackScreenshot") {
+        queueTrackScreenshot(request.orderId, request.trackNumber, request.trackUrl, request.accountName);
+        sendResponse({status: "queued"});
+    } else if (request.action === "processScreenshotQueue") {
+        processScreenshotQueue();
+        sendResponse({status: "processing"});
+    } else if (request.action === "reloadScreenshotSettings") {
+        chrome.storage.local.get(['screenshotsEnabled'], (res) => {
+            screenshotsEnabled = res.screenshotsEnabled || false;
+            console.log(`📸 Screenshots ${screenshotsEnabled ? 'ENABLED' : 'DISABLED'}`);
+        });
     } else if (request.action === "reloadTgSettings") {
         chrome.storage.local.get(['tgBotToken', 'tgChatId'], (res) => {
             console.log('🔄 Reloading Telegram Settings from popup update:', res);
@@ -614,8 +649,9 @@ async function switchToNextAmazonAccount() {
     // Save pending switch and updated state, clear completion flag and old pagination
     await chrome.storage.local.set({
         pendingAccountSwitch: { email: nextEmail },
-        amazonParsingComplete: null, // Clear so watchdog doesn't trigger prematurely
-        amazonPaginationState: null, // Clear old pagination to start fresh on new account!
+        amazonParsingComplete: null,
+        amazonPaginationState: null,
+        accountSwitchStartedAt: Date.now(),
         multiAccountState: {
             isMultiAccountParsing: true,
             amazonAccountsQueue: amazonAccountsQueue,
@@ -671,6 +707,8 @@ async function startMultiAccountAmazonParsing() {
             stopAllParsers: false,
             amazonParsingComplete: null,
             amazonPaginationState: null,
+            accountSwitchStartedAt: null,
+            accountSwitchFailures: {},
             multiAccountState: {
                 isMultiAccountParsing: true,
                 amazonAccountsQueue: amazonAccountsQueue,
@@ -737,7 +775,26 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     
     if (alarm.name !== WATCHDOG_ALARM_NAME) return;
     
-    const stored = await chrome.storage.local.get(['amazonParsingComplete', 'multiAccountState']);
+    const stored = await chrome.storage.local.get(['amazonParsingComplete', 'multiAccountState', 'accountSwitchStartedAt']);
+    
+    // TIMEOUT: if account switch started but no completion within 90s, skip the account
+    if (!stored.amazonParsingComplete && stored.accountSwitchStartedAt && stored.multiAccountState) {
+        const elapsed = Date.now() - stored.accountSwitchStartedAt;
+        if (elapsed > ACCOUNT_PARSE_TIMEOUT_MS) {
+            const failedEmail = stored.multiAccountState.currentAmazonAccount || 'unknown';
+            console.log(`🚫 Account ${failedEmail} timed out after ${Math.round(elapsed/1000)}s, skipping`);
+            sendTelegramMessage(`🚫 Аккаунт ${failedEmail.split('@')[0]} не отвечает ${Math.round(elapsed/1000)}с — пропускаю`);
+            
+            // Restore state
+            isMultiAccountParsing = stored.multiAccountState.isMultiAccountParsing;
+            amazonAccountsQueue = stored.multiAccountState.amazonAccountsQueue || [];
+            currentAmazonAccount = stored.multiAccountState.currentAmazonAccount;
+            
+            await chrome.storage.local.remove(['accountSwitchStartedAt', 'amazonParsingComplete', 'amazonPaginationState']);
+            switchToNextAmazonAccount();
+            return;
+        }
+    }
     
     if (stored.amazonParsingComplete && stored.amazonParsingComplete.timestamp) {
         const age = Date.now() - stored.amazonParsingComplete.timestamp;
@@ -753,7 +810,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             }
             
             // Clear the flag so we don't process again
-            await chrome.storage.local.set({ amazonParsingComplete: null });
+            await chrome.storage.local.set({ amazonParsingComplete: null, accountSwitchStartedAt: null });
             
             // If multi-account parsing and more accounts remain
             if (isMultiAccountParsing && amazonAccountsQueue.length > 0) {
@@ -804,8 +861,11 @@ async function checkAllStoresCompleted() {
         // Small delay to ensure data is settled
         setTimeout(async () => {
             await uploadToSheets();
-            // Upload parsing logs after data
             await uploadLogsToSheet();
+            // Process track screenshots queue after everything is done
+            if (screenshotsEnabled) {
+                processScreenshotQueue();
+            }
         }, 1000);
     }
 }
@@ -1535,6 +1595,125 @@ async function sendTelegramMessage(text) {
     }
 }
 
+
+// --- TRACK SCREENSHOT QUEUE ---
+let trackScreenshotQueue = [];
+let isProcessingScreenshots = false;
+let screenshotsEnabled = false;
+
+chrome.storage.local.get(['screenshotsEnabled'], (res) => {
+    screenshotsEnabled = res.screenshotsEnabled || false;
+});
+
+async function sendTelegramPhoto(base64Data, caption) {
+    if (!tgBotToken || !tgChatId) {
+        console.warn('⚠️ Cannot send Telegram photo - missing token or chat ID');
+        return;
+    }
+
+    try {
+        const byteChars = atob(base64Data);
+        const byteArray = new Uint8Array(byteChars.length);
+        for (let i = 0; i < byteChars.length; i++) {
+            byteArray[i] = byteChars.charCodeAt(i);
+        }
+        const blob = new Blob([byteArray], { type: 'image/png' });
+
+        const formData = new FormData();
+        formData.append('chat_id', tgChatId);
+        formData.append('photo', blob, 'screenshot.png');
+        if (caption) formData.append('caption', caption);
+
+        const res = await fetch(`https://api.telegram.org/bot${tgBotToken}/sendPhoto`, {
+            method: 'POST',
+            body: formData
+        });
+
+        if (!res.ok) {
+            const err = await res.text();
+            console.error(`❌ Telegram photo send failed: ${res.status} ${err}`);
+        } else {
+            console.log('✅ Telegram photo sent.');
+        }
+    } catch (e) {
+        console.error('Failed to send Telegram photo:', e);
+    }
+}
+
+function queueTrackScreenshot(orderId, trackNumber, trackUrl, accountName) {
+    if (!screenshotsEnabled) return;
+    trackScreenshotQueue.push({ orderId, trackNumber, trackUrl, accountName });
+    console.log(`📸 Queued screenshot: ${orderId} / ${trackNumber} (queue: ${trackScreenshotQueue.length})`);
+}
+
+async function processScreenshotQueue() {
+    if (isProcessingScreenshots || trackScreenshotQueue.length === 0) return;
+    isProcessingScreenshots = true;
+
+    const total = trackScreenshotQueue.length;
+    sendTelegramMessage(`📸 Начинаю скриншоты треков: ${total} шт.`);
+
+    let done = 0;
+    while (trackScreenshotQueue.length > 0) {
+        const item = trackScreenshotQueue.shift();
+        done++;
+        try {
+            await captureTrackScreenshot(item, done, total);
+        } catch (e) {
+            console.error(`❌ Screenshot failed for ${item.orderId}:`, e);
+        }
+        await new Promise(r => setTimeout(r, 500));
+    }
+
+    sendTelegramMessage(`✅ Скриншоты треков завершены: ${done}/${total}`);
+    isProcessingScreenshots = false;
+}
+
+async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountName }, current, total) {
+    if (!trackUrl) return;
+
+    console.log(`📸 [${current}/${total}] Capturing: ${orderId} / ${trackNumber}`);
+
+    let tab;
+    try {
+        tab = await chrome.tabs.create({ url: trackUrl, active: true });
+
+        await new Promise(resolve => {
+            function onUpdated(tabId, info) {
+                if (tabId === tab.id && info.status === 'complete') {
+                    chrome.tabs.onUpdated.removeListener(onUpdated);
+                    resolve();
+                }
+            }
+            chrome.tabs.onUpdated.addListener(onUpdated);
+            setTimeout(() => {
+                chrome.tabs.onUpdated.removeListener(onUpdated);
+                resolve();
+            }, 10000);
+        });
+
+        await new Promise(r => setTimeout(r, 2000));
+
+        const tabInfo = await chrome.tabs.get(tab.id);
+        const finalUrl = tabInfo.url || '';
+        if (!finalUrl.includes('ship-track') && !finalUrl.includes('track-package') && !finalUrl.includes('progress-tracker')) {
+            console.log(`⚠️ Skipping screenshot - redirected to: ${finalUrl.substring(0, 80)}`);
+            return;
+        }
+
+        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+        const base64 = dataUrl.replace(/^data:image\/png;base64,/, '');
+
+        const acct = accountName ? accountName.split('@')[0] : '';
+        const caption = `📦 ${orderId}\n🚚 ${trackNumber}${acct ? '\n👤 ' + acct : ''}`;
+
+        await sendTelegramPhoto(base64, caption);
+    } finally {
+        if (tab) {
+            try { await chrome.tabs.remove(tab.id); } catch (_) {}
+        }
+    }
+}
 // ... Google Sheets helpers use getAuthToken() defined above ...
 
 async function getSheetId(spreadsheetId, sheetName){
