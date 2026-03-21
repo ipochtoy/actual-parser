@@ -86,7 +86,7 @@
   <div class="container">
     <div class="header">
       <h1>📦 Pochtoy Parsing</h1>
-      <div style="font-size: 11px; opacity: 0.7; margin-top: 4px;">v6.10.17</div>
+      <div style="font-size: 11px; opacity: 0.7; margin-top: 4px;">v7.6.0</div>
     </div>
 
     <div class="store-buttons">
@@ -97,6 +97,13 @@
 
     <label style="display:flex; align-items:center; gap:6px; font-size:12px; margin:6px 0;">
         Amazon страниц: <input type="number" id="pagesToParse" min="1" max="30" value="1" style="width:50px; padding:2px 4px; border:1px solid #ccc; border-radius:4px;">
+    </label>
+    <label style="display:flex; align-items:center; gap:6px; font-size:12px; margin:6px 0;">
+        Email (для логов): 
+        <select id="manualAccountSelect" style="padding:2px; border-radius:4px; border:1px solid #ccc; font-size:11px;">
+            <option value="photopochtoy@gmail.com">photopochtoy@gmail.com</option>
+            <option value="ipochtoy@gmail.com">ipochtoy@gmail.com</option>
+        </select>
     </label>
 
     <button id="parseAllStores" class="button primary-button">🚀 Parse All Stores</button>

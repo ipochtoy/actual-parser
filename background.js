@@ -135,8 +135,8 @@ const DEFAULT_SPREADSHEET_ID = '1w1QOzGWc_CNovlezuxyLta-h1kM3pgPXc_GoHYaOA98';
 
 // --- Multi-Account Amazon Parsing ---
 const AMAZON_ACCOUNTS_TO_PARSE = [
-  'photopochtoy@gmail.com'
-  // 'ipochtoy@gmail.com'  // TEMPORARILY DISABLED - account suspended
+  'photopochtoy@gmail.com',
+  'ipochtoy@gmail.com'
 ];
 let amazonAccountsQueue = [];
 let currentAmazonAccount = null;
@@ -426,7 +426,7 @@ async function handleProgressMessage(request) {
     }
 
     // Standalone parse (not multi-account, not parse-all): still notify Telegram
-    if (shouldNotifyTelegram) {
+    if (shouldNotifyTelegram && !stored.multiAccountState) {
         const count = request.found || 0;
         const emoji = request.status === 'Error' ? '❌' : '✅';
         sendTelegramMessage(`${emoji} ${request.store || storeKey}: Готово (${count} заказов)`);
@@ -569,6 +569,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     } else if (request.action === "processScreenshotQueue") {
         processScreenshotQueue();
         sendResponse({status: "processing"});
+    } else if (request.action === "saveManualAccount") {
+        chrome.storage.local.set({ manualAccountName: request.accountName });
+        sendResponse({status: "saved"});
     } else if (request.action === "reloadScreenshotSettings") {
         chrome.storage.local.get(['screenshotsEnabled'], (res) => {
             screenshotsEnabled = res.screenshotsEnabled || false;
@@ -1665,25 +1668,57 @@ function queueTrackScreenshot(orderId, trackNumber, trackUrl, accountName) {
     console.log(`📸 Queued screenshot: ${orderId} / ${trackNumber} (queue: ${trackScreenshotQueue.length})`);
 }
 
+async function filterAlreadySent(queue) {
+    const { sentScreenshots = [] } = await chrome.storage.local.get('sentScreenshots');
+    const sentSet = new Set(sentScreenshots);
+    const filtered = queue.filter(item => !sentSet.has(item.trackNumber));
+    const skipped = queue.length - filtered.length;
+    if (skipped > 0) console.log(`📸 Пропущено ${skipped} уже отправленных скриншотов`);
+    return filtered;
+}
+
+async function markAsSent(trackNumbers) {
+    const { sentScreenshots = [] } = await chrome.storage.local.get('sentScreenshots');
+    const updated = [...new Set([...sentScreenshots, ...trackNumbers])];
+    await chrome.storage.local.set({ sentScreenshots: updated });
+}
+
 async function processScreenshotQueue() {
     if (isProcessingScreenshots || trackScreenshotQueue.length === 0) return;
     isProcessingScreenshots = true;
 
+    trackScreenshotQueue = await filterAlreadySent(trackScreenshotQueue);
+    if (trackScreenshotQueue.length === 0) {
+        sendTelegramMessage(`📸 Все скриншоты уже были отправлены ранее`);
+        isProcessingScreenshots = false;
+        return;
+    }
+
     const total = trackScreenshotQueue.length;
     sendTelegramMessage(`📸 Начинаю скриншоты треков: ${total} шт.`);
 
+    const sentTracks = [];
     let done = 0;
     while (trackScreenshotQueue.length > 0) {
         const item = trackScreenshotQueue.shift();
         done++;
         try {
-            await captureTrackScreenshot(item, done, total);
+            const result = await captureTrackScreenshot(item, done, total);
+            if (result === 'CAPTCHA') {
+                trackScreenshotQueue.unshift(item); // Вернуть в очередь
+                isProcessingScreenshots = false;
+                break; // Выход из цикла (остановка)
+            }
+            sentTracks.push(item.trackNumber);
+            await markAsSent([item.trackNumber]); // Сохраняем каждый трек моментально
         } catch (e) {
             console.error(`❌ Screenshot failed for ${item.orderId}:`, e);
+            sendTelegramMessage(`❌ Скриншот ${done}/${total} ошибка: ${item.orderId} — ${e.message || e}`);
         }
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, 5000));
     }
 
+    if (sentTracks.length > 0) await markAsSent(sentTracks);
     sendTelegramMessage(`✅ Скриншоты треков завершены: ${done}/${total}`);
     isProcessingScreenshots = false;
 }
@@ -1701,6 +1736,7 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
     console.log(`📸 [${current}/${total}] Capturing: ${orderId} / ${trackNumber} -> ${fullUrl.substring(0, 80)}`);
 
     let tab;
+    let keepTabOpen = false;
     try {
         tab = await chrome.tabs.create({ url: fullUrl, active: true });
 
@@ -1718,24 +1754,84 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
             }, 10000);
         });
 
-        await new Promise(r => setTimeout(r, 2000));
+        // --- ПРОВЕРКА КАПЧИ ---
+        try {
+            const results = await chrome.scripting.executeScript({
+                target: { tabId: tab.id },
+                func: () => {
+                    const html = document.body ? document.body.innerHTML : "";
+                    if (html.includes('Type the characters you see in this image') || 
+                        document.getElementById('captchacharacters')) {
+                        return true;
+                    }
+                    return false;
+                }
+            });
+            if (results && results[0] && results[0].result === true) {
+                console.error('🚨 CAPTCHA DETECTED! Stopping queue.');
+                sendTelegramMessage('🚨 ВНИМАНИЕ: На Amazon вылезла капча! Парсинг скриншотов приостановлен.\nПерейдите в открытую вкладку Amazon и решите капчу.');
+                keepTabOpen = true; // Не закрываем вкладку, чтобы юзер мог решить
+                return 'CAPTCHA';
+            }
+        } catch (captchaErr) {
+            console.warn('⚠️ Ошибка проверки капчи:', captchaErr);
+        }
+
+        // --- ИМИТАЦИЯ ЧЕЛОВЕКА ---
+        await new Promise(r => setTimeout(r, 1000 + Math.random() * 1000));
+        try {
+            await chrome.scripting.executeScript({
+                target: { tabId: tab.id },
+                func: async () => {
+                    const delay = ms => new Promise(res => setTimeout(res, ms));
+                    
+                    // Движение мыши
+                    for (let i = 0; i < 3; i++) {
+                        const x = Math.floor(Math.random() * window.innerWidth);
+                        const y = Math.floor(Math.random() * window.innerHeight);
+                        const evt = new MouseEvent('mousemove', { bubbles: true, clientX: x, clientY: y });
+                        document.dispatchEvent(evt);
+                        await delay(200 + Math.random() * 300);
+                    }
+                    
+                    // Плавный скролл вниз
+                    window.scrollBy({ top: 300 + Math.random() * 400, behavior: 'smooth' });
+                    await delay(1500 + Math.random() * 1500);
+                    
+                    // Скролл обратно наверх для красивого скриншота
+                    window.scrollTo({ top: 0, behavior: 'smooth' });
+                    await delay(1000 + Math.random() * 500);
+                }
+            });
+        } catch (injectErr) {
+            console.warn('⚠️ Не удалось запустить скрипт имитации человека:', injectErr);
+            await new Promise(r => setTimeout(r, 3000));
+        }
 
         const tabInfo = await chrome.tabs.get(tab.id);
         const finalUrl = tabInfo.url || '';
-        if (!finalUrl.includes('ship-track') && !finalUrl.includes('track-package') && !finalUrl.includes('progress-tracker')) {
-            console.log(`⚠️ Skipping screenshot - redirected to: ${finalUrl.substring(0, 80)}`);
+        if (finalUrl.includes('signin') || finalUrl.includes('ap/challenge')) {
+            console.log(`⚠️ Skipping screenshot - login page: ${finalUrl.substring(0, 80)}`);
             return;
         }
 
-        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+        let dataUrl;
+        try {
+            dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+        } catch (captureErr) {
+            console.error(`❌ captureVisibleTab failed:`, captureErr);
+            sendTelegramMessage(`❌ Capture failed ${orderId}: ${captureErr.message}`);
+            return;
+        }
         const base64 = dataUrl.replace(/^data:image\/png;base64,/, '');
 
-        const acct = accountName ? accountName.split('@')[0] : '';
-        const caption = `📦 ${orderId}\n🚚 ${trackNumber}${acct ? '\n👤 ' + acct : ''}`;
+         
+        const caption = `📦 ${orderId}\n🚚 ${trackNumber}${accountName ? '\n📧 ' + accountName : ''}`;
 
         await sendTelegramPhoto(base64, caption);
+        console.log(`✅ Screenshot sent for ${orderId}`);
     } finally {
-        if (tab) {
+        if (tab && !keepTabOpen) {
             try { await chrome.tabs.remove(tab.id); } catch (_) {}
         }
     }

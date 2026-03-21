@@ -15,7 +15,7 @@ const stores = [
 
 function initialize() {
     stores.forEach(store => {
-        document.getElementById(store.id)?.addEventListener('click', () => parseStore(store));
+        document.getElementById(store.id)?.addEventListener('click', () => parseStore(store, { skipMultiAccount: true }));
     });
 
     document.getElementById('parseAllStores')?.addEventListener('click', parseAllStores);
@@ -130,6 +130,11 @@ function initialize() {
         const screenshotsEl = document.getElementById('screenshots-enabled');
         if (screenshotsEl) screenshotsEl.checked = res.screenshotsEnabled || false;
 
+        const manualAccEl = document.getElementById('manualAccountSelect');
+        if (manualAccEl && res.manualAccountName) {
+            manualAccEl.value = res.manualAccountName;
+        }
+
         if (res.savedPagesToParse && pagesToParseInput) pagesToParseInput.value = res.savedPagesToParse;
 
         // Restore Spreadsheet ID (or use hardcoded default)
@@ -211,7 +216,7 @@ async function parseStore(store, overrides = {}) {
     }
 
     // For Amazon, use multi-account parsing (photopochtoy + ipochtoy)
-    if (store.name === 'Amazon' && !overrides.skipMultiAccount) {
+    if (store.name === 'Amazon' && !overrides.skipMultiAccount && overrides.isMultiAccount !== false) {
         console.log('🔄 Starting multi-account Amazon parsing from regular button');
         chrome.runtime.sendMessage({ action: "startMultiAccountAmazon" }, (response) => {
             if (response?.status === 'started') {
@@ -255,7 +260,7 @@ async function parseStore(store, overrides = {}) {
         }
         
         const options = {
-            pages: (store.name === 'Amazon') ? (parseInt(document.getElementById('pagesToParse')?.value, 10) || 1) : undefined,
+            pages: (store.name === 'Amazon') ? (parseInt(document.getElementById('pagesToParse')?.value, 10) || 20) : undefined,
             mode: mode,
             ...overrides
         };
@@ -563,7 +568,7 @@ async function clearAllStoreData(confirmUser = true) {
         chrome.runtime.sendMessage({ action: "stopPochtoyAutomation" });
         await new Promise(resolve => chrome.storage.local.set({ stopAllParsers: true }, resolve));
 
-        await chrome.storage.local.remove(['orderData', 'progressState', 'automationState', 'parsingState']); // Clear automation state too
+        await chrome.storage.local.remove(['orderData', 'progressState', 'automationState', 'parsingState', 'amazonPaginationState']); // Clear automation state too
         updateCopyButtonState();
         updateStatus('All data cleared and parsing stopped.', 'success');
         

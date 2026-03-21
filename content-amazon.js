@@ -56,7 +56,7 @@
 
   async function getSavedPageCount() {
     const res = await chrome.storage.local.get(['savedPagesToParse']);
-    return parseInt(res.savedPagesToParse, 10) || 1;
+    return parseInt(res.savedPagesToParse, 10) || 20;
   }
 
   // Check for auto-parse flag on page load
@@ -156,6 +156,7 @@
         showOverlay(`🚀 ЗАПУСК (${PARSE_MODE})...`, "#d35400");
         // Use a small delay to ensure overlay renders
         (async () => {
+          console.log("🔥 CALLING CLEAR PAGINATION"); await clearPaginationState();
           const opts = request.options || { pages: await getSavedPageCount() };
           parseAmazonOrdersWithPagination(opts);
         })();
@@ -167,6 +168,7 @@
          console.log("📨 Legacy parse command received!");
          showOverlay(`🚀 ЗАПУСК (${PARSE_MODE})...`, "#d35400");
          (async () => {
+          console.log("🔥 CALLING CLEAR PAGINATION"); await clearPaginationState();
           const opts = request.options || { pages: await getSavedPageCount() };
           parseAmazonOrdersWithPagination(opts);
         })();
@@ -600,13 +602,17 @@
     console.log(`  📊 QTY: ${qty}`);
 
     // Queue screenshot for Telegram if enabled
-    chrome.runtime.sendMessage({
-      action: 'queueTrackScreenshot',
-      orderId: individualOrderId,
-      trackNumber: trackNumber,
-      trackUrl: trackUrl,
-      accountName: ''
-    }, () => chrome.runtime.lastError);
+    chrome.storage.local.get(['multiAccountState', 'manualAccountName'], (res) => {
+      const acct = res.multiAccountState?.currentAmazonAccount || res.manualAccountName || '';
+      console.log('📸 Sending queueTrackScreenshot for ' + trackNumber + ' acct: ' + acct);
+      chrome.runtime.sendMessage({
+        action: 'queueTrackScreenshot',
+        orderId: individualOrderId,
+        trackNumber: trackNumber,
+        trackUrl: trackUrl,
+        accountName: acct
+      }, () => chrome.runtime.lastError);
+    });
 
     return {
       store_name: "Amazon",
@@ -714,13 +720,17 @@
     console.log(`  📊 QTY: ${qty}`);
 
     // Queue screenshot for Telegram if enabled
-    chrome.runtime.sendMessage({
-      action: 'queueTrackScreenshot',
-      orderId: orderId,
-      trackNumber: trackNumber,
-      trackUrl: trackUrl,
-      accountName: ''
-    }, () => chrome.runtime.lastError);
+    chrome.storage.local.get(['multiAccountState', 'manualAccountName'], (res) => {
+      const acct = res.multiAccountState?.currentAmazonAccount || res.manualAccountName || '';
+      console.log('📸 Sending queueTrackScreenshot for ' + trackNumber + ' acct: ' + acct);
+      chrome.runtime.sendMessage({
+        action: 'queueTrackScreenshot',
+        orderId: orderId,
+        trackNumber: trackNumber,
+        trackUrl: trackUrl,
+        accountName: acct
+      }, () => chrome.runtime.lastError);
+    });
 
     return {
       store_name: 'Amazon',
@@ -983,8 +993,11 @@
   }
   
   async function clearPaginationState() {
+    console.log('🧹 ПРИНУДИТЕЛЬНАЯ ОЧИСТКА ПАГИНАЦИИ');
     return new Promise(resolve => {
-      chrome.storage.local.remove(PAGINATION_STATE_KEY, resolve);
+      chrome.storage.local.remove([PAGINATION_STATE_KEY, 'amazonOrders'], () => {
+        resolve();
+      });
     });
   }
   
@@ -1075,7 +1088,7 @@
     });
     
     chrome.storage.local.set({ amazonOrders: state.allOrders });
-    await clearPaginationState();
+    console.log("🔥 CALLING CLEAR PAGINATION"); await clearPaginationState();
     
     // НАДЕЖНЫЙ механизм: записываем флаг завершения напрямую в storage
     // чтобы background.js мог его проверить даже если sendMessage потеряется
@@ -1157,7 +1170,7 @@
   
   // WRAPPER для пагинации - вызывает parseAmazonOrders() для каждой страницы
   async function parseAmazonOrdersWithPagination(options = {}) {
-    const maxPagesToParse = options.pages || 1;
+    const maxPagesToParse = options.pages || 20;
     console.log(`\n📦 Запуск парсера Amazon с пагинацией (${maxPagesToParse} страниц)`);
 
     if (await shouldStop()) {
