@@ -1,6 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Pochtoy Parsing",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyDUXpFfJg0GFsmCRC5XFJmax4Yi3lK03LQMK4dmBSMBdmhqXFwfPFxCh2MLCR4xTMU57iACM8LbjnA/JM3snvfC3ob0Ve4yxWdVMMZqjhDaSQGdUVB03dwI7hvfFDuyK+WXa+wpJjsr8ZSv0L4+3yHEDzfGC4DUjs3nandEPG3XqMiR+Wd7rW17LV2O9g5cZM21q1rfpVaQQqqz8aLqw/NqWkJAex1WYytlJocQb2e1Kw8Q6REsml2EadiTnQz3mlbSmuBfsv7tblvNlfzc2xThtAfe95HqA+Ox0ra4NrdlqpPdwKIiHfk6brNKBCoU+MsJWuV8/Y0MpvUIe4VPU8wIDAQAB",
   "version": "6.10.17",
   "description": "🇧🇾 Parse orders from eBay, iHerb, Amazon and export to Google Sheets",
   "permissions": ["storage", "identity", "tabs", "scripting"],
