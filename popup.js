@@ -62,6 +62,9 @@ function initialize() {
 
     document.getElementById('reset-marks-btn').addEventListener('click', resetMarks);
 
+    // Email Export
+    document.getElementById('exportEmailsBtn').addEventListener('click', exportCustomerEmails);
+
     // Restore saved toggles and default spreadsheet
     chrome.storage.local.get(['skipProcessed','colorProcessed','limitRows','chainPochtoy','savedPagesToParse','spreadsheetId','sheetName','tgBotToken','tgChatId'], (res)=>{
         if (typeof res.skipProcessed === 'boolean') document.getElementById('skip-processed').checked = res.skipProcessed;
@@ -707,4 +710,114 @@ function updateAutomationProgress(state) {
     progressLabelEl.textContent = total > 0 ? 'Выполняется...' : 'Подготовка...';
     progressBar.style.backgroundColor = '#28a745';
     currentTaskEl.textContent = currentTask ? `Трек: ${currentTask.trackNumber}` : 'Подготовка...';
+}
+
+// --- EMAIL EXPORT LOGIC ---
+
+async function exportCustomerEmails() {
+    const btn = document.getElementById('exportEmailsBtn');
+    const statusEl = document.getElementById('email-export-status');
+    const originalText = btn.textContent;
+
+    btn.textContent = 'Сканирую...';
+    btn.disabled = true;
+    statusEl.style.display = 'none';
+
+    function showEmailStatus(msg, type) {
+        statusEl.textContent = msg;
+        statusEl.style.display = 'block';
+        statusEl.style.backgroundColor = type === 'success' ? '#d4edda' : type === 'error' ? '#f8d7da' : '#d1ecf1';
+        statusEl.style.color = type === 'success' ? '#155724' : type === 'error' ? '#721c24' : '#0c5460';
+    }
+
+    try {
+        // Ищем вкладку Pochtoy admin
+        const tabs = await chrome.tabs.query({ url: "https://www.pochtoy.com/*" });
+
+        if (tabs.length === 0) {
+            showEmailStatus('Откройте страницу Pochtoy.com admin сначала', 'error');
+            btn.textContent = originalText;
+            btn.disabled = false;
+            return;
+        }
+
+        const targetTab = tabs[0];
+
+        // Инжектим скрипт
+        try {
+            await chrome.scripting.executeScript({
+                target: { tabId: targetTab.id },
+                files: ['content-email-export.js']
+            });
+        } catch (e) {
+            console.warn("Script injection warning:", e);
+        }
+
+        // Даем скрипту загрузиться
+        await new Promise(r => setTimeout(r, 500));
+
+        // Отправляем команду на экспорт
+        chrome.tabs.sendMessage(targetTab.id, {
+            action: "exportCustomerEmails",
+            options: { tariffs: ['эконом', 'универсал'] }
+        }, (response) => {
+            btn.textContent = originalText;
+            btn.disabled = false;
+
+            if (chrome.runtime.lastError) {
+                showEmailStatus('Ошибка: ' + chrome.runtime.lastError.message, 'error');
+                return;
+            }
+
+            if (!response || response.status === 'error') {
+                showEmailStatus('Ошибка: ' + (response?.message || 'нет данных'), 'error');
+                return;
+            }
+
+            if (response.count === 0) {
+                showEmailStatus('Не найдено клиентов с тарифами Эконом/Универсал на этой странице', 'info');
+                return;
+            }
+
+            // Генерируем и скачиваем Excel-совместимый CSV
+            downloadExcel(response.data);
+            showEmailStatus(`Найдено ${response.count} клиентов. Файл скачан!`, 'success');
+        });
+
+    } catch (error) {
+        console.error("Email export error:", error);
+        showEmailStatus('Ошибка: ' + error.message, 'error');
+        btn.textContent = originalText;
+        btn.disabled = false;
+    }
+}
+
+function downloadExcel(customers) {
+    // BOM для корректного отображения кириллицы в Excel
+    const BOM = '\uFEFF';
+
+    const header = 'Email;Имя клиента;Тариф;Трек-номер;Заказ;Телефон;Дата';
+    const rows = customers.map(c =>
+        [
+            c.email || '',
+            (c.name || '').replace(/;/g, ','),
+            (c.tariff || '').replace(/;/g, ','),
+            c.trackNumber || '',
+            c.orderId || '',
+            c.phone || '',
+            c.date || ''
+        ].join(';')
+    );
+
+    const csv = BOM + header + '\n' + rows.join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    const date = new Date().toISOString().slice(0, 10);
+    link.setAttribute('href', url);
+    link.setAttribute('download', `emails_econom_universal_${date}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
 }
