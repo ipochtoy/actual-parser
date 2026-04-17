@@ -2,13 +2,18 @@
   "manifest_version": 3,
   "name": "Pochtoy Parsing",
   "version": "7.6.0",
-  "description": "🇧🇾 Parse orders from eBay, iHerb, Amazon and export to Google Sheets",
-  "permissions": ["storage", "identity", "tabs", "scripting", "alarms", "activeTab"],
+  "description": "\ud83c\udde7\ud83c\uddfe Parse orders from eBay, iHerb, Amazon and export to Google Sheets",
+  "permissions": [
+    "storage",
+    "identity",
+    "tabs",
+    "scripting",
+    "alarms",
+    "activeTab",
+    "debugger"
+  ],
   "host_permissions": [
-    "https://secure.iherb.com/*",
-    "https://www.ebay.com/*",
-    "https://www.amazon.com/*",
-    "https://www.pochtoy.com/*"
+    "<all_urls>"
   ],
   "oauth2": {
     "client_id": "294811721052-4fkb0f5cea2qsek0cfm46jq6i7n3r25t.apps.googleusercontent.com",
@@ -31,13 +36,21 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://www.ebay.com/mye/myebay/purchase*"],
-      "js": ["content-ebay.js"],
+      "matches": [
+        "https://www.ebay.com/mye/myebay/purchase*"
+      ],
+      "js": [
+        "content-ebay.js"
+      ],
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://secure.iherb.com/myaccount/orders*"],
-      "js": ["content-iherb.js"],
+      "matches": [
+        "https://secure.iherb.com/myaccount/orders*"
+      ],
+      "js": [
+        "content-iherb.js"
+      ],
       "run_at": "document_idle"
     },
     {
@@ -46,17 +59,48 @@
         "https://www.amazon.com/gp/css/order-history*",
         "https://www.amazon.com/your-orders*"
       ],
-      "js": ["content-amazon.js"],
+      "js": [
+        "content-amazon.js"
+      ],
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://www.amazon.com/ap/signin*"],
-      "js": ["content-switch-account.js"],
+      "matches": [
+        "https://www.amazon.com/ap/signin*"
+      ],
+      "js": [
+        "content-switch-account.js"
+      ],
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://www.amazon.com/", "https://www.amazon.com/?*"],
-      "js": ["content-amazon-redirect.js"],
+      "matches": [
+        "https://www.amazon.com/",
+        "https://www.amazon.com/?*"
+      ],
+      "js": [
+        "content-amazon-redirect.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://checkout.iherb.com/auth/ui/account/login*",
+        "https://secure.iherb.com/account/sign-in*",
+        "https://secure.iherb.com/account/logoff*"
+      ],
+      "js": [
+        "content-iherb-login.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.iherb.com/*"
+      ],
+      "js": [
+        "content-iherb-signout.js"
+      ],
       "run_at": "document_idle"
     }
   ],
