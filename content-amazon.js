@@ -761,12 +761,22 @@
 
   async function parseAmazonOrders(currentPage = 1, totalPages = 1) {
     console.log(`\n📦 Запуск парсера Amazon для страницы ${currentPage}/${totalPages}`);
-    
+
       const cards = getOrderCards(document);
       console.log(`📦 Найдено ${cards.length} карточек заказов`);
-    
+
     if (cards.length === 0) {
       console.log("❌ Карточки заказов не найдены!");
+      try {
+        chrome.runtime.sendMessage({
+          action: 'multiAccountLog',
+          step: 'content-amazon:no-cards',
+          detail: {
+            url: location.href.slice(0, 160),
+            bodyPreview: (document.body?.innerText || '').slice(0, 400)
+          }
+        });
+      } catch (e) { /* ignore */ }
       return { success: false, error: "Карточки заказов не найдены", orders: [] };
     }
 
@@ -1101,6 +1111,13 @@
       }, resolve);
     });
     console.log('🚩 Флаг завершения Amazon записан в storage');
+    try {
+      chrome.runtime.sendMessage({
+        action: 'multiAccountLog',
+        step: 'content-amazon:parse-end',
+        detail: { url: location.href.slice(0, 160), found: state.allOrders.length }
+      });
+    } catch (e) { /* ignore */ }
     
     // Отправляем сообщение (может потеряться, но storage уже есть)
     chrome.runtime.sendMessage({ 
@@ -1172,6 +1189,14 @@
   async function parseAmazonOrdersWithPagination(options = {}) {
     const maxPagesToParse = options.pages || 20;
     console.log(`\n📦 Запуск парсера Amazon с пагинацией (${maxPagesToParse} страниц)`);
+
+    try {
+      chrome.runtime.sendMessage({
+        action: 'multiAccountLog',
+        step: 'content-amazon:parse-start',
+        detail: { url: location.href.slice(0, 160), maxPages: maxPagesToParse }
+      });
+    } catch (e) { /* SW may be asleep, ignore */ }
 
     if (await shouldStop()) {
       console.log('🛑 Stopped before start');

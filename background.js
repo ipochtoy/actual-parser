@@ -388,10 +388,31 @@ let successCount = 0;
 let failureCount = 0;
 
 // --- Progress Handler Function ---
+// Persistent diagnostic log for Amazon multi-account flow.
+// Lets us see WHEN and WHERE a silent failure happened — picker didn't load,
+// email link wasn't found, parser never started, etc.
+// Read via: chrome.storage.local.get('amazonMultiAccountLog', console.log)
+async function logMultiAccountStep(step, detail = {}) {
+    try {
+        const { amazonMultiAccountLog = [] } = await new Promise(r => chrome.storage.local.get('amazonMultiAccountLog', r));
+        amazonMultiAccountLog.push({ t: Date.now(), iso: new Date().toISOString(), step, ...detail });
+        while (amazonMultiAccountLog.length > 200) amazonMultiAccountLog.shift();
+        await chrome.storage.local.set({ amazonMultiAccountLog });
+        console.log(`📒 [multiAccountLog] ${step}`, detail);
+    } catch (e) { console.warn('logMultiAccountStep failed:', e?.message || e); }
+}
+
 async function handleProgressMessage(request) {
     // Persist progress to storage so popup can restore it when reopened
     const storeKey = request.store.toLowerCase();
     console.log(`📊 [BACKGROUND] Progress from ${request.store}:`, request.current, '/', request.total, request.status);
+
+    // Watchdog uses lastAmazonProgressAt to detect "content-amazon silent" case.
+    // Without this ping, a 20-page account gets killed after 90s because watchdog
+    // compares now() to accountSwitchStartedAt. Progress-based idle check fixes it.
+    if (storeKey === 'amazon') {
+        chrome.storage.local.set({ lastAmazonProgressAt: Date.now() });
+    }
 
     // Restore multi-account state from storage FIRST (Service Worker may have restarted)
     const stored = await new Promise(resolve => chrome.storage.local.get(['multiAccountState', 'multiAccountIherbState'], resolve));
@@ -668,6 +689,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         });
     } else if (request.action === "progress") {
         handleProgressMessage(request);
+    } else if (request.action === "multiAccountLog") {
+        // Forwarded from content-switch-account.js / content-amazon.js —
+        // persistent step-log of Amazon multi-account flow for diagnostics.
+        logMultiAccountStep(request.step, request.detail || {});
+        sendResponse({status: "logged"});
     } else if (request.action === "queueTrackScreenshot") {
         queueTrackScreenshot(request.orderId, request.trackNumber, request.trackUrl, request.accountName);
         sendResponse({status: "queued"});
@@ -747,11 +773,31 @@ async function switchToNextAmazonAccount() {
     
     if (amazonAccountsQueue.length === 0) {
         console.log('📋 No more Amazon accounts to parse');
+        await logMultiAccountStep('multi-account:complete', {});
         isMultiAccountParsing = false;
         currentAmazonAccount = null;
 
         // Clear state
-        await chrome.storage.local.remove(['multiAccountState']);
+        await chrome.storage.local.remove(['multiAccountState', 'lastAmazonProgressAt', 'accountSwitchStartedAt']);
+
+        // Build per-account Telegram summary from parseReport.stores
+        try {
+            const amazonEntries = Object.entries(parseReport.stores || {})
+                .filter(([k]) => k.startsWith('amazon_'));
+            let summary;
+            if (amazonEntries.length === 0) {
+                summary = '✅ Amazon мульти-прогон завершён:\n  (ни один аккаунт не дал результата)';
+            } else {
+                const lines = amazonEntries.map(([k, v]) => {
+                    const name = k.replace('amazon_', '');
+                    return `  ${v.status || '•'} ${name}: ${v.found ?? 0}`;
+                });
+                summary = `✅ Amazon мульти-прогон завершён:\n${lines.join('\n')}`;
+            }
+            sendTelegramMessage(summary).catch(e => console.warn('summary tg failed:', e?.message || e));
+        } catch (e) {
+            console.warn('amazon summary build failed:', e?.message || e);
+        }
 
         // Финальный возврат на основной аккаунт (ipochtoy) — без парсинга
         finalReturnToPrimaryAmazon().catch(e => console.warn('finalReturn failed:', e));
@@ -765,38 +811,42 @@ async function switchToNextAmazonAccount() {
     
     const nextEmail = amazonAccountsQueue.shift();
     currentAmazonAccount = nextEmail;
-    
+
     console.log(`🔄 Switching to Amazon account: ${nextEmail}`);
     console.log(`🔄 Switching to account: ${nextEmail.split('@')[0]}`);
-    
+    await logMultiAccountStep('switchToNextAmazonAccount:start', { account: nextEmail });
+
     // Save pending switch and updated state, clear completion flag and old pagination
     await chrome.storage.local.set({
         pendingAccountSwitch: { email: nextEmail },
         amazonParsingComplete: null,
         amazonPaginationState: null,
         accountSwitchStartedAt: Date.now(),
+        lastAmazonProgressAt: Date.now(),
         multiAccountState: {
             isMultiAccountParsing: true,
             amazonAccountsQueue: amazonAccountsQueue,
             currentAmazonAccount: nextEmail
         }
     });
-    
+
     // Find active tab or create new one
     const tabs = await chrome.tabs.query({ url: 'https://www.amazon.com/*' });
-    
+
     const switchUrl = 'https://www.amazon.com/ap/signin?openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.amazon.com%2F%3Fref_%3Dnav_youraccount_switchacct&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.assoc_handle=usflex&openid.mode=checkid_setup&marketPlaceId=ATVPDKIKX0DER&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&switch_account=picker&ignoreAuthState=1&_encoding=UTF8';
-    
+
     if (tabs.length > 0) {
         // Navigate existing Amazon tab to switch-account page
-        await chrome.tabs.update(tabs[0].id, { 
+        await logMultiAccountStep('switchToNextAmazonAccount:redirect', { account: nextEmail, tabId: tabs[0].id, url: switchUrl.slice(0, 80) });
+        await chrome.tabs.update(tabs[0].id, {
             url: switchUrl,
-            active: true 
+            active: true
         });
     } else {
         // Create new tab
-        await chrome.tabs.create({ 
-            url: switchUrl 
+        await logMultiAccountStep('switchToNextAmazonAccount:new-tab', { account: nextEmail, url: switchUrl.slice(0, 80) });
+        await chrome.tabs.create({
+            url: switchUrl
         });
     }
 }
@@ -1285,23 +1335,48 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     
     if (alarm.name !== WATCHDOG_ALARM_NAME) return;
     
-    const stored = await chrome.storage.local.get(['amazonParsingComplete', 'multiAccountState', 'accountSwitchStartedAt']);
-    
-    // TIMEOUT: if account switch started but no completion within 90s, skip the account
+    const stored = await chrome.storage.local.get(['amazonParsingComplete', 'multiAccountState', 'accountSwitchStartedAt', 'lastAmazonProgressAt']);
+
+    // TIMEOUT: progress-based (idle) + hard cap.
+    // Old logic killed after 90s from switch-start — fatally short for accounts with
+    // 20 pages (needs 5-7 min). New logic: kill if no parsing progress for 90s, or
+    // if total time exceeds 10-minute hard cap (safety against runaway).
     if (!stored.amazonParsingComplete && stored.accountSwitchStartedAt && stored.multiAccountState) {
-        const elapsed = Date.now() - stored.accountSwitchStartedAt;
-        if (elapsed > ACCOUNT_PARSE_TIMEOUT_MS) {
+        const now = Date.now();
+        const totalElapsed = now - stored.accountSwitchStartedAt;
+        const sinceLastProgress = now - (stored.lastAmazonProgressAt || stored.accountSwitchStartedAt);
+        const HARD_CAP_MS = 600_000; // 10 min absolute
+        const isIdleTimeout = sinceLastProgress > ACCOUNT_PARSE_TIMEOUT_MS;
+        const isHardCap = totalElapsed > HARD_CAP_MS;
+        if (isIdleTimeout || isHardCap) {
             const failedEmail = stored.multiAccountState.currentAmazonAccount || 'unknown';
-            console.log(`🚫 Account ${failedEmail} timed out after ${Math.round(elapsed/1000)}s, skipping`);
-            sendTelegramMessage(`🚫 Аккаунт ${failedEmail.split('@')[0]} не отвечает ${Math.round(elapsed/1000)}с — пропускаю`);
-            
+            const reason = isHardCap ? 'hard-cap 10min' : 'no progress';
+            const idleSec = Math.round(sinceLastProgress / 1000);
+            const totalSec = Math.round(totalElapsed / 1000);
+            console.log(`🚫 Account ${failedEmail} timed out (${reason}, idle=${idleSec}s, total=${totalSec}s), skipping`);
+            sendTelegramMessage(`🚫 Аккаунт ${failedEmail.split('@')[0]}: ${reason}, idle=${idleSec}с, total=${totalSec}с — пропускаю`);
+
+            // Screenshot the Amazon tab before skipping — shows what actually was on the
+            // page: picker, order-history, CAPTCHA, 2FA, device verification, empty.
+            // Critical for diagnosing the "photopochtoy silence" pattern.
+            try {
+                const amzTabs = await chrome.tabs.query({ url: '*://*.amazon.com/*' });
+                if (amzTabs[0]) {
+                    const dataUrl = await chrome.tabs.captureVisibleTab(amzTabs[0].windowId, { format: 'png' });
+                    const b64 = (dataUrl || '').replace(/^data:image\/png;base64,/, '');
+                    if (b64) await sendTelegramPhoto(b64, `🚫 Amazon timeout: ${failedEmail.split('@')[0]}\n${reason}, idle=${idleSec}s total=${totalSec}s`);
+                }
+            } catch (e) { console.warn('timeout-screenshot failed:', e?.message || e); }
+
+            await logMultiAccountStep('account-parse:timeout', { account: failedEmail, reason, idleSec, totalSec });
+
             // Restore state
             isMultiAccountParsing = stored.multiAccountState.isMultiAccountParsing;
             amazonAccountsQueue = stored.multiAccountState.amazonAccountsQueue || [];
             currentAmazonAccount = stored.multiAccountState.currentAmazonAccount;
-            
-            await chrome.storage.local.remove(['accountSwitchStartedAt', 'amazonParsingComplete', 'amazonPaginationState']);
-            switchToNextAmazonAccount();
+
+            await chrome.storage.local.remove(['accountSwitchStartedAt', 'lastAmazonProgressAt', 'amazonParsingComplete', 'amazonPaginationState']);
+            await switchToNextAmazonAccount();
             return;
         }
     }
@@ -1332,7 +1407,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             }
             
             if (isMultiAccountParsing && amazonAccountsQueue.length > 0) {
-                switchToNextAmazonAccount();
+                await switchToNextAmazonAccount();
             } else if (isMultiAccountParsing) {
                 isMultiAccountParsing = false;
                 currentAmazonAccount = null;

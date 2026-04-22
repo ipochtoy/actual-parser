@@ -3,13 +3,20 @@
 
 console.log('🔄 Switch Account script loaded on:', window.location.href);
 
+function switchLog(step, detail = {}) {
+  try {
+    chrome.runtime.sendMessage({ action: 'multiAccountLog', step: `switch-account:${step}`, detail });
+  } catch (e) { /* SW may be starting, ignore */ }
+}
+
 // Only run on switch account picker page
 if (!window.location.href.includes('switch_account=picker') && !window.location.href.includes('switchacct')) {
   console.log('📋 Not a switch account page, skipping');
 } else {
   (async function() {
     console.log('🔄 Switch account page detected!');
-    
+    switchLog('picker-loaded', { url: window.location.href.slice(0, 120) });
+
     // Wait a bit for background to set the flag
     await new Promise(resolve => setTimeout(resolve, 1000));
     
@@ -43,16 +50,18 @@ if (!window.location.href.includes('switch_account=picker') && !window.location.
     // Check if target email is visible on page
     if (!document.body.innerText.includes(targetEmail)) {
       console.log(`❌ Email ${targetEmail} not found in page text!`);
+      switchLog('email-missing', { targetEmail, bodyPreview: document.body.innerText.slice(0, 400) });
       await chrome.storage.local.remove(['pendingAccountSwitch']);
-      chrome.runtime.sendMessage({ 
-        action: 'accountSwitchFailed', 
+      chrome.runtime.sendMessage({
+        action: 'accountSwitchFailed',
         email: targetEmail,
         error: 'Email not visible on page'
       });
       return;
     }
-    
+
     console.log(`✅ Email ${targetEmail} found in page text`);
+    switchLog('email-found', { targetEmail });
     
     // Find all account rows - each account is in a container with avatar + name + email
     const allDivs = Array.from(document.querySelectorAll('div'));
@@ -101,10 +110,11 @@ if (!window.location.href.includes('switch_account=picker') && !window.location.
     
     if (isAlreadySelected) {
       console.log('🚀 Already on target account, going straight to orders!');
+      switchLog('already-selected', { targetEmail });
       await chrome.storage.local.remove(['pendingAccountSwitch']);
-      await chrome.storage.local.set({ 
+      await chrome.storage.local.set({
         accountSwitchInProgress: true,
-        switchedToEmail: targetEmail 
+        switchedToEmail: targetEmail
       });
       window.location.href = 'https://www.amazon.com/gp/your-account/order-history?orderFilter=year-2025';
       return;
@@ -147,24 +157,28 @@ if (!window.location.href.includes('switch_account=picker') && !window.location.
       
       if (clickTarget) {
         console.log('🖱️ Clicking:', clickTarget.tagName, clickTarget.textContent.substring(0, 50));
+        switchLog('click-done', { targetEmail, tag: clickTarget.tagName, text: clickTarget.textContent.slice(0, 80) });
         clickTarget.click();
       } else {
         console.log('🖱️ Clicking row directly');
+        switchLog('click-done', { targetEmail, fallback: 'row' });
         targetRow.click();
       }
-      
+
       // Wait and redirect to orders
       setTimeout(() => {
         console.log('🔄 Redirecting to orders page...');
+        switchLog('redirect-to-orders', { targetEmail });
         window.location.href = 'https://www.amazon.com/gp/your-account/order-history?orderFilter=year-2025';
       }, 2000);
-      
+
     } else {
       console.log(`❌ Could not find clickable element for ${targetEmail}`);
-      
+      switchLog('no-click-target', { targetEmail });
+
       await chrome.storage.local.remove(['pendingAccountSwitch']);
-      chrome.runtime.sendMessage({ 
-        action: 'accountSwitchFailed', 
+      chrome.runtime.sendMessage({
+        action: 'accountSwitchFailed',
         email: targetEmail,
         error: 'Could not find clickable account element'
       });
