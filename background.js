@@ -1,7 +1,7 @@
 // Background script for Pochtoy Parser - v7.5.0 (Fix: multi-product deduplication, eBay error handling)
 
-// --- Daily Auto-Parse at 1:00 AM ---
-const DAILY_PARSE_HOUR = 0; // 0:00 (midnight)
+// --- Daily Auto-Parse at 23:00 ---
+const DAILY_PARSE_HOUR = 23; // 23:00 local time
 const DAILY_PARSE_MINUTE = 0;
 const DAILY_ALARM_NAME = 'dailyAutoParse';
 
@@ -30,7 +30,7 @@ function setupDailyAlarm() {
 
 // Initialize daily alarm on extension start
 setupDailyAlarm();
-console.log('✅ Daily auto-parse ENABLED (midnight)');
+console.log('✅ Daily auto-parse ENABLED (23:00)');
 
 // --- Google Auth Functions (inlined to avoid import issues) ---
 function getAuthToken(interactive) {
@@ -135,11 +135,34 @@ let isParsingAllStores = false;
 let parseReport = { stores: {}, screenshots: { sent: 0, skipped: 0, failed: 0, broken: 0 }, startedAt: null };
 const DEFAULT_SPREADSHEET_ID = '1w1QOzGWc_CNovlezuxyLta-h1kM3pgPXc_GoHYaOA98';
 
+// --- Accounts Config (accountsConfig — источник истины для multi-account) ---
+// DEFAULT_ACCOUNTS_CONFIG используется, если user ещё не сохранил свой конфиг
+// через popup. Реальная настройка — в chrome.storage.local.accountsConfig.
+// Primary account = isPrimary:true, идёт ПЕРВЫМ в массиве (парсится первым
+// для iHerb, финальный возврат — для Amazon).
+const DEFAULT_ACCOUNTS_CONFIG = {
+  iherb: [
+    { email: 'photopochtoy@gmail.com', password: 'jSt0ldU%W55!', isPrimary: true  },
+    { email: 'pochtoy@gmail.com',      password: '1Svetakurz@',  isPrimary: false }
+  ],
+  amazon: [
+    { email: 'ipochtoy@gmail.com',     isPrimary: true  },
+    { email: 'photopochtoy@gmail.com', isPrimary: false }
+  ],
+  ebay: [
+    { email: 'ipochtoy@gmail.com',     isPrimary: true }
+  ]
+};
+
+async function loadAccountsConfig() {
+  const r = await chrome.storage.local.get(['accountsConfig']);
+  return r.accountsConfig || DEFAULT_ACCOUNTS_CONFIG;
+}
+
+function getPrimary(list)     { return list.find(a => a.isPrimary) || list[0]; }
+function getSecondaries(list) { return list.filter(a => !a.isPrimary); }
+
 // --- Multi-Account Amazon Parsing ---
-const AMAZON_ACCOUNTS_TO_PARSE = [
-  'ipochtoy@gmail.com',
-  'photopochtoy@gmail.com'
-];
 let amazonAccountsQueue = [];
 let currentAmazonAccount = null;
 let isMultiAccountParsing = false;
@@ -147,16 +170,18 @@ const MAX_ACCOUNT_SWITCH_ATTEMPTS = 2;
 const ACCOUNT_PARSE_TIMEOUT_MS = 90000;
 
 // --- Multi-Account iHerb Parsing ---
-// TODO: вынести пароли в chrome.storage.local через popup. Сейчас в коде по
-// явной просьбе — файл не публикуется, lives только локально.
-const IHERB_ACCOUNTS = [
-  { email: 'pochtoy@gmail.com', password: '1Svetakurz@' },
-  { email: 'photopochtoy@gmail.com', password: 'jSt0ldU%W55!' }
-];
-const IHERB_PRIMARY_EMAIL = 'photopochtoy@gmail.com'; // куда возвращаемся после парса
+// Список аккаунтов с паролями теперь загружается из accountsConfig (см. выше).
 let iherbAccountsQueue = [];
 let currentIherbAccount = null;
 let isMultiAccountIherb = false;
+
+// --- Sequential pipeline state machine ---
+// Stages are shop-level only. iHerb and Amazon drain their own
+// primary → secondary → return sub-steps internally (via
+// startMultiAccountIherbParsing / startMultiAccountAmazonParsing + their
+// finalReturn*() siblings). Each such shop emits ONE advancePipelineStage()
+// after its final-return; that moves us to the next shop-level stage.
+const PIPELINE_STAGES = ['iherb', 'ebay', 'amazon', 'done'];
 
 // --- Parsing Logs ---
 const LOGS_SHEET_NAME = 'Logs';
@@ -465,6 +490,8 @@ async function handleProgressMessage(request) {
             if (storeKey === 'iherb' && isMultiAccountIherb && iherbAccountsQueue.length > 0) {
                 console.log('[handleProgress] iHerb multi-account: processing screenshots, then switching');
                 parseReport.stores[`iherb_${(currentIherbAccount || '').split('@')[0]}`] = { found: count, status: emoji };
+                // Watchdog: cs дошёл до конца — снимаем marker
+                chrome.storage.local.remove(['iherbParseStartedAt', 'iherbWatchdogRetried']);
                 if (screenshotsEnabled && trackScreenshotQueue.length > 0) {
                     processScreenshotQueue().finally(() => switchToNextIherbAccount());
                 } else {
@@ -478,6 +505,7 @@ async function handleProgressMessage(request) {
                 parseReport.stores[`iherb_${(currentIherbAccount || '').split('@')[0]}`] = { found: count, status: emoji };
                 isMultiAccountIherb = false;
                 currentIherbAccount = null;
+                chrome.storage.local.remove(['iherbParseStartedAt', 'iherbWatchdogRetried']);
                 if (screenshotsEnabled && trackScreenshotQueue.length > 0) {
                     processScreenshotQueue().finally(() => finalReturnToIherbPrimary());
                 } else {
@@ -503,6 +531,18 @@ async function handleProgressMessage(request) {
 
             // Upload this store's data to Sheets immediately (dedupe handles duplicates)
             setTimeout(() => uploadToSheets(), 1500);
+
+            // Pipeline advance: if sequential pipeline is active and we just finished eBay,
+            // jump ebay → amazon_primary. iHerb and Amazon advance from their own final-return
+            // functions (with a 45s delay for picker/re-login to settle).
+            if (storeKey === 'ebay') {
+                chrome.storage.local.get(['pipelineStage']).then(r => {
+                    const p = r.pipelineStage;
+                    if (p && p.active && p.stages[p.currentIndex] === 'ebay') {
+                        advancePipelineStage().catch(() => {});
+                    }
+                });
+            }
 
             checkAllStoresCompleted();
         }
@@ -599,6 +639,25 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         parseReport = { stores: {}, screenshots: { sent: 0, skipped: 0, failed: 0, broken: 0 }, startedAt: Date.now() };
         sendTelegramMessage('🚀 Запущен парсинг всех магазинов...');
         sendResponse({status: "started"});
+    } else if (request.action === "startSequentialPipeline") {
+        // Sequential pipeline: iHerb → eBay → Amazon, one shop at a time, each
+        // draining its multi-account queue internally.
+        isParsingAllStores = true;
+        storesCompleted = { ebay: false, iherb: false, amazon: false };
+        saveParsingState();
+        cachedProgressState = {};
+        chrome.storage.local.set({ progressState: cachedProgressState });
+        clearParsingLogs();
+        parseReport = { stores: {}, screenshots: { sent: 0, skipped: 0, failed: 0, broken: 0 }, startedAt: Date.now() };
+        startSequentialPipeline();
+        sendResponse({ status: 'started' });
+        return true;
+    } else if (request.action === "getAccountsConfig") {
+        loadAccountsConfig().then(cfg => sendResponse({ config: cfg, defaults: DEFAULT_ACCOUNTS_CONFIG }));
+        return true;
+    } else if (request.action === "saveAccountsConfig") {
+        chrome.storage.local.set({ accountsConfig: request.config }).then(() => sendResponse({ ok: true }));
+        return true;
     } else if (request.action === "startMultiAccountAmazon") {
         // Multi-account Amazon parsing: photopochtoy + ipochtoy sequentially.
         // Re-enabled 2026-04-14 as part of warehouse-verify archive pipeline.
@@ -646,7 +705,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             const MAX_IH_ATTEMPTS = 2;
             if (failures[email] < MAX_IH_ATTEMPTS && reason !== 'captcha') {
                 console.log(`🔁 Retry iHerb switch for ${email} (attempt ${failures[email]+1}/${MAX_IH_ATTEMPTS})`);
-                iherbAccountsQueue.unshift({ email, password: (IHERB_ACCOUNTS.find(a => a.email === email) || {}).password });
+                const cfgForRetry = await loadAccountsConfig();
+                iherbAccountsQueue.unshift({ email, password: (cfgForRetry.iherb.find(a => a.email === email) || {}).password });
                 await chrome.storage.local.set({
                     multiAccountIherbState: {
                         isMultiAccountIherb: true,
@@ -778,7 +838,7 @@ async function switchToNextAmazonAccount() {
         currentAmazonAccount = null;
 
         // Clear state
-        await chrome.storage.local.remove(['multiAccountState', 'lastAmazonProgressAt', 'accountSwitchStartedAt']);
+        await chrome.storage.local.remove(['multiAccountState', 'lastAmazonProgressAt', 'accountSwitchStartedAt', 'skipGuardAt']);
 
         // Build per-account Telegram summary from parseReport.stores
         try {
@@ -865,10 +925,133 @@ async function switchToNextAmazonAccount() {
 const IHERB_DEBUGGER_VERSION = '1.3';
 const IHERB_HOVER_HOLD_MS    = 2000;
 
+// ─── Sequential pipeline state machine ──────────────────────────────────────
+// Coordinates iHerb → eBay → Amazon as discrete stages. Thin layer: each
+// multi-account shop drains its own queue internally; pipeline only triggers
+// the NEXT shop after the previous one (including return) finishes.
+
+async function startSequentialPipeline() {
+  // Reset the legacy parallel-parse completion tracker and flip the flag that
+  // gates handleProgressMessage's completion branch — otherwise eBay's
+  // "Done ✅" will be ignored and we never advance from ebay → amazon.
+  isParsingAllStores = true;
+  storesCompleted = { ebay: false, iherb: false, amazon: false };
+  // Чистим leftover iHerb/Amazon state от предыдущих прогонов — иначе stale
+  // iherbFinalReturn=true блокирует парсинг (content-iherb.js выходит без
+  // действий), а высокий iherbSwitchFailures счётчик срабатывает на первой же
+  // неудаче → аккаунт скипается мгновенно.
+  await chrome.storage.local.remove([
+    'iherbFinalReturn',
+    'iherbSwitchInProgress',
+    'iherbSwitchFailures',
+    'iherbOrdersReloadDone',
+    'pendingIherbSwitch',
+    'multiAccountIherbState',
+    'pendingAccountSwitch',
+    'amazonFinalReturn',
+    'accountSwitchFailures',
+    'amazonPaginationState'
+  ]);
+  await chrome.storage.local.set({
+    pipelineStage: { active: true, stages: PIPELINE_STAGES, currentIndex: 0, startedAt: Date.now() }
+  });
+  sendTelegramMessage('🚀 Sequential pipeline started: iHerb → eBay → Amazon').catch(() => {});
+  await runPipelineStage('iherb');
+}
+
+async function runPipelineStage(stageName) {
+  console.log(`🎬 runPipelineStage: ${stageName}`);
+  if (stageName === 'iherb') {
+    return startMultiAccountIherbParsing();
+  }
+  if (stageName === 'ebay') {
+    return startEbayStageForPipeline();
+  }
+  if (stageName === 'amazon') {
+    return startMultiAccountAmazonParsing();
+  }
+  if (stageName === 'done') {
+    isParsingAllStores = false;
+    await chrome.storage.local.set({
+      pipelineStage: { active: false, stages: PIPELINE_STAGES, currentIndex: PIPELINE_STAGES.length - 1, startedAt: null }
+    });
+    sendTelegramMessage('✅ Sequential pipeline done').catch(() => {});
+    return;
+  }
+}
+
+// Blocks until the screenshot queue is fully drained AND processing is idle.
+// processScreenshotQueue() has an `isProcessingScreenshots` re-entry guard —
+// a bare `await processScreenshotQueue()` returns immediately if another caller
+// is already draining, which would let the next stage start too early. This
+// helper polls until both flags are clear, kicking off a drain itself if the
+// queue has items but nobody is running.
+async function waitForScreenshotsDrained(maxWaitMs = 10 * 60 * 1000) {
+  if (!screenshotsEnabled) return;
+  const start = Date.now();
+  while (trackScreenshotQueue.length > 0 || isProcessingScreenshots) {
+    if (Date.now() - start > maxWaitMs) {
+      console.warn('⏰ waitForScreenshotsDrained: timed out, advancing anyway');
+      return;
+    }
+    if (!isProcessingScreenshots && trackScreenshotQueue.length > 0) {
+      processScreenshotQueue().catch(() => {});
+    }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
+
+async function advancePipelineStage() {
+  const r = await chrome.storage.local.get(['pipelineStage']);
+  const p = r.pipelineStage;
+  if (!p || !p.active) return;
+
+  // DRAIN screenshot queue BEFORE starting next stage.
+  // chrome.tabs.captureVisibleTab(windowId) captures whatever tab is currently active
+  // in that window. If Amazon's switch_account navigation flips its tab to active
+  // while eBay screenshots are still queued, captureVisibleTab photographs the
+  // Switch-Accounts page instead of the order page (confirmed in Telegram log:
+  // Amazon switch page was sent as an eBay "screenshot"). Draining here guarantees
+  // the previous stage's screenshots finish before any new tab steals focus.
+  if (screenshotsEnabled && (trackScreenshotQueue.length > 0 || isProcessingScreenshots)) {
+    console.log(`⏸  Pipeline: waiting for screenshot queue to drain (${trackScreenshotQueue.length} queued, processing=${isProcessingScreenshots})`);
+    await waitForScreenshotsDrained();
+    console.log('▶  Pipeline: screenshot queue drained, advancing');
+  }
+
+  const nextIndex = p.currentIndex + 1;
+  if (nextIndex >= p.stages.length) {
+    await chrome.storage.local.set({ pipelineStage: { ...p, active: false, currentIndex: p.stages.length - 1 } });
+    return;
+  }
+  const nextStage = p.stages[nextIndex];
+  await chrome.storage.local.set({ pipelineStage: { ...p, currentIndex: nextIndex } });
+  await runPipelineStage(nextStage);
+}
+
+async function startEbayStageForPipeline() {
+  // content-ebay.js checkAutoParse требует autoParsePending='ebay' + свежий
+  // autoParseTimestamp (<120s). Без этого он молча скипнет парсинг.
+  await chrome.storage.local.set({
+    autoParsePending: 'ebay',
+    autoParseTimestamp: Date.now(),
+    ebay_should_autoparse: true
+  });
+  const url = 'https://www.ebay.com/mye/myebay/purchase';
+  const tabs = await chrome.tabs.query({ url: 'https://www.ebay.com/mye/myebay/purchase*' });
+  if (tabs.length > 0) {
+    await chrome.tabs.update(tabs[0].id, { url, active: true });
+  } else {
+    await chrome.tabs.create({ url });
+  }
+}
+
 async function startMultiAccountIherbParsing() {
     console.log('🚀 startMultiAccountIherbParsing called');
 
-    iherbAccountsQueue = [...IHERB_ACCOUNTS];
+    const cfg = await loadAccountsConfig();
+    // accountsConfig.iherb уже в нужном порядке: primary первый, secondary последний.
+    iherbAccountsQueue = cfg.iherb.slice();
     isMultiAccountIherb = true;
     currentIherbAccount = null;
 
@@ -889,7 +1072,7 @@ async function startMultiAccountIherbParsing() {
     ]);
 
     setParserLock('iherb', true);
-    sendTelegramMessage(`🌿 iHerb мульти-аккаунт: ${IHERB_ACCOUNTS.map(a => a.email.split('@')[0]).join(', ')}`).catch(() => {});
+    sendTelegramMessage(`🌿 iHerb мульти-аккаунт: ${cfg.iherb.map(a => a.email.split('@')[0]).join(', ')}`).catch(() => {});
 
     // Находим существующий iherb-таб или создаём один. НЕ закрываем чужие табы.
     const tabId = await ensureIherbParserTab();
@@ -929,8 +1112,29 @@ async function switchToNextIherbAccount() {
         }
     });
 
-    const tabId = stored.iherbParserTabId || (await ensureIherbParserTab());
+    const tabId = await ensureValidIherbParserTab(stored.iherbParserTabId);
     await chrome.storage.local.set({ iherbParserTabId: tabId });
+
+    // Fast path ТОЛЬКО для первого аккаунта в очереди (primary): если оператор
+    // уже залогинен на iHerb, пропускаем dropdown-dance и сразу идём на /orders.
+    // multiAccountIherbState.currentIherbAccount уже выставлен в next.email, так
+    // что content-iherb.js размтит все позиции на правильный account_name.
+    // Для secondary-аккаунта (pochtoy) мы ВСЕГДА обязаны делать sign-out dance,
+    // потому что оператор сейчас залогинен как primary, не как secondary.
+    const cfg = await loadAccountsConfig();
+    const primary = getPrimary(cfg.iherb);
+    const isPrimaryAttempt = next.email === primary.email;
+    const alreadyLoggedIn = isPrimaryAttempt && await iherbIsLoggedIn(tabId);
+    if (alreadyLoggedIn) {
+        console.log(`✅ Already logged in — skipping sign-out dance, parsing as ${next.email}`);
+        sendTelegramMessage(`✅ iHerb уже залогинен — парсим ${next.email.split('@')[0]} напрямую`).catch(() => {});
+        await chrome.storage.local.remove(['pendingIherbSwitch']);
+        // iherbSwitchInProgress=true уже выставлен выше — content-iherb.js auto-parse.
+        // iherb watchdog: marker для проверки залипания cs (Extension context invalidated и т.п.)
+        await chrome.storage.local.set({ iherbParseStartedAt: Date.now(), iherbWatchdogRetried: false });
+        await chrome.tabs.update(tabId, { url: 'https://secure.iherb.com/myaccount/orders', active: true });
+        return;
+    }
 
     try {
         await iherbUiSignOutAndNavigateToLogin(tabId);
@@ -940,6 +1144,27 @@ async function switchToNextIherbAccount() {
         console.error('❌ iHerb UI sign-out flow failed:', e);
         sendTelegramMessage(`⚠️ iHerb UI sign-out упал для ${next.email.split('@')[0]}: ${e.message || e}`).catch(() => {});
         await handleIherbSwitchFailure(next.email, 'ui_signout_failed');
+    }
+}
+
+// Проверяет что на iHerb кто-то залогинен (logoff link присутствует в DOM).
+// iHerb прячет email в HttpOnly-куках — JS не может прочитать какой именно
+// аккаунт залогинен без fetch к пользовательскому API. Для multi-account мы
+// ДОВЕРЯЕМ что primary-аккаунт (photopochtoy) — это тот аккаунт, в котором
+// оператор обычно сидит. Если это не так, content-iherb.js может проверить
+// при парсинге (отдельная проблема вне scope).
+async function iherbIsLoggedIn(tabId) {
+    try {
+        const tabInfo = await chrome.tabs.get(tabId);
+        if (!/^https?:\/\/(www|secure)\.iherb\.com\//i.test(tabInfo.url || '')) return false;
+        const [res] = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: () => !!document.querySelector('a[href*="logoff"]')
+        });
+        return !!res?.result;
+    } catch (e) {
+        console.warn('iherbIsLoggedIn failed:', e?.message || String(e));
+        return false;
     }
 }
 
@@ -955,7 +1180,8 @@ async function handleIherbSwitchFailure(email, reason) {
     const MAX_IH_ATTEMPTS = 2;
     if (failures[email] < MAX_IH_ATTEMPTS && reason !== 'captcha') {
         console.log(`🔁 Retry iHerb switch for ${email} (attempt ${failures[email] + 1}/${MAX_IH_ATTEMPTS})`);
-        const creds = IHERB_ACCOUNTS.find(a => a.email === email);
+        const cfg = await loadAccountsConfig();
+        const creds = cfg.iherb.find(a => a.email === email);
         if (creds) iherbAccountsQueue.unshift(creds);
         await chrome.storage.local.set({
             multiAccountIherbState: {
@@ -976,7 +1202,8 @@ async function handleIherbSwitchFailure(email, reason) {
 }
 
 async function finalReturnToIherbPrimary() {
-    const primary = IHERB_ACCOUNTS.find(a => a.email === IHERB_PRIMARY_EMAIL) || IHERB_ACCOUNTS[IHERB_ACCOUNTS.length - 1];
+    const cfg = await loadAccountsConfig();
+    const primary = getPrimary(cfg.iherb);
     console.log(`🏁 iHerb final return to ${primary.email}`);
     sendTelegramMessage(`🏁 Возврат на основной iHerb-аккаунт: ${primary.email.split('@')[0]}`).catch(() => {});
 
@@ -988,8 +1215,21 @@ async function finalReturnToIherbPrimary() {
     await chrome.storage.local.remove(['iherbSwitchInProgress']);
 
     const stored = await chrome.storage.local.get(['iherbParserTabId']);
-    const tabId = stored.iherbParserTabId || (await ensureIherbParserTab());
+    const tabId = await ensureValidIherbParserTab(stored.iherbParserTabId);
     await chrome.storage.local.set({ iherbParserTabId: tabId });
+
+    // Fast path: если мы остались залогинены как primary (secondary-логин
+    // провалился или уже дренили очередь без выхода) — final-return это no-op.
+    const alreadyOnPrimary = await iherbIsLoggedIn(tabId);
+    if (alreadyOnPrimary) {
+        console.log(`✅ Already on primary ${primary.email} — final return no-op`);
+        sendTelegramMessage(`✅ iHerb уже на ${primary.email.split('@')[0]} — возврат не нужен`).catch(() => {});
+        await chrome.storage.local.remove(['pendingIherbSwitch', 'iherbFinalReturn', 'iherbSwitchInProgress']);
+        await chrome.tabs.update(tabId, { url: 'https://www.iherb.com/', active: false });
+        // Advance faster — нет 45s login wait.
+        setTimeout(() => advancePipelineStage().catch(() => {}), 3000);
+        return;
+    }
 
     try {
         await iherbUiSignOutAndNavigateToLogin(tabId);
@@ -997,6 +1237,10 @@ async function finalReturnToIherbPrimary() {
         console.error('❌ iHerb final return failed:', e);
         sendTelegramMessage(`⚠️ iHerb final return упал: ${e.message || e}`).catch(() => {});
     }
+
+    // Pipeline advance: after ~45s (sign-out + login + orders page load) jump
+    // from iherb_return → ebay (if pipeline active).
+    setTimeout(() => advancePipelineStage().catch(() => {}), 45000);
 }
 
 // ─── Shared: ensure we have exactly one iHerb parser tab ───────────────────
@@ -1007,6 +1251,26 @@ async function ensureIherbParserTab() {
     const t = await chrome.tabs.create({ url: 'https://www.iherb.com/', active: false });
     await waitForTabComplete(t.id, 20000);
     return t.id;
+}
+
+// Валидирует cached iherbParserTabId: проверяет что таб жив и на iHerb-домене.
+// Если нет — возвращает свежий tabId через ensureIherbParserTab. Это чинит
+// ошибку "Cannot access a chrome-extension:// URL of different extension",
+// которая возникает когда chrome.debugger.attach пытается подключиться к табу
+// чужого расширения (stale ID после закрытия iHerb-таба).
+async function ensureValidIherbParserTab(cachedTabId) {
+    if (cachedTabId) {
+        try {
+            const t = await chrome.tabs.get(cachedTabId);
+            if (t && /^https?:\/\/[a-z0-9.-]*iherb\.com\//i.test(t.url || '')) {
+                return cachedTabId;
+            }
+            console.warn(`⚠️ iherbParserTabId=${cachedTabId} stale (url=${t?.url?.slice(0,80)}) — re-query`);
+        } catch (e) {
+            console.warn(`⚠️ iherbParserTabId=${cachedTabId} not found — re-query`);
+        }
+    }
+    return ensureIherbParserTab();
 }
 
 function waitForTabComplete(tabId, timeoutMs) {
@@ -1084,161 +1348,139 @@ async function dbgEval(tabId, expression) {
     }
 }
 
-// ─── Phase 1 flow: hover .my-account → click Sign out → re-hover → click Sign in/Create ──
-async function iherbUiSignOutAndNavigateToLogin(tabId) {
-    // 1) Ensure we're on www.iherb.com (header dropdown lives only there).
-    const tabInfo = await chrome.tabs.get(tabId);
-    if (!/^https?:\/\/www\.iherb\.com\//i.test(tabInfo.url)) {
-        console.log('🌿 [iHerb UI] nav to https://www.iherb.com/');
-        await chrome.tabs.update(tabId, { url: 'https://www.iherb.com/', active: true });
-        await waitForTabComplete(tabId, 20000);
-        await new Promise(r => setTimeout(r, 1500));
-    } else {
-        // tab must be active for Input events not to have 5s lag (Phase 1).
-        await chrome.tabs.update(tabId, { active: true });
-        await new Promise(r => setTimeout(r, 400));
-    }
-
-    await dbgAttach(tabId);
-    try {
-        // 2) Get .my-account trigger coords
-        const trig = await dbgEval(tabId, `
+// Ждёт пока .my-account появится и станет видимым в header. iHerb hydrate'ит
+// header асинхронно после `load`; фиксированный dwell 1.5s рейсит с монтажом.
+async function waitForIherbHeader(tabId, maxMs = 20000) {
+    const start = Date.now();
+    let logged = false;
+    while (Date.now() - start < maxMs) {
+        const ok = await dbgEval(tabId, `
             (() => {
                 const el = document.querySelector('.my-account');
-                if (!el) return null;
+                if (!el) return false;
                 const r = el.getBoundingClientRect();
-                return { x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2) };
+                return r.width > 0 && r.height > 0;
             })()
         `);
-        if (!trig) throw new Error('my_account_trigger_not_found');
-
-        // 3) Hover sequence (neutral → trigger → hold 2s)
-        await dbgMouseMove(tabId, 100, 500);
-        await new Promise(r => setTimeout(r, 300));
-        await dbgMouseMove(tabId, trig.x, trig.y);
-        await new Promise(r => setTimeout(r, IHERB_HOVER_HOLD_MS));
-
-        // 4) Find Sign out inside dropdown
-        const signOut = await dbgEval(tabId, `
-            (() => {
-                const sels = ['a.btn-primary-universal[href*="logoff"]', 'a[href*="logoff"]'];
-                let el = null;
-                for (const s of sels) { el = document.querySelector(s); if (el) break; }
-                if (!el) el = Array.from(document.querySelectorAll('a,button')).find(x => (x.textContent||'').trim() === 'Sign out');
-                if (!el || el.offsetParent === null) return null;
-                const r = el.getBoundingClientRect();
-                return { x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2) };
-            })()
-        `);
-        if (!signOut) throw new Error('signout_button_not_visible');
-
-        // 5) Glide-click: стай внутри hover-zone пока двигаешься к Sign out
-        await dbgMouseMove(tabId, trig.x, trig.y);
-        await new Promise(r => setTimeout(r, 300));
-        await dbgMouseMove(tabId, trig.x, trig.y + 80);
-        await new Promise(r => setTimeout(r, 150));
-        await dbgMouseMove(tabId, trig.x, trig.y + 200);
-        await new Promise(r => setTimeout(r, 150));
-        await dbgMouseMove(tabId, signOut.x, signOut.y - 20);
-        await new Promise(r => setTimeout(r, 150));
-        await dbgMouseMove(tabId, signOut.x, signOut.y);
-        await new Promise(r => setTimeout(r, 400));
-        await dbgMouseClick(tabId, signOut.x, signOut.y);
-        console.log('🌿 [iHerb UI] → clicked Sign out');
-
-        // 6) Wait for redirect (iHerb уходит на www.iherb.com/?correlationId=... logged-out)
-        await waitForTabComplete(tabId, 20000);
-        await new Promise(r => setTimeout(r, 2000));
-
-        // 7) Re-hover .my-account (dropdown теперь показывает зелёную Sign in/Create)
-        const trig2 = await dbgEval(tabId, `
-            (() => {
-                const el = document.querySelector('.my-account');
-                if (!el) return null;
-                const r = el.getBoundingClientRect();
-                return { x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2) };
-            })()
-        `);
-        if (!trig2) throw new Error('my_account_trigger_not_found_after_logout');
-
-        await dbgMouseMove(tabId, 100, 500);
-        await new Promise(r => setTimeout(r, 300));
-        await dbgMouseMove(tabId, trig2.x, trig2.y);
-        await new Promise(r => setTimeout(r, IHERB_HOVER_HOLD_MS));
-
-        const signInBtn = await dbgEval(tabId, `
-            (() => {
-                const sels = [
-                    'a.btn-primary-universal[href*="/auth/ui/account/login"]',
-                    'a.btn-primary-universal[href*="sign-in"]',
-                    'a[href*="/auth/ui/account/login"]',
-                    'a[href*="/account/login"]',
-                    'a[href*="/account/sign-in"]'
-                ];
-                let el = null;
-                for (const s of sels) { el = document.querySelector(s); if (el && el.offsetParent !== null) break; }
-                if (!el || el.offsetParent === null) {
-                    el = Array.from(document.querySelectorAll('a,button')).find(x => {
-                        const t = (x.textContent||'').trim();
-                        return /sign\\s*in.*create|create.*account/i.test(t) && x.offsetParent !== null;
-                    });
-                }
-                if (!el) return null;
-                const r = el.getBoundingClientRect();
-                return { x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2) };
-            })()
-        `);
-        if (!signInBtn) throw new Error('sign_in_create_button_not_visible');
-
-        // 8) Glide-click Sign in/Create
-        await dbgMouseMove(tabId, trig2.x, trig2.y);
-        await new Promise(r => setTimeout(r, 300));
-        await dbgMouseMove(tabId, trig2.x, trig2.y + 100);
-        await new Promise(r => setTimeout(r, 150));
-        await dbgMouseMove(tabId, signInBtn.x, signInBtn.y - 30);
-        await new Promise(r => setTimeout(r, 150));
-        await dbgMouseMove(tabId, signInBtn.x, signInBtn.y);
-        await new Promise(r => setTimeout(r, 400));
-        await dbgMouseClick(tabId, signInBtn.x, signInBtn.y);
-        console.log('🌿 [iHerb UI] → clicked Sign in/Create');
-
-        // 9) Wait for navigation to login page (checkout.iherb.com/auth/ui/account/login)
-        await waitForTabComplete(tabId, 25000);
-        console.log('🌿 [iHerb UI] login page loaded; content-iherb-login.js takes over');
-    } finally {
-        await dbgDetach(tabId).catch(() => {});
+        if (ok) return true;
+        if (!logged) {
+            console.log('🌿 [iHerb UI] waiting for .my-account to hydrate...');
+            logged = true;
+        }
+        await new Promise(r => setTimeout(r, 500));
     }
+    return false;
 }
 
-// Финальный return — открывает switch_account=picker для AMAZON_ACCOUNTS_TO_PARSE[0]
-// (ipochtoy) и выставляет флаг amazonFinalReturn, чтобы content-скрипты знали:
-// кликать аккаунт, но НЕ запускать парсинг и НЕ редиректить на orders.
+// Hover .my-account + ищет элемент в дропдауне с retry. Дропдаун может схлопнуться
+// во время CDP round-trip (~200мс) → element.offsetParent===null. Retry с re-hover.
+// `evalExpr` должен возвращать { found: bool, x?, y?, reason? }.
+async function hoverAndFind(tabId, trigger, evalExpr, maxAttempts = 3) {
+    let lastReason = 'unknown';
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        // Neutral → trigger hover. На 2+ попытке — сначала уходим далеко и паузим.
+        if (attempt > 1) {
+            await dbgMouseMove(tabId, 10, 10);
+            await new Promise(r => setTimeout(r, 600));
+        }
+        await dbgMouseMove(tabId, 100, 500);
+        await new Promise(r => setTimeout(r, 300));
+        await dbgMouseMove(tabId, trigger.x, trigger.y);
+        // Удерживаем hover: мелкие подёргивания чтобы dropdown не подумал что мы ушли.
+        const holdMs = IHERB_HOVER_HOLD_MS + (attempt - 1) * 1000; // 2s → 3s → 4s
+        const jitters = Math.max(2, Math.floor(holdMs / 400));
+        for (let i = 0; i < jitters; i++) {
+            await new Promise(r => setTimeout(r, 400));
+            await dbgMouseMove(tabId, trigger.x + (i % 2 ? 2 : -2), trigger.y + (i % 3 ? 1 : -1));
+        }
+        const res = await dbgEval(tabId, evalExpr);
+        if (res && res.found) {
+            if (attempt > 1) console.log(`🌿 [iHerb UI] found on attempt ${attempt}/${maxAttempts}`);
+            return { x: res.x, y: res.y };
+        }
+        lastReason = res?.reason || 'no_response';
+        console.warn(`🌿 [iHerb UI] attempt ${attempt}/${maxAttempts} failed: ${lastReason}`);
+    }
+    console.error(`🌿 [iHerb UI] hoverAndFind giving up after ${maxAttempts}: ${lastReason}`);
+    return null;
+}
+
+// ─── Sign-out flow: direct URL redirect (no chrome.debugger) ──
+// Раньше использовался chrome.debugger.attach + hover + click через Input.dispatchMouseEvent.
+// Это падало с "Cannot access a chrome-extension:// URL of different extension" когда
+// другой extension (AutoBuy) имел persistent attached debugger session — Chrome не
+// разрешает второму extension одновременно держать chrome.debugger client.
+//
+// Решение: iHerb sign-out — это обычный <a href="https://checkout.iherb.com/account/logoff">.
+// Просто chrome.tabs.update на этот URL → server-side logout → redirect на homepage.
+// Затем chrome.tabs.update на /myaccount/orders → если разлогинен, iHerb сам
+// отредиректит на /auth/ui/account/login, где content-iherb-login.js берёт за дело.
+//
+// Никакого debugger, никакого hover, никаких mouse events.
+// Helpers dbgAttach/dbgEval/dbgClick/waitForIherbHeader/hoverAndFind остаются как
+// dead code на случай если понадобятся в другом флоу.
+async function iherbUiSignOutAndNavigateToLogin(tabId) {
+    const LOGOFF_URL = 'https://checkout.iherb.com/account/logoff';
+    const ORDERS_URL = 'https://secure.iherb.com/myaccount/orders';
+
+    console.log('🌿 [iHerb UI] sign-out via URL redirect');
+
+    // 1) Activate tab + navigate to logoff URL — iHerb выполнит logout server-side
+    //    и редиректнет на homepage (с correlationId).
+    try {
+        await chrome.tabs.update(tabId, { url: LOGOFF_URL, active: true });
+        await waitForTabComplete(tabId, 20000);
+        await new Promise(r => setTimeout(r, 1500));
+    } catch (e) {
+        console.warn('[iHerb UI] logoff navigate failed:', e?.message || e);
+        throw new Error('logoff_navigate_failed: ' + (e?.message || e));
+    }
+
+    // 2) Navigate to /myaccount/orders. Поскольку мы только что разлогинились,
+    //    iHerb redirect на /auth/ui/account/login → content-iherb-login.js видит
+    //    pendingIherbSwitch и выполняет fillAndSubmit логина для нового аккаунта.
+    try {
+        await chrome.tabs.update(tabId, { url: ORDERS_URL, active: true });
+        await waitForTabComplete(tabId, 25000);
+    } catch (e) {
+        console.warn('[iHerb UI] orders navigate failed:', e?.message || e);
+        throw new Error('orders_navigate_failed: ' + (e?.message || e));
+    }
+
+    console.log('🌿 [iHerb UI] login page should be loaded; content-iherb-login.js takes over');
+}
+
+// Финальный return — открывает switch_account=picker для primary Amazon-аккаунта
+// (из accountsConfig) и выставляет флаг amazonFinalReturn, чтобы content-скрипты
+// знали: кликать аккаунт, но НЕ запускать парсинг и НЕ редиректить на orders.
 async function finalReturnToPrimaryAmazon() {
-    const primaryEmail = AMAZON_ACCOUNTS_TO_PARSE[0];
-    console.log(`🏁 Final return to primary Amazon account: ${primaryEmail}`);
-    sendTelegramMessage(`🏁 Возврат на основной Amazon-аккаунт: ${primaryEmail.split('@')[0]}`).catch(() => {});
+    const cfg = await loadAccountsConfig();
+    const primary = getPrimary(cfg.amazon);
+    console.log(`🏁 Amazon final return to ${primary.email}`);
+    sendTelegramMessage(`🏁 Amazon: возврат на ${primary.email.split('@')[0]}`).catch(() => {});
 
     await chrome.storage.local.set({
-        pendingAccountSwitch: { email: primaryEmail },
+        pendingAccountSwitch: { email: primary.email },
         amazonFinalReturn: true,
-        amazonParsingComplete: null,
-        amazonPaginationState: null
+        accountSwitchStartedAt: Date.now(),
+        amazonParsingComplete: null
     });
+    await chrome.storage.local.remove(['amazonPaginationState']);
 
     const switchUrl = 'https://www.amazon.com/ap/signin?openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.amazon.com%2F%3Fref_%3Dnav_youraccount_switchacct&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.assoc_handle=usflex&openid.mode=checkid_setup&marketPlaceId=ATVPDKIKX0DER&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&switch_account=picker&ignoreAuthState=1&_encoding=UTF8';
 
     const tabs = await chrome.tabs.query({ url: 'https://www.amazon.com/*' });
-    if (tabs.length > 0) {
-        await chrome.tabs.update(tabs[0].id, { url: switchUrl, active: false });
-    } else {
-        await chrome.tabs.create({ url: switchUrl, active: false });
-    }
+    if (tabs.length > 0) await chrome.tabs.update(tabs[0].id, { url: switchUrl, active: true });
+    else await chrome.tabs.create({ url: switchUrl });
+
+    // Pipeline advance: after ~45s give picker → landing page time to finish.
+    setTimeout(() => advancePipelineStage().catch(() => {}), 45000);
 }
 
 // Initialize multi-account Amazon parsing
 async function startMultiAccountAmazonParsing() {
     console.log('🚀 startMultiAccountAmazonParsing called');
-    
+
     // STEP 1: Close ALL existing Amazon tabs to avoid race conditions
     const existingTabs = await chrome.tabs.query({ url: 'https://www.amazon.com/*' });
     if (existingTabs.length > 0) {
@@ -1253,14 +1495,15 @@ async function startMultiAccountAmazonParsing() {
         // Small delay to ensure tabs are closed
         await new Promise(resolve => setTimeout(resolve, 500));
     }
-    
-    amazonAccountsQueue = [...AMAZON_ACCOUNTS_TO_PARSE];
+
+    const cfg = await loadAccountsConfig();
+    amazonAccountsQueue = cfg.amazon.map(a => a.email);
     isMultiAccountParsing = true;
     currentAmazonAccount = null;
-    
+
     // STEP 2: Clear ALL related flags BEFORE proceeding (with await!)
     await new Promise(resolve => {
-        chrome.storage.local.set({ 
+        chrome.storage.local.set({
             stopAllParsers: false,
             amazonParsingComplete: null,
             amazonPaginationState: null,
@@ -1274,9 +1517,9 @@ async function startMultiAccountAmazonParsing() {
         }, resolve);
     });
     console.log('✅ multiAccountState saved to storage');
-    
+
     console.log(`🚀 Starting multi-account Amazon parsing for ${amazonAccountsQueue.length} accounts`);
-    console.log(`🔄 Multi-account Amazon: ${AMAZON_ACCOUNTS_TO_PARSE.map(e => e.split('@')[0]).join(', ')}`);
+    console.log(`🔄 Multi-account Amazon: ${amazonAccountsQueue.map(e => e.split('@')[0]).join(', ')}`);
 
     // Lock AutoBuy: пока парсим амазон — авто-выкуп амазон не работает
     setParserLock('amazon', true);
@@ -1290,6 +1533,15 @@ async function startMultiAccountAmazonParsing() {
 
 // Watchdog using chrome.alarms (reliable even when Service Worker sleeps)
 const WATCHDOG_ALARM_NAME = 'amazonCompletionWatchdog';
+const SCREENSHOT_RESUME_ALARM = 'screenshotResume';
+chrome.alarms.create(SCREENSHOT_RESUME_ALARM, { delayInMinutes: 1, periodInMinutes: 1 });
+
+// iHerb cs watchdog: проверяет каждую минуту что content-iherb.js не залип
+// (Extension context invalidated, infinite scroll стал, network 429 etc.).
+// Если cs не отвечает >IHERB_PARSE_TIMEOUT_MS — retry tab.update (one shot), потом fail.
+const IHERB_WATCHDOG_ALARM = 'iherbParseWatchdog';
+const IHERB_PARSE_TIMEOUT_MS = 240_000; // 4 min hard cap
+chrome.alarms.create(IHERB_WATCHDOG_ALARM, { delayInMinutes: 1, periodInMinutes: 1 });
 
 function startCompletionWatchdog() {
     console.log('👀 Starting completion watchdog with chrome.alarms...');
@@ -1305,6 +1557,77 @@ function stopCompletionWatchdog() {
     console.log('🛑 Watchdog alarm stopped');
 }
 
+// iHerb watchdog handler — запускается раз в минуту.
+// Проверяет если cs auto-parse залип >4 минут — retry tab.update (one shot), потом fail.
+async function handleIherbWatchdog() {
+    const stored = await chrome.storage.local.get([
+        'iherbParseStartedAt', 'iherbWatchdogRetried',
+        'multiAccountIherbState', 'iherbParserTabId', 'pipelineStage'
+    ]);
+    if (!stored.iherbParseStartedAt) return; // нет активного парса — нечего watch'ить
+    const elapsed = Date.now() - stored.iherbParseStartedAt;
+    if (elapsed < IHERB_PARSE_TIMEOUT_MS) return; // ещё не таймаут
+    const tabId = stored.iherbParserTabId;
+    const acc = stored.multiAccountIherbState?.currentIherbAccount || 'unknown';
+
+    // Прочитать heartbeat из tab.localStorage
+    let heartbeat = null;
+    if (tabId) {
+        try {
+            const [{ result }] = await chrome.scripting.executeScript({
+                target: { tabId },
+                func: () => {
+                    try { return JSON.parse(window.localStorage.getItem('parser_iherb_heartbeat') || 'null'); } catch { return null; }
+                }
+            });
+            heartbeat = result;
+        } catch (e) {
+            console.warn('[iherbWatchdog] executeScript failed:', e?.message || e);
+        }
+    }
+
+    const heartbeatAge = heartbeat ? Date.now() - heartbeat.ts : null;
+    console.log(`[iherbWatchdog] iHerb stuck: acc=${acc}, elapsed=${Math.round(elapsed/1000)}s, heartbeat=${JSON.stringify(heartbeat)}, hbAge=${heartbeatAge}`);
+
+    if (!stored.iherbWatchdogRetried) {
+        // First retry: reload tab → cs снова auto-parse'нет.
+        await chrome.storage.local.set({ iherbWatchdogRetried: true, iherbParseStartedAt: Date.now() });
+        sendTelegramMessage(`⚠️ iHerb (${acc.split('@')[0]}) залип ${Math.round(elapsed/1000)}с, retry...`).catch(()=>{});
+        if (tabId) {
+            try {
+                await chrome.tabs.update(tabId, { url: 'https://secure.iherb.com/myaccount/orders', active: true });
+                console.log('[iherbWatchdog] retry: tab.update sent');
+            } catch (e) {
+                console.warn('[iherbWatchdog] retry tab.update failed:', e?.message || e);
+            }
+        }
+        return;
+    }
+
+    // Already retried — fail this account, move forward.
+    console.log(`[iherbWatchdog] Already retried — failing iherb acc=${acc}, moving to next`);
+    sendTelegramMessage(`🚫 iHerb (${acc.split('@')[0]}) не отвечает после retry — пропускаю`).catch(()=>{});
+    await chrome.storage.local.remove(['iherbParseStartedAt', 'iherbWatchdogRetried']);
+
+    // Restore in-memory state if SW restarted between alarm ticks
+    if (stored.multiAccountIherbState) {
+        isMultiAccountIherb = stored.multiAccountIherbState.isMultiAccountIherb;
+        iherbAccountsQueue = stored.multiAccountIherbState.iherbAccountsQueue || [];
+        currentIherbAccount = stored.multiAccountIherbState.currentIherbAccount;
+    }
+    if (isMultiAccountIherb && iherbAccountsQueue.length > 0) {
+        switchToNextIherbAccount();
+    } else {
+        // Закрываем iherb stage чтобы pipeline двигался дальше
+        isMultiAccountIherb = false;
+        currentIherbAccount = null;
+        if (typeof storesCompleted === 'object') storesCompleted.iherb = true;
+        setParserLock('iherb', false);
+        await finalReturnToIherbPrimary().catch(e => console.warn('finalReturn failed:', e?.message || e));
+        if (typeof checkAllStoresCompleted === 'function') checkAllStoresCompleted();
+    }
+}
+
 // Alarm listener - this fires even when Service Worker wakes up
 chrome.alarms.onAlarm.addListener(async (alarm) => {
     // Handle daily auto-parse
@@ -1318,39 +1641,69 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             return;
         }
         
-        sendTelegramMessage('⏰ Автоматический ночной парсинг запущен (0:00)...');
-        
+        sendTelegramMessage('⏰ Автоматический ночной парсинг запущен (23:00)...');
+
         // Reset states and start parsing
-        isParsingAllStores = true;
-        storesCompleted = { ebay: false, iherb: false, amazon: false };
-        saveParsingState();
         cachedProgressState = {};
         chrome.storage.local.set({ progressState: cachedProgressState, stopAllParsers: false });
         await clearParsingLogs();
-        
-        // Launch parsers
-        launchParsersFromBackground();
+
+        // Sequential pipeline — avoids active-tab race between concurrent shop flows
+        // (see advancePipelineStage / waitForScreenshotsDrained).
+        startSequentialPipeline();
         return;
     }
     
+    if (alarm.name === SCREENSHOT_RESUME_ALARM) {
+        try {
+            const { trackScreenshotQueue: stored = [] } = await chrome.storage.local.get('trackScreenshotQueue');
+            if (Array.isArray(stored) && stored.length > 0 && !isProcessingScreenshots) {
+                console.log(`⏰ screenshotResume: ${stored.length} stuck in queue, resuming`);
+                processScreenshotQueue();
+            }
+        } catch (_) {}
+        return;
+    }
+
+    if (alarm.name === IHERB_WATCHDOG_ALARM) {
+        await handleIherbWatchdog().catch(e => console.warn('[iherbWatchdog] error:', e?.message || e));
+        return;
+    }
+
     if (alarm.name !== WATCHDOG_ALARM_NAME) return;
-    
-    const stored = await chrome.storage.local.get(['amazonParsingComplete', 'multiAccountState', 'accountSwitchStartedAt', 'lastAmazonProgressAt']);
+
+    const stored = await chrome.storage.local.get(['amazonParsingComplete', 'multiAccountState', 'accountSwitchStartedAt', 'lastAmazonProgressAt', 'skipGuardAt']);
+
+    // Skip-guard mutex: alarm fires every 3s, but skip-path takes 5-10s
+    // (screenshot + Telegram photo + log + remove + switch). Without this guard, a
+    // second alarm tick reads stale accountSwitchStartedAt AFTER first remove() but
+    // BEFORE switchToNextAmazonAccount's new set() commits — triggering duplicate
+    // timeout that kills the newly-switched account (observed 2026-04-22 03:59:26:
+    // ipochtoy timed out at 600s, photopochtoy switched + parse-started, second
+    // watchdog fired 3s later with stale data, killed photopochtoy mid-parse).
+    if (stored.skipGuardAt && (Date.now() - stored.skipGuardAt < 30000)) {
+        return;
+    }
 
     // TIMEOUT: progress-based (idle) + hard cap.
     // Old logic killed after 90s from switch-start — fatally short for accounts with
     // 20 pages (needs 5-7 min). New logic: kill if no parsing progress for 90s, or
-    // if total time exceeds 10-minute hard cap (safety against runaway).
+    // if total time exceeds 20-minute hard cap (bumped from 10min after 2026-04-22
+    // observation: ipochtoy finished 19 pages + started page 20 at exactly 600s).
     if (!stored.amazonParsingComplete && stored.accountSwitchStartedAt && stored.multiAccountState) {
         const now = Date.now();
         const totalElapsed = now - stored.accountSwitchStartedAt;
         const sinceLastProgress = now - (stored.lastAmazonProgressAt || stored.accountSwitchStartedAt);
-        const HARD_CAP_MS = 600_000; // 10 min absolute
+        const HARD_CAP_MS = 1_200_000; // 20 min absolute
         const isIdleTimeout = sinceLastProgress > ACCOUNT_PARSE_TIMEOUT_MS;
         const isHardCap = totalElapsed > HARD_CAP_MS;
         if (isIdleTimeout || isHardCap) {
+            // Set skip-guard IMMEDIATELY before any long awaits — this is the mutex
+            // that prevents concurrent alarm handlers from firing duplicate timeouts.
+            await chrome.storage.local.set({ skipGuardAt: Date.now() });
+
             const failedEmail = stored.multiAccountState.currentAmazonAccount || 'unknown';
-            const reason = isHardCap ? 'hard-cap 10min' : 'no progress';
+            const reason = isHardCap ? 'hard-cap 20min' : 'no progress';
             const idleSec = Math.round(sinceLastProgress / 1000);
             const totalSec = Math.round(totalElapsed / 1000);
             console.log(`🚫 Account ${failedEmail} timed out (${reason}, idle=${idleSec}s, total=${totalSec}s), skipping`);
@@ -1369,6 +1722,21 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             } catch (e) { console.warn('timeout-screenshot failed:', e?.message || e); }
 
             await logMultiAccountStep('account-parse:timeout', { account: failedEmail, reason, idleSec, totalSec });
+
+            // Populate partial parseReport.stores so final Telegram summary shows
+            // partial progress instead of silently reporting zero (observed 2026-04-22:
+            // ipochtoy parsed 19 pages but summary showed "(ни один аккаунт не дал
+            // результата)" because only the completion-flag path writes parseReport).
+            // Read last known count from cachedProgressState['amazon'].found which
+            // content-amazon.js updates on every page.
+            try {
+                const accountName = failedEmail.split('@')[0];
+                const partialFound = (cachedProgressState.amazon && cachedProgressState.amazon.found) || 0;
+                parseReport.stores[`amazon_${accountName}`] = {
+                    found: partialFound,
+                    status: isHardCap ? '⏱' : '🚫'
+                };
+            } catch (e) { console.warn('partial parseReport failed:', e?.message || e); }
 
             // Restore state
             isMultiAccountParsing = stored.multiAccountState.isMultiAccountParsing;
@@ -1532,7 +1900,9 @@ async function uploadToSheets() {
                 ];
             });
         } else {
-            // Warehouse Mode: Standard columns
+            // Warehouse Mode: 9 columns A-I.
+            // A store | B order_id | C track | D product | E qty | F color | G size |
+            // H screenshot_link (written separately by writeScreenshotLinkToSheet) | I account_name
             values = allOrders.map(o => [
                 o.store_name || '',
                 o.order_id || '',
@@ -1540,7 +1910,9 @@ async function uploadToSheets() {
                 o.product_name || '',
                 o.qty || '',
                 o.color || '',
-                o.size || ''
+                o.size || '',
+                '',                        // H screenshot_link placeholder
+                o.account_name || ''       // I account_name
             ]);
         }
 
@@ -1561,19 +1933,19 @@ async function uploadToSheets() {
         } else {
              const headerOffset = existing.length > 0 && existing[0].length > 1 && /store/i.test(existing[0][0] || '') ? 1 : 0;
              const existingRows = existing.slice(headerOffset);
-             
-             // Key WITHOUT qty: store + order + track + product
+
+             // Key WITHOUT qty: store + order + track + product + account_name (col I = idx 8)
              const existingMap = new Map();
              existingRows.forEach((r, idx) => {
-                 const key = [r[0]||'', r[1]||'', r[2]||'', r[3]||''].join('\u0001');
+                 const key = [r[0]||'', r[1]||'', r[2]||'', r[3]||'', r[8]||''].join('\u0001');
                  const existingQty = r[4] || '1';
                  existingMap.set(key, { rowIndex: idx + headerOffset + 1, qty: existingQty }); // 1-based row in sheet
              });
-             
+
              for (const r of values) {
-                 const key = [r[0], r[1], r[2], r[3]].join('\u0001');
+                 const key = [r[0], r[1], r[2], r[3], r[8]||''].join('\u0001');
                  const newQty = r[4] || '1';
-                 
+
                  if (existingMap.has(key)) {
                      const existing = existingMap.get(key);
                      // Check if qty changed
@@ -2036,9 +2408,13 @@ async function pollTelegramUpdates() {
                                 })
                             });
                         } else {
-                            // Trigger Parse All Stores
-                            console.log('✅ Command accepted! Starting parse...');
-                            launchParsersFromBackground();
+                            // Trigger Parse All Stores — sequential pipeline only.
+                            // The legacy launchParsersFromBackground() fires iHerb + Amazon
+                            // multi-account flows in parallel, which races with screenshot
+                            // captureVisibleTab (active-tab contention). Sequential keeps
+                            // one shop's tabs in focus at a time.
+                            console.log('✅ Command accepted! Starting sequential pipeline...');
+                            startSequentialPipeline();
                         }
                     }
                 }
@@ -2498,8 +2874,10 @@ async function processScreenshotQueue() {
             parseReport.screenshots.failed++;
             console.error(`❌ Screenshot ${done}/${total} failed: ${item.orderId} — ${e.message || e}`);
         }
-        // Пауза между заказами: 1.2-2.2 сек — естественно, но не тормозит
-        await new Promise(r => setTimeout(r, 1200 + Math.random() * 1000));
+        // Пауза между заказами: 1.2-2.2 сек базово; iHerb триггерит на бота → 3-6 сек.
+        const isIherbItem = /(secure\.|www\.)?iherb\.com/i.test(String(item.trackUrl || ''));
+        const pauseMs = isIherbItem ? (3000 + Math.random() * 3000) : (1200 + Math.random() * 1000);
+        await new Promise(r => setTimeout(r, pauseMs));
     }
 
     // Закрыть переиспользуемую вкладку (если не оставлена для решения капчи)
@@ -2911,6 +3289,122 @@ async function captureFullPageStitched(tab, override = null) {
     }
 }
 
+// iHerb tracking page (secure.iherb.com/tr/carrierTracking) — кропим только левую карточку:
+// 4 верхние секции в .row > .column (carrier + expected delivery + product thumbs + timeline).
+// Ждём пока догрузятся картинки товаров (async), затем скроллим карточку в topViewport и режем виз. скрин.
+async function captureIherbTrackingCard(tab) {
+    try {
+        // 1) Скролл карточки наверх + ожидание загрузки product thumbnails
+        const measure = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: async () => {
+                const delay = ms => new Promise(r => setTimeout(r, ms));
+                const col = document.querySelector('.row > .column');
+                if (!col) return { error: 'no_column' };
+                const sections = Array.from(col.children).slice(0, 4);
+                if (sections.length < 2) return { error: 'not_enough_sections' };
+
+                // Скрываем sticky/fixed чтобы не перекрывали карточку при скролле
+                const hidden = [];
+                document.querySelectorAll('*').forEach(el => {
+                    try {
+                        const cs = getComputedStyle(el);
+                        if ((cs.position === 'fixed' || cs.position === 'sticky') && el.dataset.parserHidden !== '1') {
+                            hidden.push({ el, prev: el.style.visibility });
+                            el.style.setProperty('visibility', 'hidden', 'important');
+                            el.dataset.parserHidden = '1';
+                        }
+                    } catch (_) {}
+                });
+                window.__iherbCardHidden = hidden;
+
+                // Скроллим первую секцию к верху вьюпорта (с небольшим отступом)
+                const topOffset = 10;
+                const firstRect = sections[0].getBoundingClientRect();
+                window.scrollBy({ top: firstRect.top - topOffset, behavior: 'instant' });
+                await delay(400);
+
+                // Ждём пока картинки в карточке догрузятся (product thumbs лениво).
+                // Условие: все <img> внутри карточки имеют complete===true И naturalHeight>0 И width>10.
+                // Таймаут 20 сек — iHerb медленно грузит thumbs.
+                const allImgs = () => sections.flatMap(s => Array.from(s.querySelectorAll('img')));
+                const imgsReady = () => {
+                    const list = allImgs();
+                    if (list.length === 0) return true;
+                    return list.every(i => i.complete && i.naturalHeight > 0 && i.naturalWidth > 10);
+                };
+                const t0 = Date.now();
+                while (!imgsReady() && Date.now() - t0 < 20000) {
+                    await delay(400);
+                }
+                await delay(1200); // pixel stability + decode finish
+
+                // Обмеряем объединённый bounding box первых 4 секций
+                const rects = sections.map(s => s.getBoundingClientRect());
+                const x = Math.max(0, Math.floor(Math.min(...rects.map(r => r.left)) - 8));
+                const yTop = Math.max(0, Math.floor(Math.min(...rects.map(r => r.top)) - 8));
+                const right = Math.min(window.innerWidth, Math.ceil(Math.max(...rects.map(r => r.right)) + 8));
+                const bottom = Math.min(window.innerHeight, Math.ceil(Math.max(...rects.map(r => r.bottom)) + 8));
+                const w = right - x;
+                const h = bottom - yTop;
+                const dpr = window.devicePixelRatio || 1;
+                return {
+                    x, y: yTop, w, h, dpr,
+                    imgsLoaded: allImgs().filter(i => i.complete && i.naturalHeight > 0).length,
+                    imgsTotal: allImgs().length,
+                    sectionsCount: sections.length,
+                };
+            }
+        });
+        const m = measure?.[0]?.result;
+        if (!m || m.error) {
+            console.warn('⚠️ captureIherbTrackingCard measure failed:', m);
+            return null;
+        }
+        console.log(`📐 iHerb card: ${m.w}x${m.h}@${m.x},${m.y} dpr=${m.dpr} imgs=${m.imgsLoaded}/${m.imgsTotal}`);
+
+        // 2) captureVisibleTab
+        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+
+        // 3) Crop через OffscreenCanvas
+        const blob = await (await fetch(dataUrl)).blob();
+        const bitmap = await createImageBitmap(blob);
+        const cx = Math.round(m.x * m.dpr);
+        const cy = Math.round(m.y * m.dpr);
+        const cw = Math.round(m.w * m.dpr);
+        const ch = Math.round(m.h * m.dpr);
+        const canvas = new OffscreenCanvas(cw, ch);
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(bitmap, cx, cy, cw, ch, 0, 0, cw, ch);
+        const cropBlob = await canvas.convertToBlob({ type: 'image/png' });
+        const arr = new Uint8Array(await cropBlob.arrayBuffer());
+        let bin = '';
+        const chunkSize = 0x8000;
+        for (let i = 0; i < arr.length; i += chunkSize) bin += String.fromCharCode.apply(null, arr.subarray(i, i + chunkSize));
+        const base64 = btoa(bin);
+
+        // 4) Восстанавливаем скрытые элементы
+        try {
+            await chrome.scripting.executeScript({
+                target: { tabId: tab.id },
+                func: () => {
+                    const h = window.__iherbCardHidden || [];
+                    h.forEach(({ el, prev }) => {
+                        try { el.style.visibility = prev || ''; delete el.dataset.parserHidden; } catch (_) {}
+                    });
+                    window.__iherbCardHidden = null;
+                }
+            });
+        } catch (_) {}
+
+        console.log(`📸 iHerb tracking card cropped → ${(cropBlob.size / 1024).toFixed(0)}KB`);
+        return base64;
+    } catch (e) {
+        console.error('❌ captureIherbTrackingCard error:', e);
+        return null;
+    }
+}
+
 async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountName, extraTracks }, current, total, reuseTabId) {
     if (!trackUrl) return;
 
@@ -3124,19 +3618,21 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                 const accountTag = accountName ? '\n📧 ' + accountName : '';
                 const captionFull = `📦 ${orderId}\n${tracksLine}${accountTag}`;
 
-                const fullPageBase64 = await captureFullPageStitched(tab);
-                if (!fullPageBase64) {
-                    console.warn(`⚠️ Fullpage stitch returned null for ${orderId}, fallback to single visible`);
+                // iHerb: кропим только левую tracking-карточку (carrier + delivery + product thumbs + timeline).
+                // Ждём пока догрузятся картинки товаров — без этого снимок получается без thumb-квадратиков.
+                const cardBase64 = await captureIherbTrackingCard(tab);
+                if (!cardBase64) {
+                    console.warn(`⚠️ captureIherbTrackingCard returned null for ${orderId}, fallback to visible`);
                     const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
                     const fallbackBase64 = dataUrl.replace(/^data:image\/png;base64,/, '');
                     const archive = await sendScreenshotToArchive(fallbackBase64, captionFull);
                     if (archive?.ok && archive.link) firstPageLink = archive.link;
                 } else {
-                    const archive = await sendScreenshotToArchive(fullPageBase64, captionFull);
+                    const archive = await sendScreenshotToArchive(cardBase64, captionFull);
                     if (archive?.ok && archive.link) firstPageLink = archive.link;
                 }
                 screenshotsTaken++;
-                console.log(`✅ Fullpage screenshot sent for ${orderId} (tracks: ${allTracks.length})`);
+                console.log(`✅ iHerb tracking card screenshot sent for ${orderId} (tracks: ${allTracks.length})`);
 
                 if (firstPageLink) {
                     for (const tn of allTracks) {
