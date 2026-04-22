@@ -2487,12 +2487,16 @@ async function computeEbayCropSpecs(tab) {
                     // Трек-номер из этой shipment-card
                     let trackNum = '';
                     const dts = sc.querySelectorAll('dt.eui-label');
+                    // Strict tracking formats only (mirror pickBestTracking from content-ebay.js):
+                    // UPS 1Z[A-Z0-9]{16}, USPS 9[2-6]\d{18,24}, Yanwen YT\d, UPU [A-Z]{2}\d{9}[A-Z]{2}.
+                    // Loose /[A-Z0-9]{10,}/ used to catch product-name text like "COCTEATWINBLACK".
+                    const TRACK_RE = /\b(1Z[0-9A-Z]{16}|9[2-6]\d{18,24}|YT\d{10,25}|[A-Z]{2}\d{9}[A-Z]{2})\b/;
                     for (const dt of dts) {
                         if (/^number$/i.test((dt.textContent || '').trim())) {
                             const dd = dt.parentElement?.querySelector('dd') || dt.nextElementSibling;
                             if (dd) {
-                                const m = (dd.textContent || '').trim().match(/[A-Z0-9]{10,}/);
-                                if (m) { trackNum = m[0]; break; }
+                                const m = (dd.textContent || '').toUpperCase().match(TRACK_RE);
+                                if (m) { trackNum = m[1]; break; }
                             }
                         }
                     }
@@ -3008,20 +3012,26 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                     screenshotsTaken++;
                 } else {
                     for (const s of shipments) {
-                        const track = s.trackNum || trackNumber || '';
-                        const trackLine = '🚚 ' + (track || '—');
+                        // Packet without its own per-shipment tracking = seller hasn't shipped yet.
+                        // Previously we fell back to order-level `trackNumber` here — that leaked the
+                        // shipped packet's tracking onto unshipped siblings (see order 22-14502-80036:
+                        // one real USPS for sneakers got stamped onto two Cocteau Twins shirts that
+                        // were still "Paid / Tracking available" pending). Skip such packets — when the
+                        // seller actually ships, next parser run will pick the real track up.
+                        if (!s.trackNum) {
+                            console.log(`⏭  skip shipment ${s.shipmentIdx}/${s.shipmentTotal} for ${orderId} — no tracking yet`);
+                            continue;
+                        }
+                        const track = s.trackNum;
+                        const trackLine = '🚚 ' + track;
                         const shipTag = s.shipmentTotal > 1 ? ` • пакет ${s.shipmentIdx}/${s.shipmentTotal}` : '';
                         const itemLine = s.itemName ? ('\n🛒 ' + s.itemName) : '';
                         const caption = `📦 ${orderId}${shipTag}\n${trackLine}${itemLine}${accountTag}`;
                         const archive = await sendScreenshotToArchive(s.base64, caption);
                         if (archive?.ok && archive.link) {
                             if (!firstPageLink) firstPageLink = archive.link;
-                            // Пишем ссылку в Sheet: приоритет — трек из этой shipment-card
-                            const writeTracks = s.trackNum ? [s.trackNum] : allTracks;
-                            for (const tn of writeTracks) {
-                                try { await writeScreenshotLinkToSheet(tn, archive.link); }
-                                catch (e) { console.warn(`⚠️ writeScreenshotLinkToSheet ${tn}:`, e?.message || e); }
-                            }
+                            try { await writeScreenshotLinkToSheet(s.trackNum, archive.link); }
+                            catch (e) { console.warn(`⚠️ writeScreenshotLinkToSheet ${s.trackNum}:`, e?.message || e); }
                         }
                         screenshotsTaken++;
                     }
