@@ -843,6 +843,20 @@ async function handleProgressMessage(request) {
                 setParserLock('iherb', false);
                 storesCompleted.iherb = true;
                 setTimeout(() => uploadToSheets(), 1500);
+                // Pipeline advance немедленно (по аналогии с eBay ниже).
+                // До этого fix'а advance шёл через setTimeout 45s внутри
+                // finalReturnToIherbPrimary — фатально хрупко: если SW заснёт
+                // в эти 45 секунд, alarm не пнёт и pipeline зависнет на iherb.
+                // Guard по `stages[currentIndex] === 'iherb'` делает блок
+                // идемпотентным (повторный вызов из setTimeout safety net
+                // в finalReturnToIherbPrimary увидит уже сдвинутый currentIndex
+                // и просто проигнорирует).
+                chrome.storage.local.get(['pipelineStage']).then(r => {
+                    const p = r.pipelineStage;
+                    if (p && p.active && p.stages[p.currentIndex] === 'iherb') {
+                        advancePipelineStage().catch(() => {});
+                    }
+                });
                 checkAllStoresCompleted();
                 return;
             }
@@ -1581,8 +1595,9 @@ async function finalReturnToIherbPrimary() {
         sendTelegramMessage(`✅ iHerb уже на ${primary.email.split('@')[0]} — возврат не нужен`).catch(() => {});
         await chrome.storage.local.remove(['pendingIherbSwitch', 'iherbFinalReturn', 'iherbSwitchInProgress', 'iherbSwitchStartedAt']);
         await chrome.tabs.update(tabId, { url: 'https://www.iherb.com/', active: false });
-        // Advance faster — нет 45s login wait.
-        setTimeout(() => advancePipelineStage().catch(() => {}), 3000);
+        // Advance faster — нет 45s login wait. Guarded: если handleProgressMessage
+        // уже advanced (типичный happy path), мы здесь ничего не делаем.
+        setTimeout(() => guardedAdvanceFromIherb('fast-path').catch(() => {}), 3000);
         return;
     }
 
@@ -1593,9 +1608,25 @@ async function finalReturnToIherbPrimary() {
         sendTelegramMessage(`⚠️ iHerb final return упал: ${e.message || e}`).catch(() => {});
     }
 
-    // Pipeline advance: after ~45s (sign-out + login + orders page load) jump
-    // from iherb_return → ebay (if pipeline active).
-    setTimeout(() => advancePipelineStage().catch(() => {}), 45000);
+    // Pipeline advance: safety net через ~45с (sign-out + login + orders page).
+    // Основной advance делает handleProgressMessage СРАЗУ после iherb done,
+    // но если cs script завалился ДО progress=done (Extension context invalidated,
+    // login упал и т.д.) — этот setTimeout всё ещё двинет pipeline. Guard внутри
+    // проверяет что мы всё ещё на iherb-стадии, чтобы не пропустить ebay.
+    setTimeout(() => guardedAdvanceFromIherb('safety-net').catch(() => {}), 45000);
+}
+
+// Идемпотентный advance: проверяет что pipeline активен И мы всё ещё на iherb-стадии.
+// Защищает от двойного срабатывания (handleProgressMessage + setTimeout fallback).
+async function guardedAdvanceFromIherb(source) {
+    const r = await chrome.storage.local.get(['pipelineStage']);
+    const p = r.pipelineStage;
+    if (p && p.active && p.stages[p.currentIndex] === 'iherb') {
+        console.log(`[pipeline] advance from iherb (source=${source})`);
+        await advancePipelineStage();
+    } else {
+        console.log(`[pipeline] guardedAdvanceFromIherb skip (source=${source}, stage=${p?.stages?.[p?.currentIndex]}, active=${p?.active})`);
+    }
 }
 
 // ─── Shared: ensure we have exactly one iHerb parser tab ───────────────────
