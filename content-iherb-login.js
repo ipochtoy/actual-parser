@@ -25,6 +25,15 @@ const IS_OLD_LOGIN = /\/account\/sign-in/i.test(location.href);                /
 const IS_LOGIN     = IS_NEW_LOGIN || IS_OLD_LOGIN;
 
 (async function main() {
+  // Внешний email captured для catch блока: чтобы при любом неожиданном
+  // throw'е после данной точки мы могли позвать sendFailed → background
+  // обработает через handleIherbSwitchFailure (retry / skip / finalReturn).
+  // Без этого фолбэка cs script мог уронить любой await (Extension context
+  // invalidated, network error в storage.get, race на location.href) и
+  // оставить iherbSwitchInProgress=true навсегда. Watchdog (Fix 3b) подхватит
+  // через 5 мин, но sendFailed чище — moves on to next account сразу.
+  let emailForFailure = null;
+  try {
   if (IS_LOGOFF) {
     // iHerb после /account/logoff сам редиректит на home. Фолбэк на sign-in если застряли.
     console.log('🔐 [iHerb Login] logoff page — waiting for redirect');
@@ -58,6 +67,7 @@ const IS_LOGIN     = IS_NEW_LOGIN || IS_OLD_LOGIN;
     console.warn('🔐 [iHerb Login] pendingIherbSwitch missing email/password');
     return;
   }
+  emailForFailure = email;
 
   console.log(`🔐 [iHerb Login] auto-login as ${email} (finalReturn=${!!data.iherbFinalReturn}, layout=${IS_NEW_LOGIN ? '2step' : 'legacy'})`);
 
@@ -129,6 +139,14 @@ const IS_LOGIN     = IS_NEW_LOGIN || IS_OLD_LOGIN;
   console.log('🔐 [iHerb Login] → /myaccount/orders for parse');
   await chrome.storage.local.set({ iherbSwitchInProgress: true });
   location.href = 'https://secure.iherb.com/myaccount/orders';
+  } catch (e) {
+    console.error('🔐 [iHerb Login] uncaught exception in main():', e);
+    if (emailForFailure) {
+      sendFailed(emailForFailure, 'main_threw: ' + (e?.message || String(e)));
+    }
+    // Если email не успели прочитать — флаги почистит watchdog (Fix 3b)
+    // через IHERB_SWITCH_TIMEOUT_MS (5 мин). Это OK: пайплайн не зависнет.
+  }
 })();
 
 // ─── 2-step login (checkout.iherb.com/auth/ui/account/login) ───
