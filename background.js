@@ -4,33 +4,260 @@
 const DAILY_PARSE_HOUR = 23; // 23:00 local time
 const DAILY_PARSE_MINUTE = 0;
 const DAILY_ALARM_NAME = 'dailyAutoParse';
+const DAILY_ALARM_PERIOD_MINUTES = 24 * 60;
+const DAILY_ALARM_DRIFT_TOLERANCE_MS = 2 * 60 * 1000;
+const DAILY_MISSED_RUN_CATCHUP_MS = 2 * 60 * 60 * 1000;
+const DAILY_DIAGNOSTICS_KEY = 'dailyAutoParseDiagnostics';
+const DAILY_DIAGNOSTICS_LIMIT = 80;
+let dailyDiagnosticWriteQueue = Promise.resolve();
 
-function setupDailyAlarm() {
-    // Calculate ms until next midnight
-    const now = new Date();
+function addDailyDiagnostic(event, details = {}) {
+    dailyDiagnosticWriteQueue = dailyDiagnosticWriteQueue
+        .then(() => writeDailyDiagnostic(event, details))
+        .catch(error => {
+            console.warn('⚠️ Failed to write daily auto-parse diagnostic:', error?.message || error);
+        });
+    return dailyDiagnosticWriteQueue;
+}
+
+async function writeDailyDiagnostic(event, details = {}) {
+    try {
+        const [alarm, storage] = await Promise.all([
+            chrome.alarms.get(DAILY_ALARM_NAME).catch(() => null),
+            chrome.storage.local.get([
+                DAILY_DIAGNOSTICS_KEY,
+                'dailyAutoParseEnabled',
+                'pipelineStage',
+                'parsingState',
+                'stopAllParsers',
+                'lastDailyAutoParseTriggeredAt',
+                'lastDailyAutoParseStatus',
+                'lastDailyAutoParseSource'
+            ])
+        ]);
+        const diagnostics = Array.isArray(storage[DAILY_DIAGNOSTICS_KEY])
+            ? storage[DAILY_DIAGNOSTICS_KEY]
+            : [];
+        const entry = {
+            ts: Date.now(),
+            event,
+            details,
+            alarm: alarm ? {
+                name: alarm.name,
+                scheduledTime: alarm.scheduledTime,
+                periodInMinutes: alarm.periodInMinutes
+            } : null,
+            state: {
+                enabled: storage.dailyAutoParseEnabled !== false,
+                pipelineActive: !!storage.pipelineStage?.active,
+                pipelineStage: storage.pipelineStage?.active
+                    ? storage.pipelineStage?.stages?.[storage.pipelineStage.currentIndex]
+                    : null,
+                parsingAllStores: !!storage.parsingState?.isParsingAllStores,
+                stopAllParsers: !!storage.stopAllParsers,
+                lastTriggerAt: storage.lastDailyAutoParseTriggeredAt || null,
+                lastTriggerStatus: storage.lastDailyAutoParseStatus || null,
+                lastTriggerSource: storage.lastDailyAutoParseSource || null
+            }
+        };
+        diagnostics.push(entry);
+        await chrome.storage.local.set({
+            [DAILY_DIAGNOSTICS_KEY]: diagnostics.slice(-DAILY_DIAGNOSTICS_LIMIT)
+        });
+        console.log('[daily-autoparse]', event, entry);
+    } catch (error) {
+        throw error;
+    }
+}
+
+function formatDailyDiagnostic(entry) {
+    if (!entry) return '';
+    const when = new Date(entry.ts).toLocaleString('ru-RU');
+    const next = entry.alarm?.scheduledTime
+        ? new Date(entry.alarm.scheduledTime).toLocaleString('ru-RU')
+        : 'нет alarm';
+    const reason = entry.details?.reason || entry.details?.source || entry.details?.skipReason || '';
+    return `${when} — ${entry.event}${reason ? ` (${reason})` : ''}; next: ${next}`;
+}
+
+function getNextDailyRun(now = new Date()) {
     const next = new Date();
     next.setHours(DAILY_PARSE_HOUR, DAILY_PARSE_MINUTE, 0, 0);
-    
-    // If it's already past midnight today, schedule for tomorrow
+
     if (now >= next) {
         next.setDate(next.getDate() + 1);
     }
-    
-    const msUntilNext = next.getTime() - now.getTime();
-    const minutesUntilNext = msUntilNext / 1000 / 60;
-    
-    console.log(`⏰ Daily parse scheduled for ${next.toLocaleString('ru-RU')} (in ${Math.round(minutesUntilNext)} minutes)`);
-    
-    // Create alarm
-    chrome.alarms.create(DAILY_ALARM_NAME, {
-        delayInMinutes: minutesUntilNext,
-        periodInMinutes: 24 * 60 // Repeat every 24 hours
-    });
+
+    return next;
 }
 
-// Initialize daily alarm on extension start
-setupDailyAlarm();
-console.log('✅ Daily auto-parse ENABLED (23:00)');
+function getLastDailyRunSlot(now = new Date()) {
+    const slot = new Date(now);
+    slot.setHours(DAILY_PARSE_HOUR, DAILY_PARSE_MINUTE, 0, 0);
+    if (now < slot) slot.setDate(slot.getDate() - 1);
+    return slot;
+}
+
+function setupDailyAlarm(reason = 'setup') {
+    const now = new Date();
+    const next = getNextDailyRun(now);
+    const msUntilNext = next.getTime() - now.getTime();
+    const minutesUntilNext = msUntilNext / 1000 / 60;
+
+    console.log(`⏰ Daily parse scheduled for ${next.toLocaleString('ru-RU')} (in ${Math.round(minutesUntilNext)} minutes)`);
+
+    chrome.alarms.create(DAILY_ALARM_NAME, {
+        delayInMinutes: minutesUntilNext,
+        periodInMinutes: DAILY_ALARM_PERIOD_MINUTES
+    });
+
+    chrome.storage.local.set({
+        dailyAlarmLastCheckedAt: now.getTime(),
+        dailyAlarmLastScheduledAt: now.getTime(),
+        dailyAlarmScheduledFor: next.getTime(),
+        dailyAlarmScheduleReason: reason
+    }).catch(() => {});
+    addDailyDiagnostic('alarm-scheduled', {
+        reason,
+        scheduledFor: next.getTime(),
+        minutesUntilNext: Math.round(minutesUntilNext)
+    });
+
+    return next;
+}
+
+async function ensureDailyAlarm(reason = 'ensure') {
+    const settings = await chrome.storage.local.get(['dailyAutoParseEnabled']);
+    if (settings.dailyAutoParseEnabled === false) {
+        const existing = await chrome.alarms.get(DAILY_ALARM_NAME);
+        if (existing) await chrome.alarms.clear(DAILY_ALARM_NAME);
+        await chrome.storage.local.set({
+            dailyAlarmLastCheckedAt: Date.now(),
+            dailyAlarmScheduleReason: `${reason}: disabled`
+        });
+        await addDailyDiagnostic('alarm-disabled', { reason, clearedExisting: !!existing });
+        return null;
+    }
+
+    const expected = getNextDailyRun();
+    const existing = await chrome.alarms.get(DAILY_ALARM_NAME);
+    const existingTime = existing?.scheduledTime || 0;
+    const driftMs = Math.abs(existingTime - expected.getTime());
+
+    if (!existing || driftMs > DAILY_ALARM_DRIFT_TOLERANCE_MS || existing.periodInMinutes !== DAILY_ALARM_PERIOD_MINUTES) {
+        await addDailyDiagnostic(existing ? 'alarm-reschedule-needed' : 'alarm-missing', {
+            reason,
+            existingScheduledTime: existing?.scheduledTime || null,
+            expectedScheduledTime: expected.getTime(),
+            driftMs,
+            existingPeriodInMinutes: existing?.periodInMinutes || null
+        });
+        return setupDailyAlarm(`${reason}: ${existing ? 'rescheduled' : 'missing'}`);
+    }
+
+    await chrome.storage.local.set({
+        dailyAlarmLastCheckedAt: Date.now(),
+        dailyAlarmScheduledFor: existing.scheduledTime,
+        dailyAlarmScheduleReason: `${reason}: ok`
+    });
+    await addDailyDiagnostic('alarm-ok', {
+        reason,
+        scheduledFor: existing.scheduledTime
+    });
+    return new Date(existing.scheduledTime);
+}
+
+async function runDailyAutoParse(source) {
+    console.log(`⏰ Daily auto-parse started (${source})`);
+    await addDailyDiagnostic('run-start', { source });
+
+    await chrome.storage.local.set({
+        lastDailyAutoParseTriggeredAt: Date.now(),
+        lastDailyAutoParseSource: source,
+        lastDailyAutoParseStatus: 'started'
+    });
+
+    sendTelegramMessage('⏰ Автоматический ночной парсинг запущен (23:00)...');
+
+    // Reset states and start parsing.
+    cachedProgressState = {};
+    await chrome.storage.local.set({ progressState: cachedProgressState, stopAllParsers: false });
+    await clearParsingLogs();
+
+    // Sequential pipeline avoids active-tab races between shop flows.
+    startSequentialPipeline();
+}
+
+async function runMissedDailyAutoParseIfNeeded(reason = 'startup') {
+    const now = new Date();
+    const lastSlot = getLastDailyRunSlot(now);
+    const missedByMs = now.getTime() - lastSlot.getTime();
+    if (missedByMs <= 0 || missedByMs > DAILY_MISSED_RUN_CATCHUP_MS) {
+        await addDailyDiagnostic('catchup-skip', {
+            reason,
+            skipReason: 'outside-catchup-window',
+            lastSlot: lastSlot.getTime(),
+            missedByMs
+        });
+        return false;
+    }
+
+    const state = await chrome.storage.local.get([
+        'dailyAutoParseEnabled',
+        'lastDailyAutoParseTriggeredAt',
+        'pipelineStage',
+        'parsingState'
+    ]);
+
+    if (state.dailyAutoParseEnabled === false) {
+        await addDailyDiagnostic('catchup-skip', { reason, skipReason: 'disabled', lastSlot: lastSlot.getTime() });
+        return false;
+    }
+    if (state.lastDailyAutoParseTriggeredAt && state.lastDailyAutoParseTriggeredAt >= lastSlot.getTime()) {
+        await addDailyDiagnostic('catchup-skip', {
+            reason,
+            skipReason: 'already-triggered-for-slot',
+            lastSlot: lastSlot.getTime(),
+            lastTriggeredAt: state.lastDailyAutoParseTriggeredAt
+        });
+        return false;
+    }
+    if (state.pipelineStage?.active || state.parsingState?.isParsingAllStores) {
+        await addDailyDiagnostic('catchup-skip', {
+            reason,
+            skipReason: 'pipeline-already-active',
+            lastSlot: lastSlot.getTime()
+        });
+        return false;
+    }
+
+    await chrome.storage.local.set({
+        lastDailyAutoParseMissedSlot: lastSlot.getTime(),
+        lastDailyAutoParseCatchupAt: Date.now(),
+        lastDailyAutoParseCatchupReason: reason
+    });
+    await addDailyDiagnostic('catchup-run', { reason, lastSlot: lastSlot.getTime(), missedByMs });
+    sendTelegramMessage(`⏰ Догоняю пропущенный запуск ${lastSlot.toLocaleString('ru-RU')} (${reason})...`).catch(() => {});
+    await runDailyAutoParse(`catchup:${reason}`);
+    return true;
+}
+
+// Initialize and self-heal daily alarm on extension/service-worker start.
+ensureDailyAlarm('service-worker-start')
+    .then(() => runMissedDailyAutoParseIfNeeded('service-worker-start'))
+    .catch(error => console.warn('⚠️ Daily alarm init failed:', error?.message || error));
+
+chrome.runtime.onInstalled.addListener(() => {
+    ensureDailyAlarm('runtime.onInstalled').catch(error => console.warn('⚠️ Daily alarm install init failed:', error?.message || error));
+});
+
+chrome.runtime.onStartup.addListener(() => {
+    ensureDailyAlarm('runtime.onStartup')
+        .then(() => runMissedDailyAutoParseIfNeeded('runtime.onStartup'))
+        .catch(error => console.warn('⚠️ Daily alarm startup init failed:', error?.message || error));
+});
+
+console.log('✅ Daily auto-parse scheduler ENABLED (23:00)');
 
 // --- Google Auth Functions (inlined to avoid import issues) ---
 function getAuthToken(interactive) {
@@ -134,6 +361,7 @@ let isParsingAllStores = false;
 // Accumulate stats for one final Telegram report instead of spamming individual messages
 let parseReport = { stores: {}, screenshots: { sent: 0, skipped: 0, failed: 0, broken: 0 }, startedAt: null };
 const DEFAULT_SPREADSHEET_ID = '1w1QOzGWc_CNovlezuxyLta-h1kM3pgPXc_GoHYaOA98';
+const PIPELINE_STALE_TIMEOUT_MS = 15 * 60 * 1000;
 
 // --- Accounts Config (accountsConfig — источник истины для multi-account) ---
 // DEFAULT_ACCOUNTS_CONFIG используется, если user ещё не сохранил свой конфиг
@@ -404,7 +632,107 @@ chrome.storage.local.get(['progressState', 'tgBotToken', 'tgChatId', 'tgPhotoCha
     // Start Telegram polling if configured
     if (tgBotToken) startTelegramPolling();
     else console.warn('⚠️ No Telegram Token - polling disabled');
+
+    reconcileStalePipelineState().catch(error => {
+        console.warn('⚠️ Failed to reconcile parser pipeline state:', error?.message || error);
+    });
 });
+
+async function clearPipelineRuntimeState(reason) {
+    console.warn(`🧹 Clearing stale parser pipeline state: ${reason}`);
+
+    isParsingAllStores = false;
+    storesCompleted = { ebay: false, iherb: false, amazon: false };
+    isMultiAccountParsing = false;
+    amazonAccountsQueue = [];
+    currentAmazonAccount = null;
+    isMultiAccountIherb = false;
+    iherbAccountsQueue = [];
+    currentIherbAccount = null;
+    cachedProgressState = {};
+
+    await chrome.storage.local.remove([
+        'progressState',
+        'pipelineStage',
+        'parsingState',
+        'multiAccountState',
+        'multiAccountIherbState',
+        'autoParsePending',
+        'autoParse_ebay',
+        'autoParse_iherb',
+        'autoParse_amazon',
+        'autoParseTimestamp',
+        'ebay_should_autoparse',
+        'iherb_should_autoparse',
+        'amazonPaginationState',
+        'amazonFinalReturn',
+        'amazonParsingComplete',
+        'accountSwitchStartedAt',
+        'accountSwitchFailures',
+        'lastAmazonProgressAt',
+        'skipGuardAt',
+        'pendingAccountSwitch',
+        'pendingIherbSwitch',
+        'iherbSwitchInProgress',
+        'iherbSwitchFailures',
+        'iherbFinalReturn',
+        'iherbOrdersReloadDone',
+        'iherbParserTabId',
+        'iherbParseStartedAt',
+        'iherbWatchdogRetried'
+    ]);
+
+    await chrome.storage.local.set({
+        progressState: cachedProgressState,
+        parsingState: {
+            isParsingAllStores,
+            storesCompleted
+        }
+    });
+}
+
+async function reconcileStalePipelineState() {
+    const state = await chrome.storage.local.get([
+        'pipelineStage',
+        'progressState',
+        'iherbParseStartedAt',
+        'lastAmazonProgressAt',
+        'accountSwitchStartedAt'
+    ]);
+    const pipeline = state.pipelineStage;
+    if (!pipeline?.active) return;
+
+    const currentStage = pipeline.stages?.[pipeline.currentIndex];
+    if (!currentStage || currentStage === 'done') return;
+
+    const stageTimestamp = Math.max(
+        pipeline.startedAt || 0,
+        state.progressState?.[currentStage]?.timestamp || 0,
+        currentStage === 'iherb' ? (state.iherbParseStartedAt || 0) : 0,
+        currentStage === 'amazon'
+            ? Math.max(state.lastAmazonProgressAt || 0, state.accountSwitchStartedAt || 0)
+            : 0
+    );
+    const stageAgeMs = stageTimestamp ? (Date.now() - stageTimestamp) : Number.POSITIVE_INFINITY;
+    if (stageAgeMs < PIPELINE_STALE_TIMEOUT_MS) return;
+
+    let shouldClear = false;
+    if (currentStage === 'iherb') {
+        const iherbTabs = await chrome.tabs.query({ url: 'https://*.iherb.com/*' });
+        shouldClear = iherbTabs.length === 0 || !state.iherbParseStartedAt;
+    } else if (currentStage === 'ebay') {
+        const ebayTabs = await chrome.tabs.query({ url: 'https://www.ebay.com/mye/myebay/purchase*' });
+        shouldClear = ebayTabs.length === 0;
+    } else if (currentStage === 'amazon') {
+        const amazonTabs = await chrome.tabs.query({ url: 'https://www.amazon.com/*' });
+        shouldClear = amazonTabs.length === 0 || !(state.lastAmazonProgressAt || state.accountSwitchStartedAt);
+    }
+
+    if (!shouldClear) return;
+
+    const ageMinutes = Math.round(stageAgeMs / 60000);
+    await clearPipelineRuntimeState(`${currentStage} stage stale for ${ageMinutes} min without live runtime`);
+}
 
 // --- Progress Tracking State ---
 let totalTasks = 0;
@@ -776,6 +1104,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             if (tgBotToken) startTelegramPolling();
         });
     } else if (request.action === "parserStarted") {
+        const startedAt = Date.now();
+        if (request.store === 'iHerb') {
+            const update = { iherbParseStartedAt: startedAt, iherbWatchdogRetried: false };
+            if (sender.tab?.id) update.iherbParserTabId = sender.tab.id;
+            chrome.storage.local.set(update);
+        } else if (request.store === 'Amazon') {
+            chrome.storage.local.set({ lastAmazonProgressAt: startedAt });
+        }
         // Notify Telegram that parser actually started working
         const storeEmoji = {
             'eBay': '🛒',
@@ -787,6 +1123,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         // Handle parsing errors (e.g., Service unavailable after retries)
         const storeKey = request.store?.toLowerCase();
         const errorMsg = request.error || 'Unknown error';
+
+        if (storeKey === 'iherb') {
+            chrome.storage.local.remove(['iherbParseStartedAt', 'iherbWatchdogRetried']);
+        } else if (storeKey === 'amazon') {
+            chrome.storage.local.remove(['lastAmazonProgressAt']);
+        }
 
         console.log(`❌ [BACKGROUND] Parse error from ${request.store}: ${errorMsg}`);
         sendTelegramMessage(`❌ ${request.store}: Ошибка парсинга - ${errorMsg}`);
@@ -1207,6 +1549,9 @@ async function finalReturnToIherbPrimary() {
     console.log(`🏁 iHerb final return to ${primary.email}`);
     sendTelegramMessage(`🏁 Возврат на основной iHerb-аккаунт: ${primary.email.split('@')[0]}`).catch(() => {});
 
+    const stored = await chrome.storage.local.get(['iherbParserTabId', 'multiAccountIherbState']);
+    const lastKnownAccount = currentIherbAccount || stored.multiAccountIherbState?.currentIherbAccount || null;
+
     await chrome.storage.local.set({
         pendingIherbSwitch: { email: primary.email, password: primary.password },
         iherbFinalReturn: true,
@@ -1214,13 +1559,13 @@ async function finalReturnToIherbPrimary() {
     });
     await chrome.storage.local.remove(['iherbSwitchInProgress']);
 
-    const stored = await chrome.storage.local.get(['iherbParserTabId']);
     const tabId = await ensureValidIherbParserTab(stored.iherbParserTabId);
     await chrome.storage.local.set({ iherbParserTabId: tabId });
 
-    // Fast path: если мы остались залогинены как primary (secondary-логин
-    // провалился или уже дренили очередь без выхода) — final-return это no-op.
-    const alreadyOnPrimary = await iherbIsLoggedIn(tabId);
+    // iherbIsLoggedIn() only proves "some account is logged in"; it cannot
+    // identify which email. Skip re-login only when our own state says the last
+    // parsed account was already primary.
+    const alreadyOnPrimary = lastKnownAccount === primary.email && await iherbIsLoggedIn(tabId);
     if (alreadyOnPrimary) {
         console.log(`✅ Already on primary ${primary.email} — final return no-op`);
         sendTelegramMessage(`✅ iHerb уже на ${primary.email.split('@')[0]} — возврат не нужен`).catch(() => {});
@@ -1633,24 +1978,26 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     // Handle daily auto-parse
     if (alarm.name === DAILY_ALARM_NAME) {
         console.log('⏰ Daily auto-parse alarm triggered!');
-        
-        // Check if auto-parse is enabled
+        await addDailyDiagnostic('alarm-fired', {
+            scheduledTime: alarm.scheduledTime || null,
+            periodInMinutes: alarm.periodInMinutes || null
+        });
+
+        await ensureDailyAlarm('daily-alarm-fired');
+
         const settings = await chrome.storage.local.get(['dailyAutoParseEnabled']);
         if (settings.dailyAutoParseEnabled === false) {
             console.log('⏰ Auto-parse is disabled, skipping');
+            await chrome.storage.local.set({
+                lastDailyAutoParseTriggeredAt: Date.now(),
+                lastDailyAutoParseSource: 'alarm',
+                lastDailyAutoParseStatus: 'disabled'
+            });
+            await addDailyDiagnostic('run-skip', { source: 'alarm', skipReason: 'disabled' });
             return;
         }
-        
-        sendTelegramMessage('⏰ Автоматический ночной парсинг запущен (23:00)...');
 
-        // Reset states and start parsing
-        cachedProgressState = {};
-        chrome.storage.local.set({ progressState: cachedProgressState, stopAllParsers: false });
-        await clearParsingLogs();
-
-        // Sequential pipeline — avoids active-tab race between concurrent shop flows
-        // (see advancePipelineStage / waitForScreenshotsDrained).
-        startSequentialPipeline();
+        await runDailyAutoParse('alarm');
         return;
     }
     
@@ -2343,27 +2690,66 @@ async function pollTelegramUpdates() {
                     // Auto-parse commands
                     if (text === '/autoparse on' || text === '/auto on') {
                         await chrome.storage.local.set({ dailyAutoParseEnabled: true });
-                        setupDailyAlarm();
-                        sendTelegramMessage('⏰ Автопарсинг ВКЛЮЧЕН! Буду запускаться каждый день в 0:00.');
+                        const nextRun = await ensureDailyAlarm('telegram:on');
+                        sendTelegramMessage(`⏰ Автопарсинг ВКЛЮЧЕН! Следующий запуск: ${nextRun.toLocaleString('ru-RU')}`);
                         continue;
                     }
                     
                     if (text === '/autoparse off' || text === '/auto off') {
                         await chrome.storage.local.set({ dailyAutoParseEnabled: false });
                         chrome.alarms.clear(DAILY_ALARM_NAME);
+                        await addDailyDiagnostic('autoparse-off', { source: 'telegram' });
                         sendTelegramMessage('⏰ Автопарсинг ВЫКЛЮЧЕН.');
+                        continue;
+                    }
+
+                    if (text === '/autoparse log' || text === '/auto log') {
+                        const stored = await chrome.storage.local.get([DAILY_DIAGNOSTICS_KEY]);
+                        const diagnostics = Array.isArray(stored[DAILY_DIAGNOSTICS_KEY])
+                            ? stored[DAILY_DIAGNOSTICS_KEY]
+                            : [];
+                        const tail = diagnostics.slice(-10);
+                        const lines = tail.length
+                            ? tail.map(formatDailyDiagnostic)
+                            : ['лог пока пуст'];
+                        sendTelegramMessage(`🧾 Лог автозапуска:\n${lines.join('\n')}`);
                         continue;
                     }
                     
                     if (text === '/status') {
-                        const settings = await chrome.storage.local.get(['dailyAutoParseEnabled']);
+                        const settings = await chrome.storage.local.get([
+                            'dailyAutoParseEnabled',
+                            'dailyAlarmLastCheckedAt',
+                            'dailyAlarmScheduledFor',
+                            'dailyAlarmScheduleReason',
+                            'lastDailyAutoParseTriggeredAt',
+                            'lastDailyAutoParseStatus',
+                            'lastDailyAutoParseSource',
+                            DAILY_DIAGNOSTICS_KEY
+                        ]);
                         const autoEnabled = settings.dailyAutoParseEnabled !== false; // default true
-                        const alarm = await chrome.alarms.get(DAILY_ALARM_NAME);
+                        const alarm = autoEnabled ? await ensureDailyAlarm('telegram:status') : await chrome.alarms.get(DAILY_ALARM_NAME);
                         let statusMsg = `📊 Статус:\n`;
                         statusMsg += `⏰ Автопарсинг: ${autoEnabled ? 'ВКЛ' : 'ВЫКЛ'}\n`;
                         if (alarm) {
                             const nextRun = new Date(alarm.scheduledTime);
-                            statusMsg += `📅 Следующий запуск: ${nextRun.toLocaleString('ru-RU')}`;
+                            statusMsg += `📅 Следующий запуск: ${nextRun.toLocaleString('ru-RU')}\n`;
+                        } else {
+                            statusMsg += `📅 Следующий запуск: не назначен\n`;
+                        }
+                        if (settings.lastDailyAutoParseTriggeredAt) {
+                            const lastRun = new Date(settings.lastDailyAutoParseTriggeredAt);
+                            statusMsg += `🧾 Последний автозапуск: ${lastRun.toLocaleString('ru-RU')} (${settings.lastDailyAutoParseStatus || 'unknown'}, ${settings.lastDailyAutoParseSource || 'unknown'})\n`;
+                        }
+                        if (settings.dailyAlarmLastCheckedAt) {
+                            const checked = new Date(settings.dailyAlarmLastCheckedAt);
+                            statusMsg += `🔎 Проверка alarm: ${checked.toLocaleString('ru-RU')} (${settings.dailyAlarmScheduleReason || 'unknown'})\n`;
+                        }
+                        const diagnostics = Array.isArray(settings[DAILY_DIAGNOSTICS_KEY])
+                            ? settings[DAILY_DIAGNOSTICS_KEY]
+                            : [];
+                        if (diagnostics.length > 0) {
+                            statusMsg += `🧾 Последние события:\n${diagnostics.slice(-3).map(formatDailyDiagnostic).join('\n')}`;
                         }
                         sendTelegramMessage(statusMsg);
                         continue;

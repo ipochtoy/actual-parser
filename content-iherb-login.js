@@ -132,7 +132,14 @@ const IS_LOGIN     = IS_NEW_LOGIN || IS_OLD_LOGIN;
 })();
 
 // ─── 2-step login (checkout.iherb.com/auth/ui/account/login) ───
+// LastPass-aware: до и после type ждём чтобы autofill отработал и стабилизировался,
+// потом verify value и retry если LastPass перезаписал наш ввод.
 async function runTwoStepLogin(email, password) {
+  // Settle wait: LastPass autofill инжектится с delay 1-3 сек после load.
+  // Если начнём clear сразу — LastPass дозальёт ПОСЛЕ нашего type → invalid password.
+  console.log('🔐 [iHerb Login] settle 4s (LastPass autofill window)');
+  await sleep(4000);
+
   // Step A: email
   const emailInput = await waitForSelector(
     '#username-input, input[name="username"], input[autocomplete*="username"], input[type="email"]',
@@ -141,7 +148,8 @@ async function runTwoStepLogin(email, password) {
   if (!emailInput) throw new Error('email_field_not_found');
 
   await clearAndType(emailInput, email);
-  await sleep(600 + Math.random() * 400);
+  await verifyOrRetry(emailInput, email, 'email');
+  await sleep(800 + Math.random() * 400);
 
   const continueBtn = findVisibleButton([
     '#auth-continue-button',
@@ -158,9 +166,14 @@ async function runTwoStepLogin(email, password) {
   );
   if (!passInput) throw new Error('password_field_not_found_after_continue');
 
-  await sleep(400 + Math.random() * 400);
+  // После показа password-step LastPass снова может попытаться autofill.
+  console.log('🔐 [iHerb Login] password step settle 4s');
+  await sleep(4000);
+
   await clearAndType(passInput, password);
-  await sleep(900 + Math.random() * 600);
+  await verifyOrRetry(passInput, password, 'password');
+
+  await sleep(700 + Math.random() * 400);
 
   const signInBtn = findVisibleButton([
     '#auth-sign-in-button',
@@ -169,6 +182,23 @@ async function runTwoStepLogin(email, password) {
   if (!signInBtn) throw new Error('sign_in_button_not_found');
   console.log('🔐 [iHerb Login] click Sign In');
   signInBtn.click();
+}
+
+// Pause 1.5s, проверяем value === expected. Если drift — clearAndType ещё раз.
+// Делаем до 2 retry, потом throw.
+async function verifyOrRetry(input, expected, label) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await sleep(1500);
+    const v = input.value || '';
+    if (v === expected) {
+      console.log(`🔐 [iHerb Login] ${label} value verified (len=${v.length})`);
+      return;
+    }
+    console.warn(`🔐 [iHerb Login] ${label} drifted (got len=${v.length}, expected ${expected.length}); retry ${attempt + 1}/2`);
+    if (attempt >= 2) break;
+    await clearAndType(input, expected);
+  }
+  throw new Error(`${label}_input_drift_after_retries`);
 }
 
 // ─── Legacy single-form (secure.iherb.com/account/sign-in) ───
@@ -183,10 +213,14 @@ async function runLegacyLogin(email, password) {
   );
   if (!emailInput || !passInput) throw new Error('legacy_login_fields_not_found');
 
+  console.log('🔐 [iHerb Login Legacy] settle 4s (LastPass autofill window)');
+  await sleep(4000);
   await clearAndType(emailInput, email);
-  await sleep(400 + Math.random() * 400);
+  await verifyOrRetry(emailInput, email, 'legacy_email');
+  await sleep(600 + Math.random() * 300);
   await clearAndType(passInput, password);
-  await sleep(900 + Math.random() * 700);
+  await verifyOrRetry(passInput, password, 'legacy_password');
+  await sleep(700 + Math.random() * 400);
 
   const form = passInput.closest('form');
   let submitBtn = form?.querySelector('button[type="submit"], input[type="submit"]');
@@ -205,35 +239,43 @@ async function runLegacyLogin(email, password) {
 // но React/Vue-safe setter + InputEvent надёжно чистит/заполняет input).
 async function clearAndType(input, text) {
   input.focus();
-  await sleep(80);
+  await sleep(150);
 
-  // 1. Select all via setSelectionRange (работает на text inputs)
-  try {
-    if (typeof input.setSelectionRange === 'function') {
-      input.setSelectionRange(0, (input.value || '').length);
-    } else {
-      input.select?.();
-    }
-  } catch (_) {}
-  await sleep(50);
+  // Multi-pass clear: LastPass может перезалить value в течение нескольких сот мс
+  // после нашего clear. Очищаем 3 раза с проверкой между попытками.
+  for (let pass = 0; pass < 3; pass++) {
+    try {
+      if (typeof input.setSelectionRange === 'function') {
+        input.setSelectionRange(0, (input.value || '').length);
+      } else {
+        input.select?.();
+      }
+    } catch (_) {}
+    await sleep(80);
+    setNativeValue(input, '');
+    input.dispatchEvent(new Event('input',  { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    await sleep(250);
+    if ((input.value || '') === '') break;
+    console.warn(`🔐 [iHerb Login] clear pass ${pass + 1}: value still "${(input.value || '').slice(0, 5)}…" — retry`);
+  }
+  if ((input.value || '') !== '') {
+    console.warn('🔐 [iHerb Login] field STILL non-empty after 3 clear passes — typing on top anyway');
+  }
 
-  // 2. Clear value через native setter (React/Vue not bypass)
-  setNativeValue(input, '');
-  input.dispatchEvent(new Event('input',  { bubbles: true }));
-  input.dispatchEvent(new Event('change', { bubbles: true }));
-  await sleep(120);
-
-  // 3. Посимвольный ввод с anti-bot jitter
+  // Slow typing 200-280мс/символ, anti-LastPass-race
   for (const ch of text) {
     const prev = input.value || '';
     setNativeValue(input, prev + ch);
     input.dispatchEvent(new InputEvent('input', { bubbles: true, data: ch, inputType: 'insertText' }));
     input.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: ch }));
     input.dispatchEvent(new KeyboardEvent('keyup',   { bubbles: true, key: ch }));
-    await sleep(80 + Math.random() * 80);
+    await sleep(200 + Math.random() * 80);
   }
   input.dispatchEvent(new Event('change', { bubbles: true }));
-  input.dispatchEvent(new Event('blur',   { bubbles: true }));
+  // Не делаем blur сразу: LastPass на blur может re-autofill.
+  // Просто ждём небольшой stabilization.
+  await sleep(300);
 }
 
 // React/Vue используют property setter перехват на HTMLInputElement.value,
