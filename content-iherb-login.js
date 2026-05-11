@@ -121,7 +121,7 @@ const IS_LOGIN     = IS_NEW_LOGIN || IS_OLD_LOGIN;
 
   if (data.iherbFinalReturn) {
     console.log('🏁 [iHerb Login] final return done, going to home');
-    await chrome.storage.local.remove(['iherbFinalReturn', 'iherbSwitchInProgress']);
+    await chrome.storage.local.remove(['iherbFinalReturn', 'iherbSwitchInProgress', 'iherbSwitchStartedAt']);
     location.href = 'https://www.iherb.com/';
     return;
   }

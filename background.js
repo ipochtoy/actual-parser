@@ -674,6 +674,7 @@ async function clearPipelineRuntimeState(reason) {
         'pendingAccountSwitch',
         'pendingIherbSwitch',
         'iherbSwitchInProgress',
+        'iherbSwitchStartedAt',
         'iherbSwitchFailures',
         'iherbFinalReturn',
         'iherbOrdersReloadDone',
@@ -1047,7 +1048,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             } else {
                 console.log(`🚫 iHerb account ${email} skipped (failures: ${failures[email]}, reason: ${reason})`);
                 sendTelegramMessage(`🚫 iHerb аккаунт ${email.split('@')[0]} пропущен (${reason})`);
-                await chrome.storage.local.remove(['iherbSwitchInProgress', 'pendingIherbSwitch']);
+                await chrome.storage.local.remove(['iherbSwitchInProgress', 'iherbSwitchStartedAt', 'pendingIherbSwitch']);
                 if (iherbAccountsQueue.length > 0) {
                     switchToNextIherbAccount();
                 } else {
@@ -1285,6 +1286,7 @@ async function startSequentialPipeline() {
   await chrome.storage.local.remove([
     'iherbFinalReturn',
     'iherbSwitchInProgress',
+    'iherbSwitchStartedAt',
     'iherbSwitchFailures',
     'iherbOrdersReloadDone',
     'pendingIherbSwitch',
@@ -1410,6 +1412,7 @@ async function startMultiAccountIherbParsing() {
         'pendingIherbSwitch',
         'iherbFinalReturn',
         'iherbSwitchInProgress',
+        'iherbSwitchStartedAt',
         'iherbOrdersReloadDone'
     ]);
 
@@ -1446,6 +1449,13 @@ async function switchToNextIherbAccount() {
     await chrome.storage.local.set({
         pendingIherbSwitch: { email: next.email, password: next.password },
         iherbSwitchInProgress: true,
+        // Отметка времени старта переключения iHerb. Нужна watchdog'у чтобы понять
+        // что переключение зависло (login-страница не загрузилась / cs-скрипт не
+        // отработал / SW заснул посреди sign-out). Без неё watchdog видел только
+        // iherbParseStartedAt, который выставляется ПОСЛЕ успешного логина — стак
+        // на самом switch'е не детектился. Отдельное от accountSwitchStartedAt
+        // (то поле — для Amazon multi-account, не пересекаем).
+        iherbSwitchStartedAt: Date.now(),
         iherbFinalReturn: null,
         multiAccountIherbState: {
             isMultiAccountIherb: true,
@@ -1537,7 +1547,7 @@ async function handleIherbSwitchFailure(email, reason) {
     } else {
         console.log(`🚫 iHerb ${email} skipped (failures=${failures[email]}, reason=${reason})`);
         sendTelegramMessage(`🚫 iHerb ${email.split('@')[0]} пропущен (${reason})`).catch(() => {});
-        await chrome.storage.local.remove(['iherbSwitchInProgress', 'pendingIherbSwitch']);
+        await chrome.storage.local.remove(['iherbSwitchInProgress', 'iherbSwitchStartedAt', 'pendingIherbSwitch']);
         if (iherbAccountsQueue.length > 0) switchToNextIherbAccount();
         else finalReturnToIherbPrimary();
     }
@@ -1557,7 +1567,7 @@ async function finalReturnToIherbPrimary() {
         iherbFinalReturn: true,
         multiAccountIherbState: null
     });
-    await chrome.storage.local.remove(['iherbSwitchInProgress']);
+    await chrome.storage.local.remove(['iherbSwitchInProgress', 'iherbSwitchStartedAt']);
 
     const tabId = await ensureValidIherbParserTab(stored.iherbParserTabId);
     await chrome.storage.local.set({ iherbParserTabId: tabId });
@@ -1569,7 +1579,7 @@ async function finalReturnToIherbPrimary() {
     if (alreadyOnPrimary) {
         console.log(`✅ Already on primary ${primary.email} — final return no-op`);
         sendTelegramMessage(`✅ iHerb уже на ${primary.email.split('@')[0]} — возврат не нужен`).catch(() => {});
-        await chrome.storage.local.remove(['pendingIherbSwitch', 'iherbFinalReturn', 'iherbSwitchInProgress']);
+        await chrome.storage.local.remove(['pendingIherbSwitch', 'iherbFinalReturn', 'iherbSwitchInProgress', 'iherbSwitchStartedAt']);
         await chrome.tabs.update(tabId, { url: 'https://www.iherb.com/', active: false });
         // Advance faster — нет 45s login wait.
         setTimeout(() => advancePipelineStage().catch(() => {}), 3000);
