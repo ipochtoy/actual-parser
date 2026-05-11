@@ -1895,7 +1895,12 @@ chrome.alarms.create(SCREENSHOT_RESUME_ALARM, { delayInMinutes: 1, periodInMinut
 // (Extension context invalidated, infinite scroll стал, network 429 etc.).
 // Если cs не отвечает >IHERB_PARSE_TIMEOUT_MS — retry tab.update (one shot), потом fail.
 const IHERB_WATCHDOG_ALARM = 'iherbParseWatchdog';
-const IHERB_PARSE_TIMEOUT_MS = 240_000; // 4 min hard cap
+const IHERB_PARSE_TIMEOUT_MS = 240_000; // 4 min hard cap для самого парсинга
+// Отдельный таймаут на стадию переключения аккаунта (sign-out → login → /orders).
+// 5 минут хватает на: 4с settle + login form fill + OAuth redirect + iherb page load.
+// Если за это время iherbSwitchInProgress=true но iherbParseStartedAt так и не
+// выставился — switch застрял (SW заснул, login страница не загрузилась и т.п.).
+const IHERB_SWITCH_TIMEOUT_MS = 5 * 60_000;
 chrome.alarms.create(IHERB_WATCHDOG_ALARM, { delayInMinutes: 1, periodInMinutes: 1 });
 
 function startCompletionWatchdog() {
@@ -1917,8 +1922,44 @@ function stopCompletionWatchdog() {
 async function handleIherbWatchdog() {
     const stored = await chrome.storage.local.get([
         'iherbParseStartedAt', 'iherbWatchdogRetried',
+        'iherbSwitchInProgress', 'iherbSwitchStartedAt',
         'multiAccountIherbState', 'iherbParserTabId', 'pipelineStage'
     ]);
+
+    // Ветка A: переключение аккаунта застряло. Это случай когда мы выставили
+    // iherbSwitchInProgress=true в switchToNextIherbAccount, но cs-парсер так
+    // и не прислал parserStarted (iherbParseStartedAt пусто) — значит login
+    // страница не загрузилась / cs не запустился / SW заснул посреди sign-out.
+    // Без этой ветки watchdog был слепой: ждал iherbParseStartedAt которого
+    // никогда не будет, а pipeline зависал на iherb-стадии навсегда.
+    if (!stored.iherbParseStartedAt
+        && stored.iherbSwitchInProgress
+        && stored.iherbSwitchStartedAt) {
+        const switchElapsed = Date.now() - stored.iherbSwitchStartedAt;
+        if (switchElapsed >= IHERB_SWITCH_TIMEOUT_MS) {
+            const acc = stored.multiAccountIherbState?.currentIherbAccount || 'unknown';
+            console.log(`[iherbWatchdog] switch deadlock: acc=${acc}, elapsed=${Math.round(switchElapsed/1000)}s`);
+            sendTelegramMessage(`🚫 iHerb (${acc.split('@')[0]}) переключение зависло ${Math.round(switchElapsed/60000)} мин — двигаю pipeline`).catch(()=>{});
+
+            // Снимаем флаги switch чтобы handleIherbSwitchFailure не споткнулся
+            // на повторе и сразу прошёл по retry/skip-логике.
+            await chrome.storage.local.remove([
+                'iherbSwitchInProgress', 'iherbSwitchStartedAt', 'pendingIherbSwitch'
+            ]);
+
+            // Восстановим in-memory state на случай если SW рестартил между alarm-тиками.
+            if (stored.multiAccountIherbState) {
+                isMultiAccountIherb = stored.multiAccountIherbState.isMultiAccountIherb;
+                iherbAccountsQueue = stored.multiAccountIherbState.iherbAccountsQueue || [];
+                currentIherbAccount = stored.multiAccountIherbState.currentIherbAccount;
+            }
+            await handleIherbSwitchFailure(acc, 'switch_timeout').catch(e => {
+                console.warn('[iherbWatchdog] handleIherbSwitchFailure threw:', e?.message || e);
+            });
+        }
+        return;
+    }
+
     if (!stored.iherbParseStartedAt) return; // нет активного парса — нечего watch'ить
     const elapsed = Date.now() - stored.iherbParseStartedAt;
     if (elapsed < IHERB_PARSE_TIMEOUT_MS) return; // ещё не таймаут
