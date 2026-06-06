@@ -114,13 +114,16 @@ const IS_LOGIN     = IS_NEW_LOGIN || IS_OLD_LOGIN;
     }
   }
 
-  // CAPTCHA check
+  // CAPTCHA check — только ВИДИМАЯ активная captcha.
+  // iHerb постоянно держит на странице невидимый reCAPTCHA (badge/anchor iframe +
+  // скрытый g-recaptcha-response textarea) для antifraud-скоринга. Старый селектор
+  // `iframe[src*=recaptcha], [class*=captcha]` ловил этот фон и слал ложный
+  // 'captcha' → аккаунт мгновенно скипался. Теперь детектим только реальный
+  // челлендж (см. detectActiveCaptcha).
   if (/\/account\/(sign-in|login)/i.test(location.href)) {
-    const captcha = !!document.querySelector(
-      'iframe[src*="captcha" i], iframe[src*="recaptcha" i], iframe[src*="hcaptcha" i], [class*="captcha" i]'
-    );
-    if (captcha) {
-      console.warn('🔐 [iHerb Login] CAPTCHA detected — alert operator');
+    const cap = detectActiveCaptcha();
+    if (cap.active) {
+      console.warn(`🔐 [iHerb Login] active CAPTCHA detected (${cap.type})`);
       sendFailed(email, 'captcha');
       return;
     }
@@ -342,6 +345,93 @@ function isErrorPage() {
   const bodyTxt = (document.body?.innerText || '').toLowerCase();
   if (hints.some(h => bodyTxt.includes(h))) return true;
   return /error|unavailable/i.test(document.title);
+}
+
+// ─── CAPTCHA detection ───
+// Возвращает {active:boolean, type:string, sitekey?:string}.
+// active=true ТОЛЬКО для видимого, реально показанного пользователю челленджа.
+// НЕ считаются captcha:
+//   - скрытый <textarea id="g-recaptcha-response"> (всегда display:none)
+//   - фоновый reCAPTCHA anchor/badge iframe (схлопнут или off-screen у invisible)
+//   - reCAPTCHA bframe в display:none (challenge ещё не вызван)
+function isElementVisible(el) {
+  if (!el) return false;
+  if (el.offsetParent === null) return false;               // display:none или скрытый предок
+  const rect = el.getBoundingClientRect();
+  if (rect.width < 50 || rect.height < 50) return false;     // схлопнутый badge/anchor
+  const cs = getComputedStyle(el);
+  if (cs.visibility === 'hidden' || cs.display === 'none') return false;
+  if (parseFloat(cs.opacity || '1') < 0.1) return false;
+  // элемент в пределах вьюпорта (не уведён за экран)
+  if (rect.bottom < 0 || rect.right < 0 ||
+      rect.top > (window.innerHeight || 0) || rect.left > (window.innerWidth || 0)) return false;
+  return true;
+}
+
+function detectActiveCaptcha() {
+  // 1) reCAPTCHA challenge popup (bframe) реально показан
+  const recaptchaChallenge = document.querySelectorAll(
+    'iframe[src*="recaptcha"][src*="bframe"], iframe[title="recaptcha challenge expires in two minutes." i]'
+  );
+  for (const f of recaptchaChallenge) {
+    if (isElementVisible(f)) return { active: true, type: 'recaptcha-challenge', sitekey: extractRecaptchaSitekey() };
+  }
+
+  // 2) Видимый reCAPTCHA v2 checkbox (data-size != invisible)
+  const visibleWidget = Array.from(
+    document.querySelectorAll('.g-recaptcha:not([data-size="invisible"]), .h-captcha')
+  ).find(isElementVisible);
+  if (visibleWidget) {
+    return { active: true, type: 'recaptcha-checkbox', sitekey: extractRecaptchaSitekey() };
+  }
+
+  // 3) hCaptcha challenge видим
+  const hCaptcha = document.querySelectorAll(
+    'iframe[src*="hcaptcha"][src*="challenge"], iframe[src*="newassets.hcaptcha"]'
+  );
+  for (const f of hCaptcha) {
+    if (isElementVisible(f)) return { active: true, type: 'hcaptcha-challenge' };
+  }
+
+  // 4) DataDome / PerimeterX "Press & Hold" — видимый текст
+  const bodyTxt = document.body ? (document.body.innerText || '') : '';
+  if (/press\s*(&|and)\s*hold/i.test(bodyTxt)) {
+    return { active: true, type: 'press-and-hold' };
+  }
+
+  // 5) "Verify you are human" — только если это challenge-страница, а не фон.
+  //    (невидимый recaptcha не рисует этот текст, но перестрахуемся title-ом/контейнером)
+  if (/verify\s+you\s+are\s+(a\s+)?human|are\s+you\s+a\s+robot/i.test(bodyTxt)) {
+    if (/captcha|verify|robot|blocked|access\s*denied/i.test(document.title || '')) {
+      return { active: true, type: 'verify-human' };
+    }
+    const overlay = document.querySelector('#datadome, [class*="datadome" i], [id*="captcha-container" i]');
+    if (isElementVisible(overlay)) return { active: true, type: 'verify-human-overlay' };
+  }
+
+  // 6) Явный видимый captcha-overlay/modal
+  const overlay = document.querySelector(
+    '#datadome, [class*="datadome" i], [id*="captcha-container" i], [class*="captcha-modal" i]'
+  );
+  if (isElementVisible(overlay)) return { active: true, type: 'visible-overlay' };
+
+  return { active: false, type: 'none' };
+}
+
+// Достаём reCAPTCHA sitekey для решения через 2captcha.
+// Источники: data-sitekey виджета, ?k= в src фонового recaptcha iframe.
+function extractRecaptchaSitekey() {
+  const widget = document.querySelector('.g-recaptcha[data-sitekey], [data-sitekey]');
+  if (widget) {
+    const k = widget.getAttribute('data-sitekey');
+    if (k) return k;
+  }
+  const frame = document.querySelector('iframe[src*="recaptcha"][src*="k="]');
+  if (frame) {
+    const m = /[?&]k=([^&]+)/.exec(frame.src || '');
+    if (m) return decodeURIComponent(m[1]);
+  }
+  return null;
 }
 
 function sendFailed(email, reason) {
