@@ -1045,6 +1045,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             failures[email] = (failures[email] || 0) + 1;
             await chrome.storage.local.set({ iherbSwitchFailures: failures });
 
+            // CAPTCHA — особый случай: captcha обычно привязана к IP, поэтому
+            // следующий iHerb-аккаунт почти наверняка упрётся в неё же и сожжёт ещё
+            // 60с. Не перебираем аккаунты — пропускаем ВСЮ стадию iHerb и идём к
+            // следующему магазину (pipeline advance). Не застреваем на одном аккаунте.
+            if (reason === 'captcha') {
+                await abortIherbStageDueToCaptcha(email);
+                return;
+            }
+
             const MAX_IH_ATTEMPTS = 2;
             if (failures[email] < MAX_IH_ATTEMPTS && reason !== 'captcha') {
                 console.log(`🔁 Retry iHerb switch for ${email} (attempt ${failures[email]+1}/${MAX_IH_ATTEMPTS})`);
@@ -1235,6 +1244,35 @@ async function solveRecaptchaVia2Captcha(sitekey, pageurl, timeoutMs = 60000) {
         await new Promise(r => setTimeout(r, 5000));
     }
     throw new Error('solve_timeout');
+}
+
+// Captcha не решилась за бюджет — пропускаем всю стадию iHerb и двигаем pipeline
+// к следующему магазину (eBay → Amazon). Очищаем iherb-очередь и runtime-флаги,
+// чтобы watchdog/ретраи не воскресили зависшую стадию. НЕ делаем
+// finalReturnToIherbPrimary в pipeline-режиме — повторный логин снова упрётся в
+// captcha и снова сожжёт 60с. Следующим магазинам логин-состояние iHerb не нужно.
+async function abortIherbStageDueToCaptcha(email) {
+    const who = (email || '').split('@')[0] || 'аккаунт';
+    console.warn(`🧩 [iHerb] captcha unsolved for ${email} — skipping iHerb stage, moving to next shop`);
+    sendTelegramMessage(`🧩 iHerb: captcha не пройдена (${who}). Пропускаю iHerb, перехожу к следующему магазину.`).catch(() => {});
+
+    iherbAccountsQueue = [];
+    await chrome.storage.local.remove([
+        'iherbSwitchInProgress', 'iherbSwitchStartedAt', 'pendingIherbSwitch',
+        'iherbFinalReturn', 'multiAccountIherbState'
+    ]);
+
+    const r = await chrome.storage.local.get(['pipelineStage']);
+    const p = r.pipelineStage;
+    if (p && p.active && p.stages[p.currentIndex] === 'iherb') {
+        console.log('[pipeline] advancing past iherb due to captcha');
+        await advancePipelineStage();
+    } else {
+        // Legacy multi-account режим (без sequential pipeline) — мягко возвращаемся
+        // на primary; если и там captcha, finalReturn сам не зациклится.
+        await finalReturnToIherbPrimary().catch(e =>
+            console.warn('finalReturn after captcha-abort failed:', e?.message || e));
+    }
 }
 
 // Switch to next Amazon account for multi-account parsing
