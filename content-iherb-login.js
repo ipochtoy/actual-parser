@@ -124,8 +124,16 @@ const IS_LOGIN     = IS_NEW_LOGIN || IS_OLD_LOGIN;
     const cap = detectActiveCaptcha();
     if (cap.active) {
       console.warn(`🔐 [iHerb Login] active CAPTCHA detected (${cap.type})`);
-      sendFailed(email, 'captcha');
-      return;
+      // Пытаемся решить через 2captcha (reCAPTCHA с известным sitekey).
+      const solved = await trySolveCaptcha(cap);
+      if (solved) {
+        console.log('🔐 [iHerb Login] CAPTCHA solved via 2captcha, continuing');
+        // упали в нормальный flow ниже (redirect уже случился внутри trySolveCaptcha)
+      } else {
+        console.warn('🔐 [iHerb Login] CAPTCHA unsolved — skip account');
+        sendFailed(email, 'captcha');
+        return;
+      }
     }
   }
 
@@ -432,6 +440,110 @@ function extractRecaptchaSitekey() {
     if (m) return decodeURIComponent(m[1]);
   }
   return null;
+}
+
+// Бюджет на решение captcha. Если за это время не решили — caller уходит на
+// skip-фолбэк (см. pipeline resilience в background.iherbSwitchFailed).
+const CAPTCHA_SOLVE_BUDGET_MS = 60000;
+
+// Пытается решить captcha через 2captcha (background.solveCaptcha) и применить токен.
+// Возвращает true только если после применения мы реально ушли со страницы логина.
+// Решаем только reCAPTCHA с известным sitekey — Press&Hold/DataDome 2captcha-токеном
+// не закрыть, для них сразу false (→ skip).
+async function trySolveCaptcha(cap) {
+  const isRecaptcha = cap.type === 'recaptcha-challenge' || cap.type === 'recaptcha-checkbox';
+  if (!isRecaptcha || !cap.sitekey) {
+    console.warn(`🧩 [iHerb Login] captcha type "${cap.type}" not auto-solvable (no sitekey / unsupported)`);
+    return false;
+  }
+
+  const started = Date.now();
+  let token;
+  try {
+    const resp = await sendMessageAsync({
+      action: 'solveCaptcha',
+      sitekey: cap.sitekey,
+      pageurl: location.href.split('#')[0],
+      timeoutMs: CAPTCHA_SOLVE_BUDGET_MS
+    });
+    if (!resp || !resp.ok || !resp.token) {
+      console.warn('🧩 [iHerb Login] 2captcha did not return token:', resp && resp.reason);
+      return false;
+    }
+    token = resp.token;
+  } catch (e) {
+    console.warn('🧩 [iHerb Login] solveCaptcha message failed:', e?.message || e);
+    return false;
+  }
+
+  // Применяем токен в page-world (isolated content script не видит grecaptcha).
+  injectRecaptchaToken(token);
+  await sleep(800);
+
+  // Ре-сабмит формы — invisible reCAPTCHA после callback обычно сабмитит сам,
+  // но добиваем кликом по submit на случай если callback не сработал.
+  const submitBtn = document.querySelector(
+    '#auth-sign-in-button, #auth-continue-button, button[type="submit"], input[type="submit"]'
+  );
+  if (submitBtn && submitBtn.offsetParent !== null) {
+    try { submitBtn.click(); } catch (_) {}
+  }
+
+  // Ждём ухода со страницы логина в пределах оставшегося бюджета.
+  while (Date.now() - started < CAPTCHA_SOLVE_BUDGET_MS) {
+    await sleep(1000);
+    if (!/\/account\/(sign-in|login)/i.test(location.href)) return true;
+    // Если челлендж исчез и форма ушла — тоже успех
+    if (!detectActiveCaptcha().active && !/\/account\/(sign-in|login)/i.test(location.href)) return true;
+  }
+  return false;
+}
+
+// Инжектит g-recaptcha-response токен в page-world и дёргает зарегистрированные
+// callbacks через window.___grecaptcha_cfg (стандартная техника для headless-solve).
+function injectRecaptchaToken(token) {
+  const script = document.createElement('script');
+  script.textContent = `(function(token){
+    try {
+      document.querySelectorAll('textarea#g-recaptcha-response, textarea[name="g-recaptcha-response"], textarea[id^="g-recaptcha-response"]').forEach(function(t){
+        t.value = token;
+        t.dispatchEvent(new Event('input', { bubbles: true }));
+        t.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      var cfg = window.___grecaptcha_cfg;
+      if (cfg && cfg.clients) {
+        Object.keys(cfg.clients).forEach(function(cid){
+          var client = cfg.clients[cid];
+          Object.keys(client).forEach(function(k){
+            var branch = client[k];
+            if (branch && typeof branch === 'object') {
+              Object.keys(branch).forEach(function(kk){
+                var leaf = branch[kk];
+                if (leaf && typeof leaf === 'object' && typeof leaf.callback === 'function') {
+                  try { leaf.callback(token); } catch (e) {}
+                }
+              });
+            }
+          });
+        });
+      }
+    } catch (e) { console.warn('recaptcha token inject error', e); }
+  })(${JSON.stringify(token)});`;
+  (document.head || document.documentElement).appendChild(script);
+  script.remove();
+}
+
+// Promise-обёртка над chrome.runtime.sendMessage.
+function sendMessageAsync(msg) {
+  return new Promise((resolve, reject) => {
+    try {
+      chrome.runtime.sendMessage(msg, (resp) => {
+        const err = chrome.runtime.lastError;
+        if (err) reject(new Error(err.message));
+        else resolve(resp);
+      });
+    } catch (e) { reject(e); }
+  });
 }
 
 function sendFailed(email, reason) {

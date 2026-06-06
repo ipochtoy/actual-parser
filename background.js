@@ -1071,6 +1071,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             }
         })();
         return true;
+    } else if (request.action === "solveCaptcha") {
+        // Решение reCAPTCHA v2 через 2captcha. Вызывается из content-iherb-login.js
+        // когда detectActiveCaptcha нашёл ВИДИМЫЙ челлендж. Возвращает
+        // { ok:true, token } или { ok:false, reason }. Жёсткий тайм-аут — чтобы
+        // content script не висел дольше budget'а (см. pipeline resilience).
+        const { sitekey, pageurl, timeoutMs } = request;
+        solveRecaptchaVia2Captcha(sitekey, pageurl, timeoutMs || 60000)
+            .then(token => sendResponse({ ok: true, token }))
+            .catch(err => {
+                console.warn('🧩 [2captcha] solve failed:', err?.message || err);
+                sendResponse({ ok: false, reason: err?.message || String(err) });
+            });
+        return true; // async
     } else if (request.action === "parsingProgress") {
         // Handle parsingProgress from content scripts (convert to progress format)
         const progressData = request.data || {};
@@ -1175,6 +1188,53 @@ function saveParsingState() {
             storesCompleted
         }
     });
+}
+
+// ─── 2captcha reCAPTCHA-v2 solver ───
+// Решает reCAPTCHA через сервис 2captcha (in.php → poll res.php → token).
+// API-ключ берётся из chrome.storage.local.twoCaptchaApiKey (можно задать в popup).
+// Если ключа нет — кидаем 'no_api_key', чтобы caller сразу ушёл на skip-фолбэк
+// (не блокируя pipeline). timeoutMs — жёсткий бюджет на всё решение.
+async function solveRecaptchaVia2Captcha(sitekey, pageurl, timeoutMs = 60000) {
+    if (!sitekey) throw new Error('no_sitekey');
+    if (!pageurl) throw new Error('no_pageurl');
+
+    const cfg = await chrome.storage.local.get(['twoCaptchaApiKey']);
+    const apiKey = (cfg.twoCaptchaApiKey || '').trim();
+    if (!apiKey) throw new Error('no_api_key');
+
+    const deadline = Date.now() + timeoutMs;
+    console.log(`🧩 [2captcha] submitting reCAPTCHA (sitekey=${sitekey.slice(0, 12)}…, pageurl=${pageurl.slice(0, 60)})`);
+
+    // 1) Отправляем задание
+    const inUrl = `https://2captcha.com/in.php?key=${encodeURIComponent(apiKey)}` +
+        `&method=userrecaptcha&googlekey=${encodeURIComponent(sitekey)}` +
+        `&pageurl=${encodeURIComponent(pageurl)}&json=1`;
+    const inResp = await fetch(inUrl).then(r => r.json());
+    if (String(inResp.status) !== '1') {
+        throw new Error('in_php_error: ' + (inResp.request || 'unknown'));
+    }
+    const captchaId = inResp.request;
+    console.log(`🧩 [2captcha] job accepted id=${captchaId}, polling…`);
+
+    // 2) Поллим результат (2captcha рекомендует ждать ~15с до первого запроса,
+    //    но мы ограничены timeoutMs — стартуем через 12с, затем каждые 5с)
+    await new Promise(r => setTimeout(r, Math.min(12000, Math.max(0, deadline - Date.now()))));
+    const resUrl = `https://2captcha.com/res.php?key=${encodeURIComponent(apiKey)}` +
+        `&action=get&id=${encodeURIComponent(captchaId)}&json=1`;
+
+    while (Date.now() < deadline) {
+        const res = await fetch(resUrl).then(r => r.json()).catch(() => ({ status: 0, request: 'fetch_error' }));
+        if (String(res.status) === '1') {
+            console.log('🧩 [2captcha] solved');
+            return res.request; // g-recaptcha-response token
+        }
+        if (res.request && res.request !== 'CAPCHA_NOT_READY' && res.request !== 'CAPTCHA_NOT_READY') {
+            throw new Error('res_php_error: ' + res.request);
+        }
+        await new Promise(r => setTimeout(r, 5000));
+    }
+    throw new Error('solve_timeout');
 }
 
 // Switch to next Amazon account for multi-account parsing
