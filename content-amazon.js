@@ -16,6 +16,23 @@
       });
     });
   }
+
+  // Resolve current Amazon account email — used to stamp every parsed order
+  // with `account_name` so the sheet/AutoBuy can attribute rows to the right
+  // Amazon login. Falls back to accountsConfig primary when we're not in
+  // multi-account mode.
+  async function getAmazonAccount() {
+    const r = await chrome.storage.local.get(['multiAccountState', 'accountsConfig']);
+    if (r.multiAccountState && r.multiAccountState.currentAmazonAccount) {
+      return r.multiAccountState.currentAmazonAccount;
+    }
+    const cfg = r.accountsConfig;
+    if (cfg && cfg.amazon && cfg.amazon.length) {
+      const primary = cfg.amazon.find(a => a.isPrimary) || cfg.amazon[0];
+      return primary.email || '';
+    }
+    return '';
+  }
   
   // Current page number for logging
   let currentLogPage = 1;
@@ -62,8 +79,14 @@
   // Check for auto-parse flag on page load
   (async function checkAutoParse() {
     console.log('🔍 Checking for auto-parse flag...');
-    
-    const data = await chrome.storage.local.get(['autoParsePending', 'autoParse_amazon', 'autoParseTimestamp', 'accountSwitchInProgress', 'switchedToEmail']);
+
+    const data = await chrome.storage.local.get(['autoParsePending', 'autoParse_amazon', 'autoParseTimestamp', 'accountSwitchInProgress', 'switchedToEmail', 'amazonFinalReturn']);
+
+    // Гард: финальный возврат на ipochtoy — парс не запускаем
+    if (data.amazonFinalReturn) {
+      console.log('🏁 amazonFinalReturn=true — пропускаю auto-parse');
+      return;
+    }
     
     // Check if this is after account switch (multi-account parsing)
     if (data.accountSwitchInProgress) {
@@ -601,19 +624,35 @@
     const qty = extractQuantityFromDOM(scope);
     console.log(`  📊 QTY: ${qty}`);
 
-    // Queue screenshot for Telegram if enabled
-    chrome.storage.local.get(['multiAccountState', 'manualAccountName'], (res) => {
-      const acct = res.multiAccountState?.currentAmazonAccount || res.manualAccountName || '';
-      console.log('📸 Sending queueTrackScreenshot for ' + trackNumber + ' acct: ' + acct);
-      chrome.runtime.sendMessage({
-        action: 'queueTrackScreenshot',
-        orderId: individualOrderId,
-        trackNumber: trackNumber,
-        trackUrl: trackUrl,
-        accountName: acct
-      }, () => chrome.runtime.lastError);
-    });
+    // Anti-rate-limit: skip скрин если order > 14 дней. Дата ищется в order card
+    // (ближайший родитель с [data-order-id]) по паттерну "Order placed Month DD, YYYY".
+    const SCREENSHOT_MAX_AGE_DAYS = 14;
+    let skipForAge_1 = false;
+    const orderCard_1 = (scope.closest && scope.closest('[data-order-id]')) || scope;
+    const dateMatch_1 = (orderCard_1.textContent || '').match(/Order\s+placed\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})/i);
+    if (dateMatch_1) {
+      const orderTs_1 = Date.parse(dateMatch_1[1]);
+      if (orderTs_1 && (Date.now() - orderTs_1) > SCREENSHOT_MAX_AGE_DAYS * 24 * 60 * 60 * 1000) {
+        const ageDays_1 = Math.round((Date.now() - orderTs_1) / 86400000);
+        console.log('    ⏭️  Skip screenshot for ' + individualOrderId + ' (age ' + ageDays_1 + 'd > ' + SCREENSHOT_MAX_AGE_DAYS + 'd)');
+        skipForAge_1 = true;
+      }
+    }
+    if (!skipForAge_1) {
+      chrome.storage.local.get(['multiAccountState', 'manualAccountName'], (res) => {
+        const acct = res.multiAccountState?.currentAmazonAccount || res.manualAccountName || '';
+        console.log('📸 Sending queueTrackScreenshot for ' + trackNumber + ' acct: ' + acct);
+        chrome.runtime.sendMessage({
+          action: 'queueTrackScreenshot',
+          orderId: individualOrderId,
+          trackNumber: trackNumber,
+          trackUrl: trackUrl,
+          accountName: acct
+        }, () => chrome.runtime.lastError);
+      });
+    }
 
+    const accountName = await getAmazonAccount();
     return {
       store_name: "Amazon",
       order_id: individualOrderId,
@@ -621,7 +660,8 @@
       product_name: title,
       qty: qty,
       color: isMultiOrderShipment ? "⚠️ РАЗНЫЕ ЗАКАЗЫ" : "",
-      size: ""
+      size: "",
+      account_name: accountName
     };
   }
 
@@ -719,19 +759,33 @@
     const qty = extractQuantityFromDOM(scope);
     console.log(`  📊 QTY: ${qty}`);
 
-    // Queue screenshot for Telegram if enabled
-    chrome.storage.local.get(['multiAccountState', 'manualAccountName'], (res) => {
-      const acct = res.multiAccountState?.currentAmazonAccount || res.manualAccountName || '';
-      console.log('📸 Sending queueTrackScreenshot for ' + trackNumber + ' acct: ' + acct);
-      chrome.runtime.sendMessage({
-        action: 'queueTrackScreenshot',
-        orderId: orderId,
-        trackNumber: trackNumber,
-        trackUrl: trackUrl,
-        accountName: acct
-      }, () => chrome.runtime.lastError);
-    });
+    // Anti-rate-limit: skip скрин если order > 14 дней.
+    let skipForAge_2 = false;
+    const orderCard_2 = (scope.closest && scope.closest('[data-order-id]')) || scope;
+    const dateMatch_2 = (orderCard_2.textContent || '').match(/Order\s+placed\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})/i);
+    if (dateMatch_2) {
+      const orderTs_2 = Date.parse(dateMatch_2[1]);
+      if (orderTs_2 && (Date.now() - orderTs_2) > 14 * 24 * 60 * 60 * 1000) {
+        const ageDays_2 = Math.round((Date.now() - orderTs_2) / 86400000);
+        console.log('    ⏭️  Skip screenshot for ' + orderId + ' (age ' + ageDays_2 + 'd > 14d)');
+        skipForAge_2 = true;
+      }
+    }
+    if (!skipForAge_2) {
+      chrome.storage.local.get(['multiAccountState', 'manualAccountName'], (res) => {
+        const acct = res.multiAccountState?.currentAmazonAccount || res.manualAccountName || '';
+        console.log('📸 Sending queueTrackScreenshot for ' + trackNumber + ' acct: ' + acct);
+        chrome.runtime.sendMessage({
+          action: 'queueTrackScreenshot',
+          orderId: orderId,
+          trackNumber: trackNumber,
+          trackUrl: trackUrl,
+          accountName: acct
+        }, () => chrome.runtime.lastError);
+      });
+    }
 
+    const accountName = await getAmazonAccount();
     return {
       store_name: 'Amazon',
       order_id: orderId,
@@ -739,6 +793,7 @@
       product_name: title,
       qty: qty,
       source_url: productLink?.href || '',
+      account_name: accountName
     };
   }
 
@@ -1135,53 +1190,11 @@
       orders: state.allOrders 
     }).catch(() => {});
     
-    // ДУБЛИРУЮЩИЙ МЕХАНИЗМ: content script сам проверяет и переключает аккаунт
-    // Это работает надежно т.к. content script активен пока страница открыта
-    setTimeout(async () => {
-      console.log('🔄 Content script backup: checking for next account...');
-      const stored = await new Promise(resolve => 
-        chrome.storage.local.get(['multiAccountState', 'amazonParsingComplete'], resolve)
-      );
-      
-      // Если флаг всё еще есть (background не обработал) и есть следующий аккаунт
-      if (stored.amazonParsingComplete && stored.multiAccountState) {
-        const { isMultiAccountParsing, amazonAccountsQueue, currentAmazonAccount } = stored.multiAccountState;
-        
-        if (isMultiAccountParsing && amazonAccountsQueue && amazonAccountsQueue.length > 0) {
-          const nextEmail = amazonAccountsQueue[0];
-          console.log(`🔄 Content script: Background не обработал, переключаюсь на ${nextEmail}`);
-          
-          // Обновляем очередь
-          const newQueue = amazonAccountsQueue.slice(1);
-          await new Promise(resolve => {
-            chrome.storage.local.set({
-              amazonParsingComplete: null,
-              amazonPaginationState: null,
-              multiAccountState: {
-                isMultiAccountParsing: true,
-                amazonAccountsQueue: newQueue,
-                currentAmazonAccount: nextEmail
-              }
-            }, resolve);
-          });
-          
-          // Переходим на страницу смены аккаунта
-          const switchUrl = 'https://www.amazon.com/ap/signin?openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.amazon.com%2F%3Fref_%3Dnav_youraccount_switchacct&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.assoc_handle=usflex&openid.mode=checkid_setup&marketPlaceId=ATVPDKIKX0DER&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&switch_account=picker&ignoreAuthState=1&_encoding=UTF8';
-          window.location.href = switchUrl;
-        } else if (isMultiAccountParsing && (!amazonAccountsQueue || amazonAccountsQueue.length === 0)) {
-          console.log('✅ Content script: Последний аккаунт, завершаю multi-account');
-          await new Promise(resolve => {
-            chrome.storage.local.set({
-              amazonParsingComplete: null,
-              multiAccountState: null
-            }, resolve);
-          });
-        }
-      } else {
-        console.log('✅ Background обработал флаг или нет multi-account режима');
-      }
-    }, 5000); // Ждём 5 секунд, даём шанс background
-    
+    // НЕ переключаем аккаунт из content-скрипта — это делает watchdog в background.js.
+    // Гонка двух механизмов крала очередь скриншотов первого аккаунта (ipochtoy):
+    // SW успевал начать switch до того как processScreenshotQueue() обрабатывал очередь.
+    console.log('✅ Флаг amazonParsingComplete установлен — ждём watchdog в background');
+
     return { success: true, orders: state.allOrders };
   }
   
@@ -1240,8 +1253,31 @@
 
       showOverlay(`♻️ ПАРСИНГ: Страница ${state.currentPage}/${state.totalPages}...`, "#e67e22");
       
+      // HEARTBEAT прогресса во время разбора страницы.
+      // Прогресс-пинг иначе шлётся ТОЛЬКО в начале страницы (выше), а watchdog в
+      // background.js убивает аккаунт после 90с без прогресса (lastAmazonProgressAt).
+      // Свежепереключённый 2-й аккаунт (photopochtoy) Amazon придушивает → fetch'и
+      // трек-номеров идут медленно, страница 1 легко превышает 90с → ложный таймаут
+      // «no progress» → 0 заказов → 0 скринов. Пинг каждые 25с держит таймер живым,
+      // пока страница реально парсится. Это НЕ трогает ядро parseAmazonOrders().
+      const __hbPage = state.currentPage, __hbTotal = state.totalPages;
+      const __heartbeat = setInterval(() => {
+        try {
+          chrome.runtime.sendMessage({
+            action: 'progress', store: 'Amazon',
+            current: __hbPage - 1, total: __hbTotal,
+            status: `Страница ${__hbPage}/${__hbTotal} (обработка)...`
+          }, () => chrome.runtime.lastError);
+        } catch (e) { /* SW asleep, ignore */ }
+      }, 25000);
+
       // ВЫЗЫВАЕМ ОРИГИНАЛЬНЫЙ parseAmazonOrders() - НЕ ТРОНУТЫЙ!
-      const pageResult = await parseAmazonOrders(state.currentPage, state.totalPages);
+      let pageResult;
+      try {
+        pageResult = await parseAmazonOrders(state.currentPage, state.totalPages);
+      } finally {
+        clearInterval(__heartbeat);
+      }
       const pageOrders = pageResult.orders || [];
       console.log(`✅ Страница ${state.currentPage}: найдено ${pageOrders.length} заказов`);
       
