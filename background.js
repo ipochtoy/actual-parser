@@ -1445,6 +1445,18 @@ async function runPipelineStage(stageName) {
 async function waitForScreenshotsDrained(maxWaitMs = 10 * 60 * 1000) {
   if (!screenshotsEnabled) return;
   const start = Date.now();
+  // SW мог уснуть между queueTrackScreenshot и этим вызовом — in-memory очередь
+  // тогда пуста, а в storage скрины ещё ждут. Без restore цикл ниже не стартует
+  // и аккаунт переключится с недоснятыми скринами. Подтягиваем недостающие.
+  try {
+    const { trackScreenshotQueue: storedQ = [] } = await chrome.storage.local.get('trackScreenshotQueue');
+    if (Array.isArray(storedQ) && storedQ.length > trackScreenshotQueue.length) {
+      const seen = new Set(trackScreenshotQueue.map(x => x.trackNumber));
+      for (const item of storedQ) {
+        if (!seen.has(item.trackNumber)) trackScreenshotQueue.push(item);
+      }
+    }
+  } catch (_) {}
   while (trackScreenshotQueue.length > 0 || isProcessingScreenshots) {
     if (Date.now() - start > maxWaitMs) {
       console.warn('⏰ waitForScreenshotsDrained: timed out, advancing anyway');
@@ -2296,9 +2308,18 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             const accountName = currentAmazonAccount ? currentAmazonAccount.split('@')[0] : 'current';
             parseReport.stores[`amazon_${accountName}`] = { found: count, status: '✅' };
             
-            // Process screenshots for THIS account before moving on
-            if (screenshotsEnabled && trackScreenshotQueue.length > 0) {
-                await processScreenshotQueue();
+            // Process screenshots for THIS account before moving on.
+            // ВАЖНО: waitForScreenshotsDrained(), а НЕ голый processScreenshotQueue().
+            // У processScreenshotQueue есть re-entry guard (isProcessingScreenshots):
+            // если в этот момент скрины уже снимает другой вызов (хвост eBay/iHerb
+            // или минутный screenshotResume), голый `await` вернётся МГНОВЕННО, и
+            // switchToNextAmazonAccount переключит аккаунт, не доснявши скрины
+            // текущего. Страница трека Amazon открывается только под нужным
+            // аккаунтом → скрины первого аккаунта снимались под вторым и бились
+            // (симптом: «скрины только одного из двух аккаунтов»).
+            // waitForScreenshotsDrained крутится пока очередь реально не опустеет.
+            if (screenshotsEnabled) {
+                await waitForScreenshotsDrained();
             }
             
             if (isMultiAccountParsing && amazonAccountsQueue.length > 0) {
@@ -2357,9 +2378,36 @@ async function checkAllStoresCompleted() {
                 if (ss.skipped > 0) report += `, ${ss.skipped} уже было`;
                 if (ss.broken > 0) report += `, ${ss.broken} пропущено (битые)`;
                 if (ss.failed > 0) report += `, ${ss.failed} ошибок`;
+                // Разбивка по магазинам — сразу видно, если по iHerb внезапно мало скринов
+                const byShop = ss.byShop || {};
+                const shopParts = Object.entries(byShop).map(([s, n]) => `${s}: ${n}`);
+                if (shopParts.length) report += `\n   (${shopParts.join(', ')})`;
             }
-            
+
             report += `\n\n✅ Выгрузка в Google Sheets завершена`;
+
+            // Сохраняем сводку прогона в storage — чтобы «как прошло» можно было
+            // посмотреть в любой момент с цифрами, без раскопок. История — 20 прогонов. (2026-06-08)
+            try {
+                const runSummary = {
+                    finishedAt: Date.now(),
+                    durationSec: elapsed,
+                    stores: parseReport.stores,
+                    screenshots: parseReport.screenshots,
+                    report
+                };
+                const prev = await chrome.storage.local.get(['parseRunSummaries']);
+                const history = Array.isArray(prev.parseRunSummaries) ? prev.parseRunSummaries : [];
+                history.push(runSummary);
+                await chrome.storage.local.set({
+                    parseReport,
+                    parseReportTimestamp: Date.now(),
+                    parseRunSummaries: history.slice(-20)
+                });
+            } catch (e) {
+                console.warn('⚠️ Не удалось сохранить сводку прогона:', e?.message || e);
+            }
+
             sendTelegramMessage(report);
         }, 1000);
     }
@@ -3413,6 +3461,9 @@ async function processScreenshotQueue() {
     while (trackScreenshotQueue.length > 0) {
         const item = trackScreenshotQueue.shift();
         done++;
+        // Магазин по trackUrl — чтобы в сводке прогона видеть «сколько скринов ушло по iHerb / Amazon / eBay»
+        const u = String(item.trackUrl || '');
+        const shop = /iherb\.com/i.test(u) ? 'iherb' : /amazon\./i.test(u) ? 'amazon' : /ebay\./i.test(u) ? 'ebay' : 'other';
         try {
             const result = await captureTrackScreenshot(item, done, total, reuseTab?.id);
             if (result === 'CAPTCHA') {
@@ -3424,6 +3475,8 @@ async function processScreenshotQueue() {
             }
             sentTracks.push(item.trackNumber);
             parseReport.screenshots.sent++;
+            parseReport.screenshots.byShop = parseReport.screenshots.byShop || {};
+            parseReport.screenshots.byShop[shop] = (parseReport.screenshots.byShop[shop] || 0) + 1;
             await markAsSent([item.trackNumber]);
             persistScreenshotQueue();
             // Update progress message
