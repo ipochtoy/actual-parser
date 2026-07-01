@@ -1,5 +1,5 @@
-/* content-ebay.js — v7.7.1 (silence benign MV3 messaging noise + softer page delay) */
-console.log('🔧 eBay Parser v7.7.1 loaded');
+/* content-ebay.js — v7.7.2 (scan FULL history: raise page cap + stop only on empty page) */
+console.log('🔧 eBay Parser v7.7.2 loaded');
 
 // Silence the benign MV3 console flood during long scans. Fire-and-forget
 // chrome.runtime.sendMessage() calls (progress/parserStarted/updatePopup)
@@ -312,7 +312,12 @@ async function parseEbayOrders() {
   let allOrders = [];
   let page = 1;
   let hasMore = true;
-  const MAX_PAGES = 40;
+  // Safety cap only — the REAL terminator is an empty page (see the items-length
+  // check below). This account (flysell2010) has ~59 pages / 1510 orders; the old
+  // MAX_PAGES=40 silently cut the scan at page 40, hiding ~500 orders on pages
+  // 41-60 (that's the "some orders never get scanned" the operator reported).
+  // 120 leaves generous headroom as the history grows.
+  const MAX_PAGES = 120;
   // Per-page retry on transient errors (invalid JSON / upstream error). eBay
   // rate-limits the rapid multi-page fetch and returns non-JSON for a page;
   // the old code silently skipped that whole page (26 orders lost — e.g. order
@@ -429,14 +434,17 @@ async function parseEbayOrders() {
         });
       }
 
-      if (items && items.length < 20) {
-        hasMore = false;
-      } else {
+      // End-of-history is detected ONLY by an EMPTY page (items.length === 0,
+      // handled above → hasMore=false). The old code stopped on the first page
+      // with <20 items, but eBay occasionally returns a short mid-history batch
+      // (antibot throttling / partial payload) — that heuristic then truncated
+      // the whole scan and lost every order after it. A genuinely last partial
+      // page just advances once more into the empty page and stops naturally.
+      if (hasMore) {
         page++;
         // 1000ms (was 500ms) between pages — a modest slowdown to ease eBay's
         // antibot (PerimeterX served non-JSON HTML for some pages at 500ms).
-        // The per-page retry-with-backoff below is the real safety net; 1500ms
-        // roughly tripled scan time and only worsened the idle-SW noise, so 1s.
+        // The per-page retry-with-backoff above is the real safety net.
         await new Promise(r => setTimeout(r, 1000));
       }
     }
