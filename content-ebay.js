@@ -1,5 +1,5 @@
-/* content-ebay.js — v7.7.1 (silence benign MV3 messaging noise + softer page delay) */
-console.log('🔧 eBay Parser v7.7.1 loaded');
+/* content-ebay.js — v7.7.5 (feed-only by default: detail-page tracking enrichment gated OFF to avoid soft-ban; page-loop fetch timeout+retry) */
+console.log('🔧 eBay Parser v7.7.5 loaded');
 
 // Silence the benign MV3 console flood during long scans. Fire-and-forget
 // chrome.runtime.sendMessage() calls (progress/parserStarted/updatePopup)
@@ -343,13 +343,37 @@ async function parseEbayOrders() {
 
       const url = `https://www.ebay.com/mye/myebay/ajax/v2/purchase/mp/get?filter=year_filter:${year}&page=${page}&modules=ALL_TRANSACTIONS&moduleId=122164&pg=purchase&mp=purchase-module-v2`;
 
-      const response = await fetch(url, {
-        credentials: 'include',
-        headers: { 'Accept': 'application/json' }
-      });
-
-      // Check if response is valid JSON before parsing
-      const responseText = await response.text();
+      // Hard timeout: a hung page fetch (eBay sometimes stalls the connection) must
+      // not freeze the whole scan forever with no log. Abort at 20s and retry the page.
+      let responseText;
+      {
+        const ac = new AbortController();
+        const to = setTimeout(() => ac.abort(), 20000);
+        try {
+          const response = await fetch(url, {
+            credentials: 'include',
+            headers: { 'Accept': 'application/json' },
+            signal: ac.signal
+          });
+          responseText = await response.text();
+        } catch (netErr) {
+          if (pageAttempt < MAX_PAGE_RETRIES) {
+            pageAttempt++;
+            const backoff = 2000 * pageAttempt;
+            console.warn(`⏳ Page ${page} fetch failed (${netErr.name}) — retry ${pageAttempt}/${MAX_PAGE_RETRIES} in ${backoff}ms`);
+            sendLog('-', '-', '⚠️ Fetch timeout (retry)', `Page ${page} attempt ${pageAttempt}/${MAX_PAGE_RETRIES}`);
+            await new Promise(r => setTimeout(r, backoff));
+            continue;
+          }
+          console.error(`❌ Page ${page} fetch failed ${MAX_PAGE_RETRIES}x (${netErr.name}) — skipping`);
+          sendLog('-', '-', '❌ Page LOST', `Page ${page}: fetch failed ${MAX_PAGE_RETRIES}x — its orders were skipped`);
+          pageAttempt = 0;
+          page++;
+          continue;
+        } finally {
+          clearTimeout(to);
+        }
+      }
 
       // Handle eBay upstream errors (temporary server issues)
       if (responseText.includes('upstream connect error') || responseText.includes('error') && responseText.length < 200) {
@@ -441,6 +465,15 @@ async function parseEbayOrders() {
       }
     }
 
+    // Recover tracking for orders that had NONE in the list feed by reading each
+    // order's detail page (order.ebay.com/ord/show) via the background SW (see
+    // enrichMissingTrackings). Mutates allOrders in place.
+    await enrichMissingTrackings(allOrders);
+    // Drop entries STILL without tracking (genuinely un-shipped) and strip the internal
+    // flag, preserving the original "sheet gets only trackable shipments" contract.
+    allOrders = allOrders.filter(o => o && o.track_number);
+    allOrders.forEach(o => { delete o._needsDetailTracking; });
+
     console.log(`📊 TOTAL: ${allOrders.length} orders`);
 
     // Save orders to storage (store-specific)
@@ -490,6 +523,82 @@ async function parseEbayOrders() {
   } catch (error) {
     console.error('❌ Error:', error);
     throw error;
+  }
+}
+
+// Post-parse: fill in tracking for orders that had NONE in the purchase-history list
+// feed by reading each order's DETAIL page (order.ebay.com/ord/show). The tracking sits
+// in the detail SPA's embedded JSON (trackingSection → label "Number" → value). Content
+// scripts can't fetch order.ebay.com cross-origin (CORS), so the actual fetch happens in
+// the background SW via the 'fetchEbayOrderTracking' message. Sequential + small delay to
+// stay gentle on eBay; only the (usually few) feed-untracked orders are looked up.
+async function enrichMissingTrackings(allOrders) {
+  const pending = allOrders.filter(o => o && o._needsDetailTracking && o.order_id && o.order_id !== 'N/A');
+  if (pending.length === 0) return;
+  // ⚠️ Detail-page tracking recovery is DISABLED by default. Fetching order.ebay.com
+  // per-order is exactly what triggers eBay's soft-ban (limitexceeded.html, ~24h) — see
+  // AutoBuy CLAUDE.md rule #11. This path stays dormant until it can be re-verified as a
+  // gentle, throttled, new-orders-only pass. Enable with:
+  //   chrome.storage.local.set({ ebayDetailEnrichmentEnabled: true })
+  // Without it, eBay parses the LIST FEED only (no extra hits, no ban) and any order whose
+  // tracking isn't in the feed is simply picked up on a later run once the feed carries it.
+  try {
+    const flag = await chrome.storage.local.get(['ebayDetailEnrichmentEnabled']);
+    if (!flag || flag.ebayDetailEnrichmentEnabled !== true) {
+      console.log(`⏭ ${pending.length} feed-untracked order(s) — detail-page enrichment is disabled (feed-only, ban-safe)`);
+      return;
+    }
+  } catch (_) { return; }
+  const orderIds = Array.from(new Set(pending.map(o => o.order_id)));
+  console.log(`🔎 ${orderIds.length} order(s) had no tracking in the list feed — checking order-detail pages...`);
+  sendLog('-', '-', '🔎 Enrich start', `${orderIds.length} feed-untracked order(s) — reading detail pages`);
+
+  // Fetch the WHOLE batch in ONE message. The background SW loops through all the
+  // detail-page fetches in a single active run, so it stays alive and won't idle-die
+  // mid-way (many small messages with delays between them let the SW sleep, and a
+  // dropped async response then hangs the parse forever). The timeout is a safety net
+  // so a lost response can never wedge the parse — worst case we recover nothing this
+  // run and pick the orders up next run.
+  let map = {};
+  try {
+    map = await new Promise((resolve) => {
+      let settled = false;
+      const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+      const timer = setTimeout(() => { console.warn('⏱ tracking-enrichment batch timed out'); done({}); },
+                               orderIds.length * 3000 + 15000);
+      try {
+        chrome.runtime.sendMessage({ action: 'fetchEbayOrderTrackings', orderIds }, (resp) => {
+          clearTimeout(timer);
+          if (chrome.runtime.lastError) { done({}); return; }
+          done((resp && resp.map) || {});
+        });
+      } catch (_) { clearTimeout(timer); done({}); }
+    });
+  } catch (_) { map = {}; }
+
+  const recovered = Object.values(map).filter(Boolean).length;
+  sendLog('-', '-', '🔎 Enrich done', `recovered ${recovered}/${orderIds.length} from detail pages`);
+  for (const orderId of orderIds) {
+    const tracking = map[orderId] || '';
+    if (tracking) {
+      for (const o of allOrders) {
+        if (o.order_id === orderId && !o.track_number) o.track_number = tracking;
+      }
+      console.log(`   ✅ ${orderId}: recovered tracking ${tracking} from order-details page`);
+      sendLog(orderId, tracking, '✅ Found (detail)', 'tracking recovered from order-details page');
+      // Queue the same order-page screenshot that feed-tracked orders get.
+      try {
+        chrome.runtime.sendMessage({
+          action: 'queueTrackScreenshot',
+          orderId,
+          trackNumber: tracking,
+          trackUrl: `https://order.ebay.com/ord/show?orderid=${orderId}`,
+          accountName: __ebayAccountName || 'ebay'
+        }, () => chrome.runtime.lastError);
+      } catch (_) {}
+    } else {
+      console.log(`   ⏭ ${orderId}: still no tracking (genuinely un-shipped) — will drop`);
+    }
   }
 }
 
@@ -643,10 +752,20 @@ function parseItem(item) {
     // Collect distinct trackings that actually belong to THIS order's cards.
     const trackingsInOrder = Array.from(new Set(entries.map(e => e.track_number).filter(Boolean)));
 
-    // If NO card in this order has a real tracking → order not yet shipped, skip entirely.
-    // Don't queue a screenshot (would show "Tracking available" not reached) and don't write
-    // to sheet (sheet consumer expects only trackable shipments).
-    if (trackingsInOrder.length === 0) return null;
+    // If NO card in this order has a real tracking in the LIST FEED, don't drop the order
+    // yet — some carriers/orders expose the tracking ONLY on the order-DETAIL page
+    // (order.ebay.com/ord/show), never in this feed. Example: order 24-14770-78524
+    // (MacBook, FedEx 873223053751) has zero trackingNumber in the feed but a real
+    // "Tracking details → Number" on its detail page. Tag the entries so the post-parse
+    // enrichMissingTrackings() step can recover the tracking via the background SW.
+    // Orders that are genuinely un-shipped (no tracking even on the detail page) are
+    // dropped later by the caller, so the sheet still gets only trackable shipments.
+    if (trackingsInOrder.length === 0) {
+      if (orderId && orderId !== 'N/A') {
+        return entries.map(e => ({ ...e, _needsDetailTracking: true }));
+      }
+      return null;
+    }
 
     // Queue ONE screenshot per order (the /ord/show page contains all items + all trackings).
     // queueTrackScreenshot dedupes by orderId for order-page URLs and merges extra trackings

@@ -933,6 +933,45 @@ async function handleProgressMessage(request) {
 }
 
 // --- Message Listener ---
+// Fetch an eBay order's tracking number from its DETAIL page. Some orders/carriers
+// (e.g. FedEx order 24-14770-78524 → 873223053751) expose the tracking ONLY in the
+// order-details SPA (order.ebay.com/ord/show), never in the purchase-history list feed
+// the parser reads. The value sits in embedded JSON: trackingSection → label "Number"
+// → value. This is cross-origin from the parser's www.ebay.com tab, so it MUST run in
+// the background SW (host_permissions <all_urls> bypasses CORS). Returns '' on miss.
+async function fetchEbayOrderTracking(orderId) {
+    if (!orderId || orderId === 'N/A') return '';
+    try {
+        const url = `https://order.ebay.com/ord/show?orderId=${encodeURIComponent(orderId)}`;
+        // Hard timeout: one hung detail fetch must never wedge the whole batch.
+        const ac = new AbortController();
+        const to = setTimeout(() => ac.abort(), 12000);
+        let r;
+        try { r = await fetch(url, { credentials: 'include', signal: ac.signal }); }
+        finally { clearTimeout(to); }
+        if (!r.ok) return '';
+        const html = await r.text();
+        // Anchor on trackingSection so an unrelated number elsewhere can't be grabbed.
+        const m = html.match(/"trackingSection"[\s\S]*?"text":"Number"[\s\S]{0,220}?"text":"([A-Z0-9]{8,30})"/);
+        return m ? m[1] : '';
+    } catch (_) {
+        return '';
+    }
+}
+
+// Batch variant: fetch tracking for many orders in ONE active run so the SW stays
+// alive throughout (a single content-script message → one long busy loop, instead of
+// many small messages with idle gaps that let the SW sleep and drop the async reply,
+// hanging the parse). Returns { [orderId]: tracking }.
+async function fetchEbayOrderTrackings(orderIds) {
+    const out = {};
+    for (const orderId of (orderIds || [])) {
+        out[orderId] = await fetchEbayOrderTracking(orderId);
+        await new Promise(r => setTimeout(r, 500)); // gentle pacing between detail fetches
+    }
+    return out;
+}
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // Debug logs for messages
     if (request.action !== 'progress' && request.action !== 'addLog') { // Reduce noise
@@ -1119,6 +1158,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         // persistent step-log of Amazon multi-account flow for diagnostics.
         logMultiAccountStep(request.step, request.detail || {});
         sendResponse({status: "logged"});
+    } else if (request.action === "fetchEbayOrderTracking") {
+        // Parser found no tracking in the list feed for this order — read it from the
+        // order-detail page (cross-origin; only the background SW can, due to CORS).
+        fetchEbayOrderTracking(request.orderId)
+            .then(tracking => sendResponse({ ok: true, tracking }))
+            .catch(err => sendResponse({ ok: false, tracking: '', error: String(err?.message || err) }));
+        return true; // async
+    } else if (request.action === "fetchEbayOrderTrackings") {
+        // Batch: recover tracking for all feed-untracked orders from their detail pages.
+        fetchEbayOrderTrackings(request.orderIds)
+            .then(map => sendResponse({ ok: true, map }))
+            .catch(err => sendResponse({ ok: false, map: {}, error: String(err?.message || err) }));
+        return true; // async
     } else if (request.action === "queueTrackScreenshot") {
         queueTrackScreenshot(request.orderId, request.trackNumber, request.trackUrl, request.accountName);
         sendResponse({status: "queued"});
@@ -1417,6 +1469,17 @@ async function startSequentialPipeline() {
 
 async function runPipelineStage(stageName) {
   console.log(`🎬 runPipelineStage: ${stageName}`);
+  // Stamp when THIS stage started, so handlePipelineWatchdog can force-advance a stage
+  // that hangs. eBay had no safety-net; a hung eBay froze the whole nightly run and the
+  // Google Sheets upload with it (blackout from 2026-06-15).
+  if (stageName !== 'done') {
+    try {
+      const st = await chrome.storage.local.get(['pipelineStage']);
+      if (st.pipelineStage) {
+        await chrome.storage.local.set({ pipelineStage: { ...st.pipelineStage, stageStartedAt: Date.now(), stageName } });
+      }
+    } catch (_) {}
+  }
   if (stageName === 'iherb') {
     return startMultiAccountIherbParsing();
   }
@@ -1428,8 +1491,12 @@ async function runPipelineStage(stageName) {
   }
   if (stageName === 'done') {
     isParsingAllStores = false;
+    // Honest terminal status — was previously stuck at 'started' forever, so "как прошёл
+    // ночной парс" always looked in-progress even when the run had long finished/frozen.
     await chrome.storage.local.set({
-      pipelineStage: { active: false, stages: PIPELINE_STAGES, currentIndex: PIPELINE_STAGES.length - 1, startedAt: null }
+      pipelineStage: { active: false, stages: PIPELINE_STAGES, currentIndex: PIPELINE_STAGES.length - 1, startedAt: null, stageStartedAt: null },
+      lastDailyAutoParseStatus: 'completed',
+      lastDailyAutoParseFinishedAt: Date.now()
     });
     sendTelegramMessage('✅ Sequential pipeline done').catch(() => {});
     return;
@@ -2044,6 +2111,55 @@ const IHERB_PARSE_TIMEOUT_MS = 240_000; // 4 min hard cap для самого п
 const IHERB_SWITCH_TIMEOUT_MS = 5 * 60_000;
 chrome.alarms.create(IHERB_WATCHDOG_ALARM, { delayInMinutes: 1, periodInMinutes: 1 });
 
+// ─── Pipeline stage watchdog ──────────────────────────────────────────────
+// Every stage EXCEPT eBay already had a safety-net (iHerb: 45s advance + iherbParseWatchdog;
+// Amazon: amazonCompletionWatchdog). eBay had NONE — a hung eBay fetch left
+// pipelineStage stuck at currentIndex='ebay' forever: Amazon never started and the
+// FINAL Google Sheets upload (gated on storesCompleted.ebay && .iherb && .amazon) never
+// fired. That silently froze the nightly upload for ALL stores from 2026-06-15 onward.
+// This watchdog force-advances ANY stage that overruns its cap, so the run always reaches
+// 'done' and uploads — even if one store is broken or rate-limited (eBay limitexceeded).
+const PIPELINE_WATCHDOG_ALARM = 'pipelineStageWatchdog';
+const PIPELINE_STAGE_MAX_MS = {
+  iherb: 12 * 60_000,  // multi-account, longest
+  ebay:  6 * 60_000,   // 40 pages + detail-page tracking enrichment; generous
+  amazon: 15 * 60_000  // multi-account; has its own watchdog too, this is a backstop
+};
+chrome.alarms.create(PIPELINE_WATCHDOG_ALARM, { delayInMinutes: 1, periodInMinutes: 1 });
+
+async function handlePipelineWatchdog() {
+  const r = await chrome.storage.local.get(['pipelineStage']);
+  const p = r.pipelineStage;
+  if (!p || !p.active) return;
+  const stage = p.stages[p.currentIndex];
+  if (stage === 'done') return;
+  // stageStartedAt is stamped in runPipelineStage; fall back to pipeline startedAt.
+  const startedAt = p.stageStartedAt || p.startedAt || 0;
+  if (!startedAt) return;
+  const elapsed = Date.now() - startedAt;
+  const cap = PIPELINE_STAGE_MAX_MS[stage] || 15 * 60_000;
+  if (elapsed < cap) return;
+
+  console.warn(`[pipelineWatchdog] stage '${stage}' stuck ${Math.round(elapsed/1000)}s (cap ${Math.round(cap/1000)}s) — force-advancing so the run can still upload`);
+  // Mark the stuck store 'completed' so the final upload gate can pass without it.
+  // It TIMED OUT (not succeeded) — its data just won't be fresh this run; the other
+  // stores still upload. Mirrors the proven iHerb-watchdog pattern (storesCompleted +
+  // checkAllStoresCompleted from alarm context).
+  if (stage === 'ebay' || stage === 'iherb' || stage === 'amazon') {
+    if (typeof storesCompleted === 'object') storesCompleted[stage] = true;
+    setParserLock(stage, false);
+    try { if (!parseReport.stores[stage]) parseReport.stores[stage] = { found: 0, status: '⏱' }; } catch (_) {}
+  }
+  sendTelegramMessage(`⏱ Парс: стадия «${stage}» зависла (${Math.round(elapsed/60000)} мин) — пропускаю, чтобы прогон дошёл до выгрузки в таблицу`).catch(() => {});
+  // Guard: only advance if we're still on the stuck stage (a late real 'Done ✅' may
+  // have advanced it already — then this is a no-op via advancePipelineStage's checks).
+  const cur = (await chrome.storage.local.get(['pipelineStage'])).pipelineStage;
+  if (cur && cur.active && cur.stages[cur.currentIndex] === stage) {
+    await advancePipelineStage();
+  }
+  if (typeof checkAllStoresCompleted === 'function') checkAllStoresCompleted();
+}
+
 function startCompletionWatchdog() {
     console.log('👀 Starting completion watchdog with chrome.alarms...');
     // Create alarm that fires every 5 seconds (minimum is 0.5 minutes for production, but we use 0.1 for dev)
@@ -2206,6 +2322,11 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 
     if (alarm.name === IHERB_WATCHDOG_ALARM) {
         await handleIherbWatchdog().catch(e => console.warn('[iherbWatchdog] error:', e?.message || e));
+        return;
+    }
+
+    if (alarm.name === PIPELINE_WATCHDOG_ALARM) {
+        await handlePipelineWatchdog().catch(e => console.warn('[pipelineWatchdog] error:', e?.message || e));
         return;
     }
 
