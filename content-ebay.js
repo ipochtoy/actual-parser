@@ -1,5 +1,5 @@
-/* content-ebay.js — v7.6.0 (FedEx 12/15-digit tracking support) */
-console.log('🔧 eBay Parser v7.6.0 loaded');
+/* content-ebay.js — v7.7.0 (retry failed pages w/ backoff + FedEx tracking) */
+console.log('🔧 eBay Parser v7.7.0 loaded');
 
 let PARSE_MODE = 'warehouse'; // 'warehouse' or 'financial'
 // Guard against double-parse (both flag + message could trigger)
@@ -300,6 +300,13 @@ async function parseEbayOrders() {
   let page = 1;
   let hasMore = true;
   const MAX_PAGES = 40;
+  // Per-page retry on transient errors (invalid JSON / upstream error). eBay
+  // rate-limits the rapid multi-page fetch and returns non-JSON for a page;
+  // the old code silently skipped that whole page (26 orders lost — e.g. order
+  // 24-14770-78524 vanished when page 8 came back as invalid JSON). Now we retry
+  // the SAME page with backoff before giving up, for ALL pages (not just ≤2).
+  const MAX_PAGE_RETRIES = 4;
+  let pageAttempt = 0;
 
   try {
     while (hasMore && page <= MAX_PAGES) {
@@ -334,14 +341,18 @@ async function parseEbayOrders() {
       // Handle eBay upstream errors (temporary server issues)
       if (responseText.includes('upstream connect error') || responseText.includes('error') && responseText.length < 200) {
         console.warn(`⚠️ eBay API error on page ${page}: ${responseText.substring(0, 100)}`);
-        sendLog('-', '-', '⚠️ API Error', `Page ${page}: ${responseText.substring(0, 50)}`);
-        // Retry this page after a delay
-        if (page <= 2) {
-          console.log('⏳ Retrying page in 3 seconds...');
-          await new Promise(r => setTimeout(r, 3000));
-          continue; // Retry same page
+        if (pageAttempt < MAX_PAGE_RETRIES) {
+          pageAttempt++;
+          const backoff = 2000 * pageAttempt; // 2s, 4s, 6s, 8s
+          console.log(`⏳ Retrying page ${page} in ${backoff}ms (attempt ${pageAttempt}/${MAX_PAGE_RETRIES})...`);
+          sendLog('-', '-', '⚠️ API Error (retry)', `Page ${page} attempt ${pageAttempt}/${MAX_PAGE_RETRIES}, waiting ${backoff}ms`);
+          await new Promise(r => setTimeout(r, backoff));
+          continue; // Retry SAME page (page unchanged)
         }
-        // For later pages, just skip and continue
+        // Exhausted retries — LOUD skip so lost orders aren't invisible
+        console.error(`❌ Page ${page} failed ${MAX_PAGE_RETRIES}x (upstream error) — skipping, orders on it are LOST`);
+        sendLog('-', '-', '❌ Page LOST', `Page ${page}: upstream error ${MAX_PAGE_RETRIES}x — its orders were skipped`);
+        pageAttempt = 0;
         page++;
         continue;
       }
@@ -351,10 +362,24 @@ async function parseEbayOrders() {
         data = JSON.parse(responseText);
       } catch (parseError) {
         console.error(`❌ JSON parse error on page ${page}:`, responseText.substring(0, 100));
-        sendLog('-', '-', '❌ Parse Error', `Page ${page}: Invalid JSON response`);
+        if (pageAttempt < MAX_PAGE_RETRIES) {
+          pageAttempt++;
+          const backoff = 2000 * pageAttempt; // 2s, 4s, 6s, 8s
+          console.log(`⏳ Retrying page ${page} in ${backoff}ms (attempt ${pageAttempt}/${MAX_PAGE_RETRIES})...`);
+          sendLog('-', '-', '⚠️ Parse Error (retry)', `Page ${page} attempt ${pageAttempt}/${MAX_PAGE_RETRIES}, waiting ${backoff}ms`);
+          await new Promise(r => setTimeout(r, backoff));
+          continue; // Retry SAME page (page unchanged)
+        }
+        // Exhausted retries — LOUD skip so lost orders aren't invisible
+        console.error(`❌ Page ${page} invalid JSON ${MAX_PAGE_RETRIES}x — skipping, orders on it are LOST`);
+        sendLog('-', '-', '❌ Page LOST', `Page ${page}: invalid JSON ${MAX_PAGE_RETRIES}x — its orders were skipped`);
+        pageAttempt = 0;
         page++;
         continue; // Skip this page
       }
+
+      // Page parsed cleanly — reset the per-page retry counter for the next page.
+      pageAttempt = 0;
 
       let items = data.modules?.RIVER?.[0]?.data?.items || data.data?.modules?.RIVER?.[0]?.data?.items;
 
@@ -395,7 +420,9 @@ async function parseEbayOrders() {
         hasMore = false;
       } else {
         page++;
-        await new Promise(r => setTimeout(r, 500));
+        // 1500ms (was 500ms) between pages — eBay rate-limited the faster cadence
+        // and returned non-JSON for some pages, which we then lost.
+        await new Promise(r => setTimeout(r, 1500));
       }
     }
 
