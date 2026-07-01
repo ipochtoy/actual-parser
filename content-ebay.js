@@ -1,9 +1,24 @@
-/* content-ebay.js — v7.5.1 (Reliable auto-parse with retry fallback) */
-console.log('🔧 eBay Parser v7.5.1 loaded');
+/* content-ebay.js — v7.6.0 (FedEx 12/15-digit tracking support) */
+console.log('🔧 eBay Parser v7.6.0 loaded');
 
 let PARSE_MODE = 'warehouse'; // 'warehouse' or 'financial'
 // Guard against double-parse (both flag + message could trigger)
 let isParsingInProgress = false;
+
+// eBay account email (single account in this extension). Preloaded by
+// parseEbayOrders() before calling parseItem() so every row carries it.
+let __ebayAccountName = '';
+
+async function getEbayAccount() {
+  try {
+    const r = await chrome.storage.local.get(['accountsConfig']);
+    const cfg = r.accountsConfig;
+    if (cfg && cfg.ebay && cfg.ebay[0]) return cfg.ebay[0].email || '';
+    return '';
+  } catch (_) {
+    return '';
+  }
+}
 
 // Save log entry directly to storage
 async function sendLog(orderId, trackNumber, status, details) {
@@ -240,6 +255,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 async function parseEbayOrders() {
   console.log(`🚀 parseEbayOrders() started (Mode: ${PARSE_MODE})`);
   console.log('📍 Current URL:', window.location.href);
+
+  // Resolve eBay account_name BEFORE we call parseItem() so every row
+  // carries it. eBay has only one account in this extension.
+  __ebayAccountName = await getEbayAccount();
+  console.log(`👤 eBay account_name: ${__ebayAccountName || '(empty)'}`);
 
   // Wait a bit for page to fully load
   await new Promise(resolve => setTimeout(resolve, 1000));
@@ -519,41 +539,36 @@ function parseItem(item) {
         // Priority 4: UPU format
         const upu = up.match(/\b([A-Z]{2}\d{9}[A-Z]{2})\b/);
         if (upu) return upu[1];
+        // Priority 5: FedEx — bare 12- or 15-digit numeric (e.g. 873223053751).
+        // Safe here because `trackingNumber` param holds ONLY a real track, not
+        // arbitrary page text, so a loose numeric match won't grab noise.
+        const fedex = up.match(/\b(\d{15}|\d{12})\b/);
+        if (fedex) return fedex[1];
       } catch (_) {}
       return '';
     };
 
-    const extractTracking = () => {
-      // 1) From any actionList entry in card
-      const actions = (firstCard?.__myb?.actionList || []).concat(item?.__myb?.actionList || []);
+    // Per-card tracking extraction — look ONLY at THIS card's __myb.actionList.
+    // Earlier versions concatenated firstCard + item-level actionList and fell back to
+    // item-level "typical" fields, which leaked one shipment's tracking onto unshipped
+    // siblings (see bug: order 05-14528-97460 had firstCard tracking slapped onto the
+    // not-yet-shipped TOMS; order 21-14502-88603 inherited 88602's tracking via item-level
+    // fields). Strict per-card lookup makes the bot skip genuinely un-shipped items.
+    const extractCardTracking = (card) => {
+      if (!card) return '';
+      const actions = card?.__myb?.actionList || [];
       for (const a of actions) {
         const tn = a?.action?.params?.trackingNumber;
         const best = pickBestTracking(tn);
         if (best) return best;
       }
-      // 1b) Shallow search for typical fields (safe subset)
-      const typical = [
-        item?.trackingNumber,
-        item?.shipmentTrackingNumber,
-        item?.packageTrackingNumber,
-        firstCard?.trackingNumber
-      ];
-      for (const v of typical) {
-        const best = pickBestTracking(v);
-        if (best) return best;
-      }
-      // 2) From params
-      {
-        const best = pickBestTracking(params?.trackingNumber);
-        if (best) return best;
-      }
       return '';
     };
-    const trackingNumber = extractTracking();
-    if (!trackingNumber) return null; // skip items without a real tracking number
 
-    // Build entries for all items in Multiple items
+    // Build entries for all items in Multiple items, each with ITS OWN tracking.
     const entries = cards.map(card => {
+      const cardTracking = extractCardTracking(card);
+
       let quantity = 1;
       if (typeof card?.quantity === 'number') quantity = card.quantity;
       else if (params?.quantity) quantity = parseInt(params.quantity, 10) || quantity;
@@ -572,17 +587,44 @@ function parseItem(item) {
       return {
         store_name: 'eBay',
         order_id: orderId,
-        track_number: trackingNumber || '',
+        track_number: cardTracking,
         product_name: title,
         qty: quantity,
         color: color || '',
         size: size || '',
-        financial: financial, // Add financial object
-        total_amount: financial.total_amount // Add for direct access
+        financial: financial,
+        total_amount: financial.total_amount,
+        account_name: __ebayAccountName || ''
       };
     });
 
-    return entries;
+    // Collect distinct trackings that actually belong to THIS order's cards.
+    const trackingsInOrder = Array.from(new Set(entries.map(e => e.track_number).filter(Boolean)));
+
+    // If NO card in this order has a real tracking → order not yet shipped, skip entirely.
+    // Don't queue a screenshot (would show "Tracking available" not reached) and don't write
+    // to sheet (sheet consumer expects only trackable shipments).
+    if (trackingsInOrder.length === 0) return null;
+
+    // Queue ONE screenshot per order (the /ord/show page contains all items + all trackings).
+    // queueTrackScreenshot dedupes by orderId for order-page URLs and merges extra trackings
+    // into extraTracks — so we call it once per distinct tracking to attach the whole set.
+    if (orderId && orderId !== 'N/A') {
+      for (const tn of trackingsInOrder) {
+        try {
+          chrome.runtime.sendMessage({
+            action: 'queueTrackScreenshot',
+            orderId,
+            trackNumber: tn,
+            trackUrl: `https://order.ebay.com/ord/show?orderid=${orderId}`,
+            accountName: __ebayAccountName || 'ebay'
+          }, () => chrome.runtime.lastError);
+        } catch (_) {}
+      }
+    }
+
+    // Drop un-shipped cards from the sheet — we'll pick them up next run when they ship.
+    return entries.filter(e => e.track_number);
   } catch (e) {
     console.error('❌ parseItem error:', e);
     return null;
