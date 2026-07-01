@@ -1,5 +1,18 @@
-/* content-ebay.js — v7.7.0 (retry failed pages w/ backoff + FedEx tracking) */
-console.log('🔧 eBay Parser v7.7.0 loaded');
+/* content-ebay.js — v7.7.1 (silence benign MV3 messaging noise + softer page delay) */
+console.log('🔧 eBay Parser v7.7.1 loaded');
+
+// Silence the benign MV3 console flood during long scans. Fire-and-forget
+// chrome.runtime.sendMessage() calls (progress/parserStarted/updatePopup)
+// reject when the idle service worker isn't listening ("message channel
+// closed" / "Receiving end does not exist"). Those rejections are harmless —
+// the parse still completes — but they spam the console red and look like the
+// parser crashed. Swallow ONLY that specific class; everything else surfaces.
+self.addEventListener('unhandledrejection', (e) => {
+  const msg = e?.reason?.message || String(e?.reason || '');
+  if (/message channel closed|Receiving end does not exist|Extension context invalidated/i.test(msg)) {
+    e.preventDefault();
+  }
+});
 
 let PARSE_MODE = 'warehouse'; // 'warehouse' or 'financial'
 // Guard against double-parse (both flag + message could trigger)
@@ -420,9 +433,11 @@ async function parseEbayOrders() {
         hasMore = false;
       } else {
         page++;
-        // 1500ms (was 500ms) between pages — eBay rate-limited the faster cadence
-        // and returned non-JSON for some pages, which we then lost.
-        await new Promise(r => setTimeout(r, 1500));
+        // 1000ms (was 500ms) between pages — a modest slowdown to ease eBay's
+        // antibot (PerimeterX served non-JSON HTML for some pages at 500ms).
+        // The per-page retry-with-backoff below is the real safety net; 1500ms
+        // roughly tripled scan time and only worsened the idle-SW noise, so 1s.
+        await new Promise(r => setTimeout(r, 1000));
       }
     }
 
