@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pochtoy.night-fedya</string>
+
+    <!-- Одноразовый запуск каждый день в 22:52 — Claude-сессия (ночной Федя)
+         дежурит над прогоном парсера 23:00 по протоколу скилла night-parser-shift.
+         НЕ KeepAlive: сессия сама завершается после финального отчёта. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>22</integer>
+        <key>Minute</key>
+        <integer>52</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/script</string>
+        <string>-q</string>
+        <string>/dev/null</string>
+        <string>/opt/homebrew/bin/claude</string>
+        <string>-p</string>
+        <string>Запусти скилл night-parser-shift и отработай ночную смену по его протоколу от начала до конца. Работай автономно, вопросов задавать некому.</string>
+        <string>--model</string>
+        <string>opus</string>
+        <string>--permission-mode</string>
+        <string>bypassPermissions</string>
+        <string>--dangerously-skip-permissions</string>
+        <string>--add-dir</string>
+        <string>/Users/dzianismazol/Desktop/AutoBuy</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/dzianismazol/Desktop/order-parser-pro</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/dzianismazol/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/dzianismazol</string>
+        <key>TERM</key>
+        <string>xterm-256color</string>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/night-fedya.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/night-fedya.err.log</string>
+</dict>
+</plist>
