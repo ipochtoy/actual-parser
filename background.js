@@ -369,9 +369,14 @@ const PIPELINE_STALE_TIMEOUT_MS = 15 * 60 * 1000;
 // Primary account = isPrimary:true, идёт ПЕРВЫМ в массиве (парсится первым
 // для iHerb, финальный возврат — для Amazon).
 const DEFAULT_ACCOUNTS_CONFIG = {
+  // iHerb — временно ТОЛЬКО photopochtoy (оператор 2026-07-03). questburgh и
+  // oksanasorokapocht залогинены и device-trusted, но пока НЕ парсятся: без
+  // secondaries парсер не делает sign-out dance. Чтобы вернуть мульти-аккаунт —
+  // раскомментируй строки ниже и бампни флаг миграции.
   iherb: [
-    { email: 'photopochtoy@gmail.com', password: 'jSt0ldU%W55!', isPrimary: true  },
-    { email: 'pochtoy@gmail.com',      password: '1Svetakurz@',  isPrimary: false }
+    { email: 'photopochtoy@gmail.com',     password: 'jSt0ldU%W55!', isPrimary: true  }
+    // { email: 'questburgh@gmail.com',        password: '1Svetakurz@',  isPrimary: false },
+    // { email: 'oksanasorokapocht@gmail.com', password: '1Svetakurz@',  isPrimary: false }
   ],
   amazon: [
     { email: 'ipochtoy@gmail.com',     isPrimary: true  },
@@ -386,6 +391,36 @@ async function loadAccountsConfig() {
   const r = await chrome.storage.local.get(['accountsConfig']);
   return r.accountsConfig || DEFAULT_ACCOUNTS_CONFIG;
 }
+
+// --- One-time migration: перезаписать сохранённый iHerb-список на новый дефолт ---
+// Сохранённый accountsConfig перекрывает DEFAULT_ACCOUNTS_CONFIG, поэтому при
+// смене списка iHerb-аккаунтов нужна разовая миграция. amazon/ebay сохраняем
+// как были у пользователя. Флаг iherbAccountsMigrated_20260703 защищает от
+// повторного применения.
+async function migrateIherbAccounts_20260703() {
+  try {
+    const r = await chrome.storage.local.get(['accountsConfig', 'iherbAccountsMigrated_20260703']);
+    if (r.iherbAccountsMigrated_20260703) return;
+    if (r.accountsConfig) {
+      const migrated = {
+        ...r.accountsConfig,
+        iherb: DEFAULT_ACCOUNTS_CONFIG.iherb.map(a => ({ ...a }))
+      };
+      await chrome.storage.local.set({
+        accountsConfig: migrated,
+        iherbAccountsMigrated_20260703: true
+      });
+      console.log('🔄 [migrate] accountsConfig.iherb перезаписан на новый дефолт (questburgh + oksanasorokapocht, убран pochtoy@gmail.com)');
+    } else {
+      // Своего конфига нет — дефолты и так актуальны, просто ставим флаг.
+      await chrome.storage.local.set({ iherbAccountsMigrated_20260703: true });
+      console.log('🔄 [migrate] accountsConfig отсутствует — используется актуальный DEFAULT_ACCOUNTS_CONFIG, флаг миграции выставлен');
+    }
+  } catch (e) {
+    console.warn('⚠️ [migrate] iHerb accounts migration failed:', e?.message || e);
+  }
+}
+migrateIherbAccounts_20260703();
 
 function getPrimary(list)     { return list.find(a => a.isPrimary) || list[0]; }
 function getSecondaries(list) { return list.filter(a => !a.isPrimary); }
@@ -732,6 +767,21 @@ async function reconcileStalePipelineState() {
     if (!shouldClear) return;
 
     const ageMinutes = Math.round(stageAgeMs / 60000);
+
+    // Ночной прогон завис после рестарта Chrome/SW — не умираем молча:
+    // предупреждаем оператора и best-effort выгружаем то, что уже собрано.
+    try {
+        await sendTelegramMessage(`⚠️ Ночной прогон прерван (стадия ${currentStage} зависла после рестарта Chrome/SW). Выгружаю то, что собрано.`);
+    } catch (_) {}
+    try {
+        await uploadToSheets();
+        await uploadLogsToSheet();
+        await chrome.storage.local.set({ lastSheetsUploadOkAt: Date.now() });
+        console.log('✅ Частичная выгрузка после протухшей стадии выполнена');
+    } catch (e) {
+        console.error('❌ Частичная выгрузка после протухшей стадии не удалась:', e?.message || e);
+    }
+
     await clearPipelineRuntimeState(`${currentStage} stage stale for ${ageMinutes} min without live runtime`);
 }
 
@@ -757,6 +807,9 @@ async function logMultiAccountStep(step, detail = {}) {
 }
 
 async function handleProgressMessage(request) {
+    // Legacy parsingProgress wrapper ({page, totalOrders}, no store) reaches here
+    // via the converter below — without a store there is nothing to track.
+    if (!request.store) return;
     // Persist progress to storage so popup can restore it when reopened
     const storeKey = request.store.toLowerCase();
     console.log(`📊 [BACKGROUND] Progress from ${request.store}:`, request.current, '/', request.total, request.status);
@@ -2121,7 +2174,7 @@ chrome.alarms.create(IHERB_WATCHDOG_ALARM, { delayInMinutes: 1, periodInMinutes:
 // 'done' and uploads — even if one store is broken or rate-limited (eBay limitexceeded).
 const PIPELINE_WATCHDOG_ALARM = 'pipelineStageWatchdog';
 const PIPELINE_STAGE_MAX_MS = {
-  iherb: 12 * 60_000,  // multi-account, longest
+  iherb: 25 * 60_000,  // 3 аккаунта: парсинг ×3 + 2 переключения (+5 мин ретрай логина) + возврат
   ebay:  6 * 60_000,   // 40 pages + detail-page tracking enrichment; generous
   amazon: 15 * 60_000  // multi-account; has its own watchdog too, this is a backstop
 };
@@ -2158,6 +2211,128 @@ async function handlePipelineWatchdog() {
     await advancePipelineStage();
   }
   if (typeof checkAllStoresCompleted === 'function') checkAllStoresCompleted();
+}
+
+// ─── Sheets upload watchdog (надёжность выгрузки, инцидент 2026-07-03) ──────
+// Финальная выгрузка в Google Sheets раньше ретраилась ×3 через setTimeout В ПАМЯТИ.
+// MV3 усыпляет service worker → цепочка setTimeout умирает, ретрай не возобновляется,
+// и данные молча не доезжают до таблицы до утра (пока оператор не перезапустит вручную).
+// Этот alarm переживает сон/смерть SW и догоняет выгрузку по персистентному маркеру
+// pendingSheetsUpload. Тик раз в 2 минуты, до 12 попыток (~24 мин), потом — алерт оператору.
+const SHEETS_UPLOAD_WATCHDOG_ALARM = 'sheetsUploadWatchdog';
+const SHEETS_UPLOAD_MAX_RETRIES = 12;
+chrome.alarms.create(SHEETS_UPLOAD_WATCHDOG_ALARM, { delayInMinutes: 2, periodInMinutes: 2 });
+
+// Единая точка фиксации «данные РЕАЛЬНО в таблице». Ставит честные ключи, гасит
+// маркер и сбрасывает счётчик ретраев. Вызывается и в штатном пути
+// (checkAllStoresCompleted), и в alarm-ретрае — честный флаг всегда один и тот же.
+async function markSheetsUploadSuccess() {
+    const now = Date.now();
+    // Дата «зелёного» прогона по таймзоне склада (America/New_York), YYYY-MM-DD.
+    let nyDate = '';
+    try {
+        nyDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date());
+    } catch (_) {
+        nyDate = new Date().toISOString().split('T')[0];
+    }
+    await chrome.storage.local.set({
+        lastSheetsUploadOkAt: now,       // существующий ключ — читает внешний сторож
+        lastSuccessfulDailyRunAt: now,   // честный флаг «данные подтверждённо в таблице»
+        lastSuccessfulDailyRunDate: nyDate,
+        pendingSheetsUpload: null,
+        sheetsRetryCount: 0,
+        sheetsRetryGaveUp: false
+    });
+}
+
+// Приём внешних команд сторожа (watchdog/parser-watchdog.mjs пишет
+// externalControlRequest в chrome.storage.local). Обрабатывается в alarm-тике —
+// значит переживает сон SW. Идемпотентность через lastHandledControlAt.
+async function handleExternalControlRequest() {
+    const s = await chrome.storage.local.get([
+        'externalControlRequest', 'lastHandledControlAt',
+        'pendingSheetsUpload', 'lastSheetsUploadOkAt', 'lastDailyAutoParseFinishedAt',
+        'pipelineStage', 'lastDailyAutoParseTriggeredAt'
+    ]);
+    const req = s.externalControlRequest;
+    if (!req || !req.action || !req.requestedAt) return;
+    // Уже обработали эту команду — не переисполняем.
+    if (req.requestedAt <= (s.lastHandledControlAt || 0)) return;
+
+    if (req.action === 'reupload_sheets') {
+        // Пинок заглохшему ретраю: если выгрузка ещё не подтверждена — сбрасываем
+        // счётчик и флаг «сдался», фактическую выгрузку выполнит sheetsUploadWatchdog-тик.
+        const uploaded = s.lastSheetsUploadOkAt && s.lastDailyAutoParseFinishedAt
+            && s.lastSheetsUploadOkAt >= s.lastDailyAutoParseFinishedAt;
+        if (s.pendingSheetsUpload && !uploaded) {
+            await chrome.storage.local.set({ sheetsRetryCount: 0, sheetsRetryGaveUp: false });
+        }
+    } else if (req.action === 'start_pipeline') {
+        // Защита от двойных прогонов: только если пайплайн не активен, прогон в этот
+        // слот ещё не запускался и с момента слота 23:00 прошло < 3 ч.
+        const slot = getLastDailyRunSlot(new Date()).getTime();
+        const alreadyTriggered = s.lastDailyAutoParseTriggeredAt && s.lastDailyAutoParseTriggeredAt >= slot;
+        const sinceSlotMs = Date.now() - slot;
+        if (!s.pipelineStage?.active && !alreadyTriggered && sinceSlotMs < 3 * 60 * 60 * 1000) {
+            runDailyAutoParse('watchdog-control');
+        }
+    }
+
+    await chrome.storage.local.set({
+        lastHandledControlAt: req.requestedAt,
+        externalControlRequest: null,
+        externalControlResult: { action: req.action, ok: true, at: Date.now() }
+    });
+}
+
+async function handleSheetsUploadWatchdog() {
+    // Внешние команды сторожа — в начале тика (alarm-backed, переживает сон SW).
+    await handleExternalControlRequest().catch(e => console.warn('[sheetsUploadWatchdog] control error:', e?.message || e));
+
+    const s = await chrome.storage.local.get([
+        'lastDailyAutoParseStatus', 'lastDailyAutoParseFinishedAt', 'lastSheetsUploadOkAt',
+        'pendingSheetsUpload', 'sheetsRetryCount', 'sheetsRetryGaveUp', 'pipelineStage'
+    ]);
+
+    // Никаких гонок с активной выгрузкой: не трогаем при свежем прогоне или
+    // не-completed статусе.
+    if (s.pipelineStage?.active) return;
+    if (s.lastDailyAutoParseStatus !== 'completed') return;
+    if (!s.lastDailyAutoParseFinishedAt) return;
+
+    const pending = s.pendingSheetsUpload;
+    if (!pending) return;
+    // Маркер именно этого прогона (forSlot = слот 23:00). Стабилен весь 24ч-интервал,
+    // ретрай-окно (12×2мин ≈ 24 мин) внутри него — сравнение точное.
+    if (pending.forSlot !== getLastDailyRunSlot(new Date()).getTime()) return;
+
+    // Уже залито (штатным путём или прошлым тиком) — гасим маркер, no-op дальше.
+    if (s.lastSheetsUploadOkAt && s.lastSheetsUploadOkAt >= s.lastDailyAutoParseFinishedAt) {
+        await chrome.storage.local.set({ pendingSheetsUpload: null, sheetsRetryCount: 0, sheetsRetryGaveUp: false });
+        return;
+    }
+
+    const retryCount = s.sheetsRetryCount || 0;
+    if (retryCount >= SHEETS_UPLOAD_MAX_RETRIES) {
+        if (!s.sheetsRetryGaveUp) {
+            await chrome.storage.local.set({ sheetsRetryGaveUp: true });
+            sendTelegramMessage('❗ Выгрузка в Sheets не удалась за 12 попыток (~24 мин), нужен оператор').catch(() => {});
+        }
+        return; // no-op пока не появится новый pendingSheetsUpload
+    }
+
+    // Инкремент ДО попытки — чтобы бесконечно висящий upload не крутил счётчик вечно.
+    await chrome.storage.local.set({ sheetsRetryCount: retryCount + 1 });
+    try {
+        await uploadToSheets();
+        await uploadLogsToSheet();
+        await markSheetsUploadSuccess();
+        console.log(`✅ sheetsUploadWatchdog: догнал выгрузку (попытка ${retryCount + 1})`);
+        sendTelegramMessage('✅ Догнал выгрузку в Google Sheets (со стороннего ретрая)').catch(() => {});
+    } catch (e) {
+        console.error(`❌ sheetsUploadWatchdog: попытка ${retryCount + 1} провалилась:`, e?.message || e);
+        // Просто выходим — alarm повторит через 2 мин.
+    }
 }
 
 function startCompletionWatchdog() {
@@ -2330,6 +2505,13 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
         return;
     }
 
+    // Надёжность выгрузки в Sheets (инцидент 2026-07-03): alarm-backed ретрай +
+    // приём внешних команд сторожа. Переживает сон/смерть SW.
+    if (alarm.name === SHEETS_UPLOAD_WATCHDOG_ALARM) {
+        await handleSheetsUploadWatchdog().catch(e => console.warn('[sheetsUploadWatchdog] error:', e?.message || e));
+        return;
+    }
+
     if (alarm.name !== WATCHDOG_ALARM_NAME) return;
 
     const stored = await chrome.storage.local.get(['amazonParsingComplete', 'multiAccountState', 'accountSwitchStartedAt', 'lastAmazonProgressAt', 'skipGuardAt']);
@@ -2476,8 +2658,45 @@ async function checkAllStoresCompleted() {
 
         // Upload + screenshots FIRST, then send final report
         setTimeout(async () => {
-            await uploadToSheets();
-            await uploadLogsToSheet();
+            // Надёжность выгрузки (инцидент 2026-07-03): ставим персистентный маркер
+            // pendingSheetsUpload ДО первой попытки. Сам пэйлоад (orderData + логи) уже
+            // лежит в chrome.storage.local и читается uploadToSheets()/uploadLogsToSheet()
+            // изнутри — не дублируем его, храним лишь маркер+слот прогона. Если SW уснёт
+            // и in-memory ретрай ниже умрёт — sheetsUploadWatchdog догонит выгрузку по маркеру.
+            try {
+                await chrome.storage.local.set({
+                    pendingSheetsUpload: { forSlot: getLastDailyRunSlot(new Date()).getTime(), savedAt: Date.now() },
+                    sheetsRetryCount: 0,
+                    sheetsRetryGaveUp: false
+                });
+            } catch (_) {}
+
+            // Финальная выгрузка в Google Sheets — до 3 попыток с паузой 60с.
+            // Внешний сторож читает lastSheetsUploadOkAt, поэтому имя ключа фиксировано.
+            let sheetsUploadErr = null;
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                try {
+                    await uploadToSheets();
+                    await uploadLogsToSheet();
+                    // Честный «зелёный» флаг — только после подтверждённой выгрузки: ставит
+                    // lastSheetsUploadOkAt + lastSuccessfulDailyRunAt/Date, гасит маркер.
+                    await markSheetsUploadSuccess();
+                    sheetsUploadErr = null;
+                    console.log(`✅ Выгрузка в Google Sheets успешна (попытка ${attempt}/3)`);
+                    break;
+                } catch (e) {
+                    sheetsUploadErr = e;
+                    console.error(`❌ Выгрузка в Google Sheets провалилась (попытка ${attempt}/3):`, e?.message || e);
+                    if (attempt < 3) await new Promise(r => setTimeout(r, 60000));
+                }
+            }
+            if (sheetsUploadErr) {
+                // In-memory ретрай не осилил (или SW уснул) — маркер остаётся, догонит
+                // sheetsUploadWatchdog через alarm (переживает сон SW).
+                const msg = String(sheetsUploadErr?.message || sheetsUploadErr).slice(0, 300);
+                console.error('❌ Выгрузка в Google Sheets не удалась после 3 попыток (догонит alarm):', msg);
+                try { await sendTelegramMessage(`❗ Выгрузка в Google Sheets не удалась после 3 попыток: ${msg}`); } catch (_) {}
+            }
             if (screenshotsEnabled && trackScreenshotQueue.length > 0) {
                 await processScreenshotQueue();
             }
@@ -3408,6 +3627,21 @@ async function sendTelegramPhoto(base64Data, caption) {
  * Link format: https://t.me/c/{chat_id без -100}/{message_id} — clickable in Google Sheet.
  * Does NOT replace sendTelegramPhoto — this is a parallel path for archive.
  */
+// HTML-экранирование динамических кусков подписи (для parse_mode:'HTML').
+function esc(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+// Кликабельный номер заказа → ссылка на админку Pochtoy (серверный фильтр по shop_order_number).
+function orderLink(orderId) {
+    const id = String(orderId == null ? '' : orderId);
+    const url = `https://www.pochtoy.com/admin-room/orders?shop_order_number=${encodeURIComponent(id)}`;
+    return `<a href="${url}">${esc(id)}</a>`;
+}
+
 async function sendScreenshotToArchive(base64Data, caption) {
     if (!tgBotToken || !tgPhotoChatId) {
         console.warn('⚠️ Cannot send screenshot to archive - missing token or tgPhotoChatId');
@@ -3420,12 +3654,14 @@ async function sendScreenshotToArchive(base64Data, caption) {
     for (let i = 0; i < byteChars.length; i++) byteArray[i] = byteChars.charCodeAt(i);
     const blob = new Blob([byteArray], { type: 'image/png' });
 
-    // Helper: общая отправка с обработкой fallback
-    const sendAs = async (apiMethod, fileField, filename) => {
+    // Helper: общая отправка с обработкой fallback.
+    // useHtml=true → parse_mode:'HTML' (кликабельный номер заказа в подписи).
+    const sendAs = async (apiMethod, fileField, filename, useHtml) => {
         const fd = new FormData();
         fd.append('chat_id', tgPhotoChatId);
         fd.append(fileField, blob, filename);
         if (caption) fd.append('caption', caption);
+        if (useHtml) fd.append('parse_mode', 'HTML');
         const res = await fetch(`https://api.telegram.org/bot${tgBotToken}/${apiMethod}`, {
             method: 'POST',
             body: fd
@@ -3434,23 +3670,36 @@ async function sendScreenshotToArchive(base64Data, caption) {
         return { res, json };
     };
 
-    try {
-        // 1) Пробуем как фото — компактно, превью в чате
-        let { res, json } = await sendAs('sendPhoto', 'photo', 'screenshot.png');
-        let json1 = json;
-
-        // 2) Fallback на sendDocument при PHOTO_INVALID_DIMENSIONS / PHOTO_SAVE_FILE_INVALID / лимитах размера
+    // Одна попытка: sendPhoto → fallback sendDocument (при dimension/size/400) с заданным parse_mode.
+    const trySend = async (useHtml) => {
+        let { res, json } = await sendAs('sendPhoto', 'photo', 'screenshot.png', useHtml);
+        const photoJson = json;
         const errDesc = String(json?.description || '');
         const fellThrough = !res.ok || !json?.ok;
         const dimensionIssue = /PHOTO_INVALID_DIMENSIONS|PHOTO_SAVE_FILE_INVALID|file is too big|wrong file/i.test(errDesc);
         if (fellThrough && (dimensionIssue || res.status === 400)) {
             console.warn(`⚠️ sendPhoto failed (${errDesc || res.status}), retrying as document`);
-            const r2 = await sendAs('sendDocument', 'document', 'screenshot.png');
+            const r2 = await sendAs('sendDocument', 'document', 'screenshot.png', useHtml);
             res = r2.res; json = r2.json;
+        }
+        return { res, json, photoJson };
+    };
+
+    try {
+        // 1) HTML-подпись (кликабельный номер заказа)
+        let { res, json, photoJson } = await trySend(true);
+
+        // 2) Ошибка парсинга HTML-подписи → повтор той же подписи plain (без parse_mode),
+        //    чтобы скриншот не потерялся из-за спецсимвола в названии/треке.
+        const parseIssue = /can't parse|parse entities|byte offset|end tag|unclosed|entit|unsupported/i.test(String(json?.description || ''));
+        if ((!res.ok || !json?.ok) && parseIssue) {
+            console.warn(`⚠️ HTML caption parse failed (${json?.description}), retrying plain`);
+            const plain = await trySend(false);
+            res = plain.res; json = plain.json;
         }
 
         if (!res.ok || !json?.ok) {
-            console.error(`❌ Archive send failed (photo+doc): photo=${JSON.stringify(json1)}, doc=${JSON.stringify(json)}`);
+            console.error(`❌ Archive send failed (photo+doc): photo=${JSON.stringify(photoJson)}, final=${JSON.stringify(json)}`);
             return { ok: false };
         }
 
@@ -3514,7 +3763,14 @@ async function filterAlreadySent(queue) {
     } catch (e) {
         console.warn('⚠️ Sheet dedup check failed (soft-ignored):', e?.message || e);
     }
-    const filtered = queue.filter(item => !sentSet.has(item.trackNumber));
+    // Для заказа с несколькими треками (extraTracks) пропускаем ТОЛЬКО если ВСЕ
+    // треки набора уже отправлены. Если появился хоть один новый трек — заказ
+    // остаётся в очереди (снимется только новая карточка, см. captureEbayShipments).
+    const filtered = queue.filter(item => {
+        const tracks = [item.trackNumber, ...(item.extraTracks || [])].filter(Boolean);
+        if (tracks.length === 0) return true; // нет трек-инфо — оставляем, решит съёмка
+        return !tracks.every(t => sentSet.has(t));
+    });
     const skipped = queue.length - filtered.length;
     if (skipped > 0) console.log(`📸 Пропущено ${skipped} уже отправленных скриншотов`);
     return filtered;
@@ -3578,10 +3834,31 @@ async function processScreenshotQueue() {
         console.warn('⚠️ Не удалось создать reusable tab, fallback на per-item create:', e?.message || e);
     }
 
+    // Живой набор уже отправленных треков — для ПОштучного дедупа прямо в цикле.
+    // filterAlreadySent (выше) фильтрует очередь ОДИН раз, батчем, до цикла. Но
+    // queueTrackScreenshot доливает items в очередь ПОКА идёт парсинг, а слив
+    // стартует по 1-мин аларму раньше конца парсинга — стриминговые items
+    // shift()-ятся мимо батч-фильтра. eBay-ветка защищена своей проверкой, а
+    // Amazon/iHerb — нет, и переснимали одно и то же каждый прогон. Эта живая
+    // проверка ловит их для ВСЕХ магазинов. См. incident 2026-07-03.
+    let sentSet = new Set();
+    try {
+        const { sentScreenshots = [] } = await chrome.storage.local.get('sentScreenshots');
+        sentSet = new Set(sentScreenshots);
+    } catch (_) {}
+
     let captchaPaused = false;
     while (trackScreenshotQueue.length > 0) {
         const item = trackScreenshotQueue.shift();
         done++;
+        // Поштучный дедуп: если ВСЕ треки этого заказа уже сняты — не переснимаем.
+        const itemTracks = [item.trackNumber, ...(item.extraTracks || [])].filter(Boolean);
+        if (itemTracks.length > 0 && itemTracks.every(t => sentSet.has(t))) {
+            console.log(`⏭  skip already-sent order ${item.orderId} (${itemTracks.length} track(s))`);
+            parseReport.screenshots.skipped++;
+            persistScreenshotQueue();
+            continue;
+        }
         // Магазин по trackUrl — чтобы в сводке прогона видеть «сколько скринов ушло по iHerb / Amazon / eBay»
         const u = String(item.trackUrl || '');
         const shop = /iherb\.com/i.test(u) ? 'iherb' : /amazon\./i.test(u) ? 'amazon' : /ebay\./i.test(u) ? 'ebay' : 'other';
@@ -3594,11 +3871,17 @@ async function processScreenshotQueue() {
                 captchaPaused = true; // не закрываем reuseTab — юзер будет решать капчу там
                 break;
             }
-            sentTracks.push(item.trackNumber);
+            // captureTrackScreenshot вернул полный набор реально известных/снятых
+            // треков заказа — помечаем отправленными ВСЕ, а не один первичный.
+            const tracksToMark = (Array.isArray(result) && result.length)
+                ? result
+                : [item.trackNumber].filter(Boolean);
+            sentTracks.push(...tracksToMark);
+            tracksToMark.forEach(t => sentSet.add(t)); // живой дедуп в рамках слива
             parseReport.screenshots.sent++;
             parseReport.screenshots.byShop = parseReport.screenshots.byShop || {};
             parseReport.screenshots.byShop[shop] = (parseReport.screenshots.byShop[shop] || 0) + 1;
-            await markAsSent([item.trackNumber]);
+            await markAsSent(tracksToMark);
             persistScreenshotQueue();
             // Update progress message
             if (progressMsgId) {
@@ -3722,14 +4005,36 @@ async function computeEbayCropSpecs(tab) {
 // eBay order page: возвращает массив скриншотов (по одному на shipment-card).
 // Каждый элемент: { base64, trackNum, itemName, shipmentIdx, shipmentTotal }.
 // Если specs пусто (страница не стандартная) — fallback: один обычный stitch.
+// Возвращает { shipments: [...], skippedAllSent: bool }.
+//  - shipments === []  + skippedAllSent === false → карточки не распознались (fallback на single visible)
+//  - shipments === []  + skippedAllSent === true  → все карточки заказа уже сняты ранее (ничего не слать)
+//  - shipments.length > 0 → только НОВЫЕ (ещё не отправленные) карточки
 async function captureEbayShipments(tab) {
     const specs = await computeEbayCropSpecs(tab);
     if (specs.length === 0) {
         const b64 = await captureFullPageStitched(tab);
-        return b64 ? [{ base64: b64, trackNum: '', itemName: '', shipmentIdx: 1, shipmentTotal: 1 }] : [];
+        return {
+            shipments: b64 ? [{ base64: b64, trackNum: '', itemName: '', shipmentIdx: 1, shipmentTotal: 1 }] : [],
+            skippedAllSent: false
+        };
     }
+
+    // Дедуп на уровне карточки: уже снятые треки не переснимаем.
+    let sentSet = new Set();
+    try {
+        const { sentScreenshots = [] } = await chrome.storage.local.get('sentScreenshots');
+        sentSet = new Set(sentScreenshots);
+    } catch (_) {}
+
+    const specsWithTrack = specs.filter(s => s.trackNum);
+    const alreadySentCount = specsWithTrack.filter(s => sentSet.has(s.trackNum)).length;
+
     const out = [];
     for (const spec of specs) {
+        if (spec.trackNum && sentSet.has(spec.trackNum)) {
+            console.log(`⏭  skip already-sent track ${spec.trackNum} (card ${spec.shipmentIdx}/${spec.shipmentTotal})`);
+            continue;
+        }
         const b64 = await captureFullPageStitched(tab, {
             startY: spec.startY,
             endY: spec.endY,
@@ -3744,7 +4049,12 @@ async function captureEbayShipments(tab) {
             shipmentTotal: spec.shipmentTotal
         });
     }
-    return out;
+
+    // Все карточки с трек-номером уже были сняты ранее, ничего нового не осталось.
+    const skippedAllSent = specsWithTrack.length > 0 &&
+                           alreadySentCount === specsWithTrack.length &&
+                           out.length === 0;
+    return { shipments: out, skippedAllSent };
 }
 
 async function captureFullPageStitched(tab, override = null) {
@@ -4146,7 +4456,10 @@ async function captureIherbTrackingCard(tab) {
 }
 
 async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountName, extraTracks }, current, total, reuseTabId) {
-    if (!trackUrl) return;
+    // Полный набор треков этого заказа — база для markAsSent (дедуп по ВСЕМ трекам,
+    // а не по одному первичному). По ходу съёмки доливаем реально снятые s.trackNum.
+    const capturedTracks = new Set([trackNumber, ...(extraTracks || [])].filter(Boolean));
+    if (!trackUrl) return Array.from(capturedTracks);
 
     let fullUrl = trackUrl;
     if (fullUrl.startsWith('http')) {
@@ -4257,7 +4570,7 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                 if (broken) {
                     console.log(`⚠️ Broken tracking page for ${trackNumber}, skipping screenshot`);
                     parseReport.screenshots.broken++;
-                    return;
+                    return Array.from(capturedTracks);
                 }
             } catch (e) {
                 console.warn('⚠️ Broken page check failed:', e?.message || e);
@@ -4295,7 +4608,7 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
         const finalUrl = tabInfo.url || '';
         if (finalUrl.includes('signin') || finalUrl.includes('ap/challenge')) {
             console.log(`⚠️ Skipping screenshot - login page: ${finalUrl.substring(0, 80)}`);
-            return;
+            return Array.from(capturedTracks);
         }
 
         // --- SCREENSHOTS ---
@@ -4308,14 +4621,19 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
         if (isEbay) {
             try {
                 const allTracks = [trackNumber, ...(extraTracks || [])].filter(Boolean);
-                const accountTag = accountName ? '\n📧 ' + accountName : '';
-                const shipments = await captureEbayShipments(tab);
+                const accountTag = accountName ? '\n📧 ' + esc(accountName) : '';
+                const ebayResult = await captureEbayShipments(tab);
+                const shipments = ebayResult.shipments || [];
 
-                if (shipments.length === 0) {
+                if (ebayResult.skippedAllSent) {
+                    // Все shipment-карточки заказа уже были сняты в прошлые прогоны →
+                    // ничего нового не шлём, заказ считаем обработанным.
+                    console.log(`⏭  eBay: все карточки заказа ${orderId} уже сняты ранее — ничего не отправляю`);
+                } else if (shipments.length === 0) {
                     console.warn(`⚠️ captureEbayShipments returned [] for ${orderId}, fallback to single visible`);
                     const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
                     const fallbackBase64 = dataUrl.replace(/^data:image\/png;base64,/, '');
-                    const captionFallback = `📦 ${orderId}\n🚚 ${(trackNumber || '—')}${accountTag}`;
+                    const captionFallback = `📦 ${orderLink(orderId)}\n🚚 ${esc(trackNumber || '—')}${accountTag}`;
                     const archive = await sendScreenshotToArchive(fallbackBase64, captionFallback);
                     if (archive?.ok && archive.link) firstPageLink = archive.link;
                     screenshotsTaken++;
@@ -4332,10 +4650,11 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                             continue;
                         }
                         const track = s.trackNum;
-                        const trackLine = '🚚 ' + track;
+                        capturedTracks.add(track);
+                        const trackLine = '🚚 ' + esc(track);
                         const shipTag = s.shipmentTotal > 1 ? ` • пакет ${s.shipmentIdx}/${s.shipmentTotal}` : '';
-                        const itemLine = s.itemName ? ('\n🛒 ' + s.itemName) : '';
-                        const caption = `📦 ${orderId}${shipTag}\n${trackLine}${itemLine}${accountTag}`;
+                        const itemLine = s.itemName ? ('\n🛒 ' + esc(s.itemName)) : '';
+                        const caption = `📦 ${orderLink(orderId)}${shipTag}\n${trackLine}${itemLine}${accountTag}`;
                         const archive = await sendScreenshotToArchive(s.base64, caption);
                         if (archive?.ok && archive.link) {
                             if (!firstPageLink) firstPageLink = archive.link;
@@ -4353,10 +4672,10 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
             try {
                 const allTracks = [trackNumber, ...(extraTracks || [])].filter(Boolean);
                 const tracksLine = allTracks.length > 1
-                    ? '🚚 ' + allTracks.join(', ')
-                    : '🚚 ' + (trackNumber || '—');
-                const accountTag = accountName ? '\n📧 ' + accountName : '';
-                const captionFull = `📦 ${orderId}\n${tracksLine}${accountTag}`;
+                    ? '🚚 ' + allTracks.map(esc).join(', ')
+                    : '🚚 ' + esc(trackNumber || '—');
+                const accountTag = accountName ? '\n📧 ' + esc(accountName) : '';
+                const captionFull = `📦 ${orderLink(orderId)}\n${tracksLine}${accountTag}`;
 
                 // iHerb: кропим только левую tracking-карточку (carrier + delivery + product thumbs + timeline).
                 // Ждём пока догрузятся картинки товаров — без этого снимок получается без thumb-квадратиков.
@@ -4417,8 +4736,8 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                 }
                 const base64 = dataUrl.replace(/^data:image\/png;base64,/, '');
                 const pageLabel = page > 1 ? ` [${page}]` : '';
-                const accountTag = accountName ? '\n📧 ' + accountName : '';
-                const caption = `📦 ${orderId}${pageLabel}\n🚚 ${trackNumber}${accountTag}`;
+                const accountTag = accountName ? '\n📧 ' + esc(accountName) : '';
+                const caption = `📦 ${orderLink(orderId)}${pageLabel}\n🚚 ${esc(trackNumber)}${accountTag}`;
 
                 const archive = await sendScreenshotToArchive(base64, caption);
                 if (archive?.ok && archive.link && !firstPageLink) firstPageLink = archive.link;
@@ -4452,6 +4771,8 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
             try { await chrome.tabs.remove(tab.id); } catch (_) {}
         }
     }
+    // Полный набор треков заказа → в markAsSent (дедуп по всем трекам).
+    return Array.from(capturedTracks);
 }
 
 /**

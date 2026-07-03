@@ -4,3 +4,6 @@ node_modules/
 .idea/
 .vscode/
 
+# parser watchdog local state
+watchdog/.watchdog-state.json
+
