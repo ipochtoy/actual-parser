@@ -6,6 +6,25 @@ console.log('📄 Page HTML length:', document.body?.innerHTML?.length || 0);
 // Guard against double-parse (both flag + message could trigger)
 let isParsingInProgress = false;
 
+// Multi-account: current iHerb account email (set by checkAutoParse / exportOrders
+// before parseOrders() composes rows). Rows emitted during this run will
+// include this email as `account_name`.
+window.__iherbCurrentAccountName = window.__iherbCurrentAccountName || '';
+
+// Resolve primary iHerb account from accountsConfig — used when we're not in
+// multi-account mode (manual /myaccount/orders parse).
+async function getIherbAccountFromConfig() {
+  try {
+    const r = await chrome.storage.local.get(['accountsConfig']);
+    const cfg = r.accountsConfig;
+    if (!cfg || !cfg.iherb || !cfg.iherb.length) return '';
+    const primary = cfg.iherb.find(a => a.isPrimary) || cfg.iherb[0];
+    return primary.email || '';
+  } catch (_) {
+    return '';
+  }
+}
+
 // Save log entry directly to storage
 async function sendLog(orderId, trackNumber, status, details) {
   try {
@@ -91,7 +110,7 @@ function checkServiceUnavailable() {
 }
 
 // Retry page reload with exponential backoff
-async function retryOnServiceUnavailable(maxRetries = 3, baseDelay = 10000) {
+async function retryOnServiceUnavailable(maxRetries = 5, baseDelay = 20000) {
   const storageKey = 'iherb_retry_count';
   const timestampKey = 'iherb_retry_timestamp';
 
@@ -148,10 +167,21 @@ async function retryOnServiceUnavailable(maxRetries = 3, baseDelay = 10000) {
     iherb_should_autoparse: shouldAutoParse ? true : false
   });
 
-  // Wait and reload
+  // Wait then click "Try Again" (or reload as fallback). У iHerb на странице
+  // /myaccount/orders в "Service unavailable" состоянии есть кнопка
+  // <button class="try-again-btn" onclick="window.location.reload()">Try Again</button>.
+  // Нативный клик ведёт себя ровно как reload, но iherb трекает user-action и
+  // иногда возвращает orders быстрее, чем при programmatic reload.
   setTimeout(() => {
-    console.log('🔄 Reloading page...');
-    window.location.reload();
+    const tryAgainBtn = document.querySelector('button.try-again-btn, button.action-btn[onclick*="reload" i]') ||
+                        Array.from(document.querySelectorAll('button')).find(b => /try\s*again/i.test(b.textContent || ''));
+    if (tryAgainBtn) {
+      console.log('🔄 Clicking "Try Again" button');
+      tryAgainBtn.click();
+    } else {
+      console.log('🔄 No Try Again btn found, fallback to reload()');
+      window.location.reload();
+    }
   }, delay);
 
   return true; // Retry scheduled
@@ -161,6 +191,27 @@ async function retryOnServiceUnavailable(maxRetries = 3, baseDelay = 10000) {
 (async function checkAutoParse() {
   console.log('🔍 Checking for auto-parse flag...');
 
+  // --- Multi-account iHerb gates ---------------------------------------------
+  // Final return (we navigated back to primary account just to restore
+  // session for AutoBuy) — MUST NOT parse.
+  const finalReturnCheck = await chrome.storage.local.get(['iherbFinalReturn']);
+  if (finalReturnCheck.iherbFinalReturn === true) {
+    console.log('🏁 iherbFinalReturn=true — skipping parse (session restore only)');
+    await chrome.storage.local.remove(['iherbFinalReturn']);
+    return;
+  }
+
+  // Multi-account resume: pipeline switched to next iHerb account and landed
+  // us on /myaccount/orders. Pick up the current account name so rows carry
+  // the right `account_name`.
+  const multiCheck = await chrome.storage.local.get(['multiAccountIherbState', 'iherbSwitchInProgress']);
+  const multiState = multiCheck.multiAccountIherbState;
+  if (multiState && multiState.isMultiAccountIherb && multiState.currentIherbAccount) {
+    window.__iherbCurrentAccountName = multiState.currentIherbAccount;
+    console.log(`👥 Multi-account iHerb resume: currentAccount=${multiState.currentIherbAccount}`);
+  }
+  // --------------------------------------------------------------------------
+
   // Try up to 3 times with delays (page might load before flag is set)
   let shouldAutoParse = false;
   let retryAutoParse = false;
@@ -168,15 +219,16 @@ async function retryOnServiceUnavailable(maxRetries = 3, baseDelay = 10000) {
   let isRecent = false;
 
   for (let attempt = 1; attempt <= 3; attempt++) {
-    const data = await chrome.storage.local.get(['autoParsePending', 'autoParse_iherb', 'autoParseTimestamp', 'iherb_should_autoparse']);
+    const data = await chrome.storage.local.get(['autoParsePending', 'autoParse_iherb', 'autoParseTimestamp', 'iherb_should_autoparse', 'iherbSwitchInProgress']);
 
     retryAutoParse = data.iherb_should_autoparse === true;
     standardAutoParse = (data.autoParsePending === 'iherb') || data.autoParse_iherb;
+    const switchAutoParse = data.iherbSwitchInProgress === true; // multi-account
     const timestamp = data.autoParseTimestamp || data.autoParse_iherb;
     // Increased timeout to 180 seconds (iHerb pages load slowly at night)
     isRecent = timestamp && (Date.now() - timestamp < 180000);
 
-    shouldAutoParse = retryAutoParse || (standardAutoParse && isRecent);
+    shouldAutoParse = retryAutoParse || switchAutoParse || (standardAutoParse && isRecent);
 
     if (shouldAutoParse) {
       console.log(`✅ Auto-parse flag found on attempt ${attempt}!`);
@@ -215,6 +267,21 @@ async function retryOnServiceUnavailable(maxRetries = 3, baseDelay = 10000) {
     const hasOrdersSecondCheck = document.body?.innerText?.includes('Order #') || false;
     console.log('🔍 Second check - has orders:', hasOrdersSecondCheck);
 
+    // FALLBACK: после 10с нет articles — один reload (iherb /orders иногда отдаёт пустой SPA-shell).
+    // Маркер iherbOrdersReloadDone предотвращает бесконечный цикл reload.
+    if (!hasOrdersSecondCheck) {
+      const hasArticles = document.querySelector('article[data-order-number]') !== null;
+      const reloadStored = await chrome.storage.local.get(['iherbOrdersReloadDone']);
+      if (!hasArticles && !reloadStored.iherbOrdersReloadDone) {
+        console.log('🔄 No articles after 12s — single reload fallback');
+        await chrome.storage.local.set({ iherbOrdersReloadDone: true });
+        // не сбрасываем флаги iherb_should_autoparse / iherbSwitchInProgress —
+        // после reload checkAutoParse увидит их и снова запустится
+        window.location.reload();
+        return;
+      }
+    }
+
     if (!hasOrdersSecondCheck) {
       // Still no orders - check if it's a real error
       const pageText = document.body?.innerText || '';
@@ -238,7 +305,7 @@ async function retryOnServiceUnavailable(maxRetries = 3, baseDelay = 10000) {
   }
 
   // Clear retry counter on successful load
-  await chrome.storage.local.remove(['iherb_retry_count', 'iherb_retry_timestamp']);
+  await chrome.storage.local.remove(['iherb_retry_count', 'iherb_retry_timestamp', 'iherbOrdersReloadDone']);
 
   // Start parsing (with guard)
   if (isParsingInProgress) {
@@ -352,8 +419,38 @@ async function slowProgressiveScroll(limit = 150) {
     console.log(`📜 Starting SLOW progressive scroll (limit: ${limit} orders)...`);
     console.log('⚠️  Scrolling slowly to avoid 429 errors - please wait!');
 
-    // Send initial progress
-    chrome?.runtime?.sendMessage?.({
+    // Heartbeat: пишем в localStorage каждую итерацию — переживёт даже Extension context invalidated.
+    // bg-watchdog (chrome.scripting.executeScript) сможет прочитать и понять прогресс.
+    const HEARTBEAT_KEY = 'parser_iherb_heartbeat';
+    const writeHeartbeat = (count, attempt, status) => {
+        try {
+            window.localStorage.setItem(HEARTBEAT_KEY, JSON.stringify({ ts: Date.now(), count, attempt, status, limit }));
+        } catch {}
+    };
+
+    // Safe sendMessage: ловим Extension context invalidated → break loop корректно.
+    let extensionContextDead = false;
+    const safeSendMessage = (msg) => {
+        if (extensionContextDead) return;
+        try {
+            if (!chrome?.runtime?.id) { extensionContextDead = true; return; }
+            chrome.runtime.sendMessage(msg, () => {
+                if (chrome.runtime.lastError) {
+                    const errMsg = chrome.runtime.lastError.message || '';
+                    if (/context invalidated|Extension context/i.test(errMsg)) {
+                        extensionContextDead = true;
+                        console.warn('⚠️  Extension context invalidated, breaking scroll loop');
+                    }
+                }
+            });
+        } catch (e) {
+            extensionContextDead = true;
+            console.warn('⚠️  sendMessage threw:', e.message);
+        }
+    };
+
+    writeHeartbeat(0, 0, 'starting');
+    safeSendMessage({
         action: 'parsingProgress',
         data: {
             store: 'iHerb',
@@ -365,8 +462,10 @@ async function slowProgressiveScroll(limit = 150) {
 
     let previousUniqueCount = 0;
     let noNewOrdersCount = 0;
-    const maxNoNewChecks = 8;  // Increased from 5 to 8
-    const scrollDelay = 3500;   // Increased from 2500 to 3500ms
+    const maxNoNewChecks = 14;  // дольше ждём если iHerb тормозит
+    const scrollDelay = 5000;   // 5s — iHerb lazy-load медленный
+    const wallTimeMaxMs = 180_000; // safety: hard cap 3 min на весь loop
+    const startedAt = Date.now();
 
     // Initial count - try to find orders by data-order-number attribute first
     const initialHeaders = document.querySelectorAll('article[data-order-number]');
@@ -384,7 +483,7 @@ async function slowProgressiveScroll(limit = 150) {
     console.log(`📊 Starting with ${initialCount} orders visible`);
 
     let scrollAttempts = 0;
-    const maxScrollAttempts = 60; // Increased from 30 to 60 scroll attempts
+    const maxScrollAttempts = 120; // до 120 попыток на случай длинной истории
 
     while (scrollAttempts < maxScrollAttempts) {
         scrollAttempts++;
@@ -411,8 +510,10 @@ async function slowProgressiveScroll(limit = 150) {
 
         console.log(`📦 Loaded ${currentUniqueCount}/${limit} orders... scrolling (attempt ${scrollAttempts})`);
 
-        // Send progress update
-        chrome?.runtime?.sendMessage?.({
+        writeHeartbeat(currentUniqueCount, scrollAttempts, 'scrolling');
+
+        // Send progress update (safe — будет no-op если context dead)
+        safeSendMessage({
             action: 'parsingProgress',
             data: {
                 store: 'iHerb',
@@ -423,9 +524,25 @@ async function slowProgressiveScroll(limit = 150) {
             }
         });
 
+        // Если context invalidated — нет смысла продолжать (cs мёртв с т.з. extension)
+        if (extensionContextDead) {
+            console.warn(`🛑 Breaking loop: extension context invalidated at attempt ${scrollAttempts}, count=${currentUniqueCount}`);
+            writeHeartbeat(currentUniqueCount, scrollAttempts, 'context_invalidated_break');
+            break;
+        }
+
+        // Wall-time safety: hard cap 3 min
+        const elapsedMs = Date.now() - startedAt;
+        if (elapsedMs > wallTimeMaxMs) {
+            console.warn(`🛑 Wall-time safety break at ${Math.round(elapsedMs/1000)}s, count=${currentUniqueCount}/${limit}`);
+            writeHeartbeat(currentUniqueCount, scrollAttempts, 'walltime_break');
+            break;
+        }
+
         // Check if we reached the limit
         if (currentUniqueCount >= limit) {
             console.log(`✅ Reached ${limit} orders limit!`);
+            writeHeartbeat(currentUniqueCount, scrollAttempts, 'limit_reached');
             break;
         }
 
@@ -456,6 +573,7 @@ async function slowProgressiveScroll(limit = 150) {
 
     console.log(`📊 Scroll complete: ${previousUniqueCount} orders loaded`);
     console.log(`📈 Total scroll attempts: ${scrollAttempts}`);
+    writeHeartbeat(previousUniqueCount, scrollAttempts, extensionContextDead ? 'done_with_context_dead' : 'done_ok');
 }
 
 // Extract tracking number from DOM (buttons, links, hidden elements, HTML)
@@ -687,6 +805,30 @@ function parseOrders() {
             console.log('    ⚠️  No Track button (Fulfilling status)');
         }
 
+        // Очередь скриншота заказа iHerb — страница carrierTracking (по кнопке Track shipment).
+        // НЕ фильтруем по возрасту заказа: дедуп «уже отправляли» делает background
+        // (filterAlreadySent: sentScreenshots + колонка screenshot_link в таблице, по трек-номеру),
+        // поэтому повторов не будет. Прежний фильтр «старше 14 дней» ошибочно резал свежие отгрузки
+        // старых заказов и оставлял «несколько штук» вместо всех новых. (2026-06-08)
+        if (trackingNumber && orderId && trackBtn) {
+            const carrierUrl = trackBtn.href || trackBtn.getAttribute('href') || '';
+            if (carrierUrl) {
+                try {
+                    chrome.storage.local.get(['multiAccountIherbState'], (acc) => {
+                        const accEmail = acc?.multiAccountIherbState?.currentIherbAccount || '';
+                        const accountName = accEmail ? accEmail.split('@')[0] : 'iherb';
+                        chrome.runtime.sendMessage({
+                            action: 'queueTrackScreenshot',
+                            orderId,
+                            trackNumber: trackingNumber,
+                            trackUrl: carrierUrl,
+                            accountName
+                        }, () => chrome.runtime.lastError);
+                    });
+                } catch (_) {}
+            }
+        }
+
         // STEP 3: Find all products in this order
         // Strategy: Look for elements with "Qty:" text
         console.log(`    🔍 Looking for products with "Qty:" pattern...`);
@@ -717,7 +859,8 @@ function parseOrders() {
                     product_name: productName,
                     qty: 1, // Default to 1 if no Qty found
                     color: '',
-                    size: ''
+                    size: '',
+                    account_name: window.__iherbCurrentAccountName || ''
                 });
                 sendLog(orderId, trackingNumber, '✅ Found', productName.substring(0, 80));
             });
@@ -768,7 +911,8 @@ function parseOrders() {
                         product_name: productName,
                         qty: qty,
                         color: '',
-                        size: ''
+                        size: '',
+                        account_name: window.__iherbCurrentAccountName || ''
                     });
                     sendLog(orderId, trackingNumber, '✅ Found', productName.substring(0, 80));
                 }
@@ -962,6 +1106,14 @@ async function exportOrders() {
         // Wait a bit for dynamic content to load
         console.log('⏳ Waiting for page to fully load...');
         await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // Resolve account_name BEFORE parseOrders() runs so every emitted row
+        // carries `account_name`. multi-account path already sets the global
+        // in checkAutoParse(); fall back to accountsConfig primary.
+        if (!window.__iherbCurrentAccountName) {
+          window.__iherbCurrentAccountName = await getIherbAccountFromConfig();
+        }
+        console.log(`👤 iHerb account_name: ${window.__iherbCurrentAccountName || '(empty)'}`);
 
         await slowProgressiveScroll(150);
         const result = parseOrders();

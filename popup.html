@@ -99,16 +99,64 @@
         Amazon страниц: <input type="number" id="pagesToParse" min="1" max="30" value="1" style="width:50px; padding:2px 4px; border:1px solid #ccc; border-radius:4px;">
     </label>
     <label style="display:flex; align-items:center; gap:6px; font-size:12px; margin:6px 0;">
-        Email (для логов): 
+        Email (для логов):
         <select id="manualAccountSelect" style="padding:2px; border-radius:4px; border:1px solid #ccc; font-size:11px;">
             <option value="photopochtoy@gmail.com">photopochtoy@gmail.com</option>
             <option value="ipochtoy@gmail.com">ipochtoy@gmail.com</option>
         </select>
     </label>
 
+    <details id="accounts-section" style="background:#fff; border:1px solid #ddd; border-radius:8px; padding:10px; margin-bottom:12px;">
+      <summary style="cursor:pointer; font-size:13px; font-weight:600; color:#333;">👥 Аккаунты (iHerb & Amazon)</summary>
+      <div style="margin-top:10px; display:flex; flex-direction:column; gap:10px; font-size:12px;">
+        <div style="border-left:3px solid #667eea; padding-left:8px;">
+          <div style="font-weight:600; margin-bottom:4px;">🏥 iHerb</div>
+          <label style="display:block; margin-bottom:4px;">
+            Primary:
+            <input type="email" id="iherb-primary-email" placeholder="photopochtoy@gmail.com" style="width:100%; padding:4px; border:1px solid #ccc; border-radius:4px; box-sizing:border-box;">
+            <input type="password" id="iherb-primary-password" placeholder="пароль" style="width:100%; padding:4px; margin-top:3px; border:1px solid #ccc; border-radius:4px; box-sizing:border-box;">
+          </label>
+          <label style="display:block;">
+            Secondary:
+            <input type="email" id="iherb-secondary-email" placeholder="pochtoy@gmail.com" style="width:100%; padding:4px; border:1px solid #ccc; border-radius:4px; box-sizing:border-box;">
+            <input type="password" id="iherb-secondary-password" placeholder="пароль" style="width:100%; padding:4px; margin-top:3px; border:1px solid #ccc; border-radius:4px; box-sizing:border-box;">
+          </label>
+        </div>
+        <div style="border-left:3px solid #ff9500; padding-left:8px;">
+          <div style="font-weight:600; margin-bottom:4px;">📦 Amazon (логин ручной — только email для меток)</div>
+          <label style="display:block; margin-bottom:4px;">
+            Primary email:
+            <input type="email" id="amazon-primary-email" placeholder="ipochtoy@gmail.com" style="width:100%; padding:4px; border:1px solid #ccc; border-radius:4px; box-sizing:border-box;">
+          </label>
+          <label style="display:block;">
+            Secondary email:
+            <input type="email" id="amazon-secondary-email" placeholder="photopochtoy@gmail.com" style="width:100%; padding:4px; border:1px solid #ccc; border-radius:4px; box-sizing:border-box;">
+          </label>
+        </div>
+        <div style="border-left:3px solid #00c853; padding-left:8px;">
+          <div style="font-weight:600; margin-bottom:4px;">🛒 eBay</div>
+          <label style="display:block;">
+            Email:
+            <input type="email" id="ebay-email" placeholder="ipochtoy@gmail.com" style="width:100%; padding:4px; border:1px solid #ccc; border-radius:4px; box-sizing:border-box;">
+          </label>
+        </div>
+        <div style="display:flex; gap:6px; align-items:center;">
+          <button id="save-accounts-btn" class="button primary-button" style="flex:1; padding:8px; margin:0;">💾 Сохранить</button>
+          <label style="display:flex; align-items:center; gap:4px; font-size:11px;">
+            <input type="checkbox" id="show-passwords"> показать пароли
+          </label>
+        </div>
+        <div id="accounts-save-status" style="font-size:11px; text-align:center; opacity:0.7; min-height:14px;"></div>
+      </div>
+    </details>
+
     <button id="parseAllStores" class="button primary-button">🚀 Parse All Stores</button>
-    
+
     <div id="multiProgress" style="display: none;">
+        <div id="pipeline-stage-indicator" style="padding:8px; background:#eef1ff; border-radius:6px; margin-bottom:10px; font-size:12px; text-align:center; display:none;">
+          <div style="font-weight:600; color:#333;">📡 Этап <span id="pipeline-stage-index">0/8</span></div>
+          <div id="pipeline-stage-name" style="color:#667eea; margin-top:2px;">—</div>
+        </div>
         <div class="progress-container" id="ebay-progress-container">
             <div class="progress-label-container" style="display: flex; justify-content: space-between; align-items: center;">
                 <span class="progress-label">eBay:</span>

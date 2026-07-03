@@ -109,29 +109,50 @@ if (!window.location.href.includes('switch_account=picker') && !window.location.
     }
     
     if (isAlreadySelected) {
-      console.log('🚀 Already on target account, going straight to orders!');
       switchLog('already-selected', { targetEmail });
-      await chrome.storage.local.remove(['pendingAccountSwitch']);
-      await chrome.storage.local.set({
-        accountSwitchInProgress: true,
-        switchedToEmail: targetEmail
-      });
-      window.location.href = 'https://www.amazon.com/gp/your-account/order-history?orderFilter=year-2025';
+      const flagData = await chrome.storage.local.get(['amazonFinalReturn']);
+      if (flagData.amazonFinalReturn) {
+        console.log('🏁 Already on primary account — final return done, clearing flag');
+        switchLog('final-return:home', { targetEmail });
+        await chrome.storage.local.remove([
+          'pendingAccountSwitch',
+          'amazonFinalReturn',
+          'accountSwitchInProgress',
+          'switchedToEmail',
+          'accountSwitchStartedAt'
+        ]);
+        window.location.href = 'https://www.amazon.com/';
+      } else {
+        console.log('🚀 Already on target account, going straight to orders!');
+        await chrome.storage.local.remove(['pendingAccountSwitch']);
+        await chrome.storage.local.set({
+          accountSwitchInProgress: true,
+          switchedToEmail: targetEmail
+        });
+        window.location.href = 'https://www.amazon.com/gp/your-account/order-history?orderFilter=year-2025';
+      }
       return;
     }
     
     if (targetRow) {
       console.log(`🖱️ Found target row for: ${targetEmail}`);
       console.log('Row HTML:', targetRow.outerHTML.substring(0, 300));
+      const flagData = await chrome.storage.local.get(['amazonFinalReturn']);
+      const isFinalReturn = !!flagData.amazonFinalReturn;
       
       // Clear pending switch before clicking
       await chrome.storage.local.remove(['pendingAccountSwitch']);
       
-      // Set flag that we switched
-      await chrome.storage.local.set({ 
-        accountSwitchInProgress: true,
-        switchedToEmail: targetEmail 
-      });
+      // Only parse after a real account switch. Final return must land on home and
+      // let content-amazon-redirect.js clear amazonFinalReturn without starting parse.
+      if (!isFinalReturn) {
+        await chrome.storage.local.set({
+          accountSwitchInProgress: true,
+          switchedToEmail: targetEmail
+        });
+      } else {
+        await chrome.storage.local.remove(['accountSwitchInProgress', 'switchedToEmail']);
+      }
       
       // Find the best element to click - avoid "Sign out" links!
       let clickTarget = null;
@@ -165,11 +186,18 @@ if (!window.location.href.includes('switch_account=picker') && !window.location.
         targetRow.click();
       }
 
-      // Wait and redirect to orders
-      setTimeout(() => {
-        console.log('🔄 Redirecting to orders page...');
-        switchLog('redirect-to-orders', { targetEmail });
-        window.location.href = 'https://www.amazon.com/gp/your-account/order-history?orderFilter=year-2025';
+      // Wait and redirect — на orders для парса, или на главную если final return
+      setTimeout(async () => {
+        const currentFlags = await chrome.storage.local.get(['amazonFinalReturn']);
+        if (currentFlags.amazonFinalReturn) {
+          console.log('🏁 Final return — redirecting to Amazon home (no parse)');
+          switchLog('final-return:home', { targetEmail });
+          window.location.href = 'https://www.amazon.com/';
+        } else {
+          console.log('🔄 Redirecting to orders page...');
+          switchLog('redirect-to-orders', { targetEmail });
+          window.location.href = 'https://www.amazon.com/gp/your-account/order-history?orderFilter=year-2025';
+        }
       }, 2000);
 
     } else {

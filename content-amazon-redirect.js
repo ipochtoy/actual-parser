@@ -18,10 +18,17 @@ console.log('🔄 Amazon redirect script loaded on:', window.location.href);
   }
   
   // Check if we just switched accounts and need to go to orders
-  const data = await chrome.storage.local.get(['accountSwitchInProgress', 'switchedToEmail']);
-  
+  const data = await chrome.storage.local.get(['accountSwitchInProgress', 'switchedToEmail', 'amazonFinalReturn']);
+
   console.log('📋 Checking for account switch flag:', data);
-  
+
+  // Final return: добрались до главной на нужном аккаунте — просто чистим флаги
+  if (data.amazonFinalReturn) {
+    console.log('🏁 Amazon final return complete, clearing flags (no parse)');
+    await chrome.storage.local.remove(['amazonFinalReturn', 'accountSwitchInProgress', 'switchedToEmail']);
+    return;
+  }
+
   if (data.accountSwitchInProgress) {
     console.log(`✅ Account switch completed to ${data.switchedToEmail}, redirecting to orders...`);
     

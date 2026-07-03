@@ -137,6 +137,20 @@ const IS_LOGIN     = IS_NEW_LOGIN || IS_OLD_LOGIN;
     }
   }
 
+  // Всё ещё на login-странице после 12с и без captcha — редиректа не было,
+  // значит логин НЕ прошёл (неверный пароль / inline-ошибка / verify-модалка на
+  // том же URL). Раньше это считалось успехом → переход на orders → выброс на
+  // свежий login → 5 минут пустого ожидания watchdog'а. Фейлимся сразу и несём
+  // текст ошибки со страницы для диагностики.
+  if (/\/account\/(sign-in|login)/i.test(location.href)) {
+    const errText = Array.from(document.querySelectorAll(
+      '[role="alert"], [class*="error" i], [class*="alert" i], [id*="error" i]'
+    )).map(el => (el.textContent || '').trim()).filter(t => t && t.length < 200).join(' | ').slice(0, 300);
+    console.warn('🔐 [iHerb Login] no redirect after Sign In — login failed.', errText || '(no visible error text)');
+    sendFailed(email, 'no_redirect_after_signin' + (errText ? ': ' + errText : ''));
+    return;
+  }
+
   // Login завершён — чистим pendingIherbSwitch
   await chrome.storage.local.remove(['pendingIherbSwitch']);
 

@@ -3,6 +3,110 @@ import { readSheetData, writeDataToSheet, getAuthToken } from './google-auth.js'
 // Fixed default Google Sheet ID (Pochtoy sheet)
 const DEFAULT_SPREADSHEET_ID = '1w1QOzGWc_CNovlezuxyLta-h1kM3pgPXc_GoHYaOA98';
 
+// === Accounts Config ===
+const DEFAULT_ACCOUNTS_CONFIG = {
+  iherb: [
+    { email: 'photopochtoy@gmail.com',     password: 'jSt0ldU%W55!', isPrimary: true },
+    { email: 'questburgh@gmail.com',        password: '1Svetakurz@',  isPrimary: false },
+    { email: 'oksanasorokapocht@gmail.com', password: '1Svetakurz@',  isPrimary: false }
+  ],
+  amazon: [
+    { email: 'ipochtoy@gmail.com',     isPrimary: true },
+    { email: 'photopochtoy@gmail.com', isPrimary: false }
+  ],
+  ebay: [
+    { email: 'ipochtoy@gmail.com',     isPrimary: true }
+  ]
+};
+
+async function loadAccountsIntoForm() {
+  const resp = await chrome.runtime.sendMessage({ action: 'getAccountsConfig' }).catch(() => null);
+  const cfg = (resp && resp.config) || DEFAULT_ACCOUNTS_CONFIG;
+  const iherbP = cfg.iherb.find(a => a.isPrimary) || cfg.iherb[0] || {};
+  const iherbS = cfg.iherb.find(a => !a.isPrimary) || cfg.iherb[1] || {};
+  const amazonP = cfg.amazon.find(a => a.isPrimary) || cfg.amazon[0] || {};
+  const amazonS = cfg.amazon.find(a => !a.isPrimary) || cfg.amazon[1] || {};
+  const ebayP = cfg.ebay[0] || {};
+  const q = id => document.getElementById(id);
+  if (q('iherb-primary-email'))     q('iherb-primary-email').value     = iherbP.email || '';
+  if (q('iherb-primary-password'))  q('iherb-primary-password').value  = iherbP.password || '';
+  if (q('iherb-secondary-email'))   q('iherb-secondary-email').value   = iherbS.email || '';
+  if (q('iherb-secondary-password'))q('iherb-secondary-password').value= iherbS.password || '';
+  if (q('amazon-primary-email'))    q('amazon-primary-email').value    = amazonP.email || '';
+  if (q('amazon-secondary-email'))  q('amazon-secondary-email').value  = amazonS.email || '';
+  if (q('ebay-email'))              q('ebay-email').value              = ebayP.email || '';
+}
+
+async function saveAccountsFromForm() {
+  const v = id => (document.getElementById(id)?.value || '').trim();
+  const cfg = {
+    iherb: [
+      { email: v('iherb-primary-email'),   password: v('iherb-primary-password'),   isPrimary: true  },
+      { email: v('iherb-secondary-email'), password: v('iherb-secondary-password'), isPrimary: false }
+    ].filter(a => a.email),
+    amazon: [
+      { email: v('amazon-primary-email'),   isPrimary: true  },
+      { email: v('amazon-secondary-email'), isPrimary: false }
+    ].filter(a => a.email),
+    ebay: [
+      { email: v('ebay-email'), isPrimary: true }
+    ].filter(a => a.email)
+  };
+  // В форме только 2 iHerb-поля, а аккаунтов может быть больше (сейчас 3) —
+  // сохраняем невлезшие в форму secondary-аккаунты, иначе Save молча их удалит.
+  try {
+    const resp = await chrome.runtime.sendMessage({ action: 'getAccountsConfig' }).catch(() => null);
+    const saved = (resp && resp.config && resp.config.iherb) || [];
+    const formEmails = new Set(cfg.iherb.map(a => a.email.toLowerCase()));
+    for (const a of saved) {
+      if (a.email && !a.isPrimary && !formEmails.has(a.email.toLowerCase())) cfg.iherb.push({ ...a });
+    }
+  } catch (_) {}
+  const status = document.getElementById('accounts-save-status');
+  if (status) status.textContent = 'Сохраняю...';
+  const r = await chrome.runtime.sendMessage({ action: 'saveAccountsConfig', config: cfg }).catch(() => null);
+  if (status) status.textContent = (r && r.ok) ? '✅ Сохранено' : '❌ Ошибка';
+  setTimeout(() => { if (status) status.textContent = ''; }, 3000);
+}
+
+function wireAccountsUI() {
+  const saveBtn = document.getElementById('save-accounts-btn');
+  if (saveBtn) saveBtn.addEventListener('click', saveAccountsFromForm);
+  const toggle = document.getElementById('show-passwords');
+  if (toggle) toggle.addEventListener('change', () => {
+    const type = toggle.checked ? 'text' : 'password';
+    document.querySelectorAll('#accounts-section input[type="password"], #accounts-section input[type="text"]').forEach(el => {
+      if (el.placeholder === 'пароль' || el.id.endsWith('-password')) el.type = type;
+    });
+  });
+  loadAccountsIntoForm();
+}
+
+// === Pipeline Stage Indicator ===
+const STAGE_LABELS = {
+  iherb:  '🏥 iHerb (оба аккаунта + возврат)',
+  ebay:   '🛒 eBay',
+  amazon: '📦 Amazon (оба аккаунта + возврат)',
+  done:   '✅ Готово'
+};
+
+async function updateStageIndicator() {
+  const r = await chrome.storage.local.get(['pipelineStage']);
+  const p = r.pipelineStage;
+  const box = document.getElementById('pipeline-stage-indicator');
+  const nameEl = document.getElementById('pipeline-stage-name');
+  const idxEl = document.getElementById('pipeline-stage-index');
+  if (!box) return;
+  if (!p || !p.active) {
+    box.style.display = 'none';
+    return;
+  }
+  box.style.display = 'block';
+  const stage = p.stages[p.currentIndex] || 'done';
+  if (nameEl) nameEl.textContent = STAGE_LABELS[stage] || stage;
+  if (idxEl)  idxEl.textContent  = `${p.currentIndex + 1}/${p.stages.length}`;
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     initialize();
 });
@@ -71,6 +175,11 @@ function initialize() {
         chrome.runtime.sendMessage({ action: 'reloadScreenshotSettings' });
     });
 
+    document.getElementById('manualAccountSelect')?.addEventListener('change', (e) => {
+        chrome.storage.local.set({ manualAccountName: e.target.value });
+        console.log('📧 Account set:', e.target.value);
+    });
+
     // --- NEW: Financial Mode Logic ---
     const modeRadios = document.getElementsByName('parseMode');
     const testParseBtn = document.getElementById('testParseFinancial');
@@ -131,8 +240,12 @@ function initialize() {
         if (screenshotsEl) screenshotsEl.checked = res.screenshotsEnabled || false;
 
         const manualAccEl = document.getElementById('manualAccountSelect');
-        if (manualAccEl && res.manualAccountName) {
-            manualAccEl.value = res.manualAccountName;
+        if (manualAccEl) {
+            if (res.manualAccountName) {
+                manualAccEl.value = res.manualAccountName;
+            }
+            // Always persist current dropdown value (covers first-load default)
+            chrome.storage.local.set({ manualAccountName: manualAccEl.value });
         }
 
         if (res.savedPagesToParse && pagesToParseInput) pagesToParseInput.value = res.savedPagesToParse;
@@ -177,6 +290,7 @@ function initialize() {
     restoreProgressState();
     restorePagesToParse();
     restoreAutomationState(); // Restore automation progress on open
+    wireAccountsUI();
 }
 
 function restorePagesToParse() {
@@ -203,7 +317,11 @@ function getUrlPatternsForStore(store) {
 
 function urlMatchesAnyPattern(url, patterns) {
     return patterns.some(p => {
-        const rx = new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, m => m === '*' ? '.*' : `\\${m}`).replace(/\\\*/g, '.*'));
+        const escaped = p
+            .split('*')
+            .map(part => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&'))
+            .join('.*');
+        const rx = new RegExp(`^${escaped}$`);
         return rx.test(url);
     });
 }
@@ -215,20 +333,7 @@ async function parseStore(store, overrides = {}) {
         button.disabled = true;
     }
 
-    // For Amazon, use multi-account parsing (photopochtoy + ipochtoy)
-    if (store.name === 'Amazon' && !overrides.skipMultiAccount && overrides.isMultiAccount !== false) {
-        console.log('🔄 Starting multi-account Amazon parsing from regular button');
-        chrome.runtime.sendMessage({ action: "startMultiAccountAmazon" }, (response) => {
-            if (response?.status === 'started') {
-                updateStatus('🔄 Multi-account Amazon parsing started', 'success');
-            }
-        });
-        if(button) {
-            button.classList.remove('loading');
-            button.disabled = false;
-        }
-        return;
-    }
+
 
     try {
         // Get current mode
@@ -269,6 +374,14 @@ async function parseStore(store, overrides = {}) {
         // Content scripts on SPA pages (iHerb, eBay) may not be loaded yet
         const maxRetries = 10;
         let sent = false;
+        // Self-heal for the #1 "parser won't start" cause: after the extension
+        // is reloaded (every code deploy / dev reload), the content script in an
+        // ALREADY-OPEN tab has its context invalidated and is NEVER re-injected
+        // until the PAGE itself is refreshed. sendMessage then fails forever with
+        // "Could not establish connection / Receiving end does not exist" and the
+        // retry loop just spins. Detect that and reload the tab once to force a
+        // fresh content script, then keep retrying.
+        let reloadedForStaleCs = false;
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             // Wait longer for newly created tabs
             const waitMs = attempt === 1 ? 1500 : 2000;
@@ -294,6 +407,21 @@ async function parseStore(store, overrides = {}) {
                 sent = true;
                 break;
             } catch (e) {
+                const msg = e?.message || '';
+                const staleContentScript =
+                    /Could not establish connection|Receiving end does not exist/i.test(msg);
+                if (staleContentScript && !reloadedForStaleCs) {
+                    // Re-inject a fresh content script by reloading the tab, then
+                    // give it time to load before the next sendMessage attempt.
+                    reloadedForStaleCs = true;
+                    console.warn(`♻️ ${store.name}: stale content script — reloading tab ${tabToUse.id} to re-inject...`);
+                    updateStatus(`♻️ ${store.name}: обновляю страницу и пробую снова…`, 'info');
+                    try {
+                        await new Promise((resolve) => chrome.tabs.reload(tabToUse.id, {}, resolve));
+                        await new Promise(resolve => setTimeout(resolve, 3000));
+                    } catch (_) {}
+                    continue;
+                }
                 if (attempt === maxRetries) {
                     console.error(`❌ Failed to send message to ${store.name} after ${maxRetries} attempts`);
                     updateStatus(`❌ ${store.name}: content script not responding. Try refreshing the page.`, 'error');
@@ -313,101 +441,17 @@ async function parseStore(store, overrides = {}) {
 }
 
 async function parseAllStores() {
-    updateStatus('🚀 Launching parsers...', 'info');
-    await clearAllStoreData(false); // silent clear
-
-    // Notify background to initialize state
-    chrome.runtime.sendMessage({ action: "startParsingAllStores" });
-
-    // Clear any previous stop flag when we explicitly start parsing
-    await new Promise(resolve => chrome.storage.local.set({ stopAllParsers: false }, resolve));
-
-    const multiProgress = document.getElementById('multiProgress');
-    if (multiProgress) {
-        multiProgress.style.display = 'block';
-        ['ebay', 'iherb', 'amazon'].forEach(storeKey => {
-            updateStoreProgress(storeKey.charAt(0).toUpperCase() + storeKey.slice(1), 0, 1, 'Waiting...');
-        });
-    }
-
-    // Helper: retry sending message until content script responds
-    async function sendMessageWithRetry(tabId, message, storeName, maxRetries = 12) {
-        for (let attempt = 1; attempt <= maxRetries; attempt++) {
-            const waitMs = attempt <= 3 ? 2000 : 3000;
-            await new Promise(resolve => setTimeout(resolve, waitMs));
-
-            console.log(`📤 [${storeName}] Attempt ${attempt}/${maxRetries} sending message...`);
-            updateStoreProgress(storeName, 0, 1, `Connecting... (${attempt}/${maxRetries})`);
-
-            try {
-                const response = await new Promise((resolve, reject) => {
-                    chrome.tabs.sendMessage(tabId, message, (resp) => {
-                        if (chrome.runtime.lastError) {
-                            reject(chrome.runtime.lastError);
-                        } else {
-                            resolve(resp);
-                        }
-                    });
-                });
-                console.log(`✅ [${storeName}] Message delivered on attempt ${attempt}`, response);
-                updateStoreProgress(storeName, 0, 1, "Parsing...");
-                return true;
-            } catch (e) {
-                console.warn(`⚠️ [${storeName}] Attempt ${attempt}: ${e.message}`);
-            }
-        }
-        console.error(`❌ [${storeName}] Failed after ${maxRetries} attempts`);
-        updateStoreProgress(storeName, 1, 1, "Error - no response");
-        return false;
-    }
-
-    // Only eBay and iHerb are opened directly - Amazon uses multi-account via background.js
-    try {
-        // Step 1: Open eBay tab
-        updateStoreProgress('Ebay', 0, 1, "Opening...");
-        const ebayTab = await chrome.tabs.create({ url: 'https://www.ebay.com/mye/myebay/purchase', active: false });
-        console.log(`🌐 eBay tab created: ${ebayTab.id}`);
-
-        // Step 2: Open iHerb tab
-        updateStoreProgress('iHerb', 0, 1, "Opening...");
-        const iherbTab = await chrome.tabs.create({ url: 'https://secure.iherb.com/myaccount/orders', active: false });
-        console.log(`🌐 iHerb tab created: ${iherbTab.id}`);
-
-        // Step 3: Wait for initial page load
-        updateStatus('Waiting for pages to load...', 'info');
-        await new Promise(resolve => setTimeout(resolve, 5000));
-
-        // Step 4: Refresh iHerb to avoid "Service unavailable" issue
-        updateStoreProgress('iHerb', 0, 1, "Refreshing...");
-        await chrome.tabs.reload(iherbTab.id);
-        console.log('🔄 iHerb tab refreshed');
-
-        // Step 5: Send parse commands with retry (in parallel)
-        console.log('📤 Sending parse commands with retry...');
-        const [ebayResult, iherbResult] = await Promise.all([
-            sendMessageWithRetry(ebayTab.id, { action: 'exportEbayOrders' }, 'Ebay'),
-            sendMessageWithRetry(iherbTab.id, { action: 'exportIherbOrders' }, 'iHerb')
-        ]);
-
-        console.log(`📊 Parse commands: eBay=${ebayResult}, iHerb=${iherbResult}`);
-
-        // Step 6: Amazon uses multi-account parsing via background.js
-        updateStoreProgress('Amazon', 0, 1, "Starting multi-account...");
-        chrome.runtime.sendMessage({ action: "startMultiAccountAmazon" }, (response) => {
-            if (response?.status === 'started') {
-                console.log('✅ Multi-account Amazon parsing started');
-            } else {
-                console.error('❌ Failed to start multi-account Amazon parsing');
-                updateStoreProgress('Amazon', 1, 1, "Error");
-            }
-        });
-
-        updateStatus('✅ All parse commands sent!', 'success');
-
-    } catch (error) {
-        console.error('Error in parseAllStores:', error);
-        updateStatus('Failed to open or command tabs.', 'error');
-    }
+  const multiProgress = document.getElementById('multiProgress');
+  if (multiProgress) multiProgress.style.display = 'block';
+  const btn = document.getElementById('parseAllStores');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Выполняется…'; }
+  const resp = await chrome.runtime.sendMessage({ action: 'startSequentialPipeline' }).catch(() => null);
+  if (resp && resp.status === 'started') {
+    updateStatus('🚀 Pipeline запущен (iHerb → eBay → Amazon)', 'info');
+  } else {
+    updateStatus('❌ Не удалось запустить', 'error');
+    if (btn) { btn.disabled = false; btn.textContent = '🚀 Parse All Stores'; }
+  }
 }
 
 // Multi-account Amazon parsing (photopochtoy + ipochtoy)
@@ -885,6 +929,7 @@ function startProgressPolling() {
 
     progressPollingInterval = setInterval(() => {
         restoreProgressState(); // Read from storage and update UI
+        updateStageIndicator();  // Update pipeline stage indicator
     }, 1000); // Poll every 1 second
 }
 
