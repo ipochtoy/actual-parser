@@ -115,19 +115,41 @@ function cdpEvaluate(wsUrl, expression, awaitPromise = false) {
   });
 }
 
-// Ищет SW-таргет парсера и читает нужные ключи storage.
-// Возвращает { ok:true, storage } | { ok:false, reason:'cdp_down'|'ext_missing' }.
-async function readParserStorage() {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Одна попытка: найти SW-таргет парсера в /json и прочитать storage.
+// { storage, wsUrl } при успехе | { down:true } если CDP недоступен | {} если SW не найден.
+async function tryReadParserStorage(expr) {
   let targets;
   try {
     targets = await httpJson('/json');
   } catch {
-    return { ok: false, reason: 'cdp_down' };
+    return { down: true };
   }
   const sws = (Array.isArray(targets) ? targets : []).filter(
     t => t.type === 'service_worker' && typeof t.url === 'string' && t.url.startsWith('chrome-extension://') && t.webSocketDebuggerUrl
   );
+  for (const sw of sws) {
+    let out;
+    try { out = await cdpEvaluate(sw.webSocketDebuggerUrl, expr, true); }
+    catch { continue; }
+    if (out && out.__match) return { storage: out.d || {}, wsUrl: sw.webSocketDebuggerUrl };
+  }
+  return {};
+}
 
+// Ищет SW-таргет парсера и читает нужные ключи storage.
+// Возвращает { ok:true, storage, wsUrl } | { ok:false, reason:'cdp_down'|'ext_missing' }.
+//
+// ВАЖНО (флап-фикс 2026-07-04): MV3 service worker парсера засыпает ~30с из ~60с цикла и
+// ПРОПАДАЕТ из /json целиком (browser-level Target.setDiscoverTargets его тоже не видит,
+// а ServiceWorker.startWorker для extension-SW в CDP недоступен). Дормантность != «расширение
+// не загружено»: alarm в 23:00 сам разбудит SW и парс пойдёт. Раньше сторож, поймав тик на
+// спящем SW, слал ложный «не загружено» каждые ~30-60 мин всю ночь (лог 2026-07-04). Теперь
+// при промахе РЕТРАИМ до ~75с — SW сам встаёт на ближайшем alarm-тике (замер макс. дормантности
+// = 30с). Только стойкое отсутствие (>75с) = реально выгружено/выключено. cdp_down (Chrome
+// закрыт) остаётся мгновенным — это отдельное реальное условие, не дормантность SW.
+async function readParserStorage() {
   const KEYS = [
     'dailyAutoParseEnabled',
     'lastDailyAutoParseTriggeredAt',
@@ -140,13 +162,16 @@ async function readParserStorage() {
     `(async()=>{try{if(chrome.runtime.getManifest().name!==${JSON.stringify(PARSER_MANIFEST_NAME)})return {__nomatch:true};` +
     `const d=await chrome.storage.local.get(${JSON.stringify(KEYS)});return {__match:true,d};}catch(e){return {__err:String(e)};}})()`;
 
-  for (const sw of sws) {
-    let out;
-    try { out = await cdpEvaluate(sw.webSocketDebuggerUrl, expr, true); }
-    catch { continue; }
-    if (out && out.__match) return { ok: true, storage: out.d || {}, wsUrl: sw.webSocketDebuggerUrl };
+  const DORMANT_RETRY_MS = 75000, STEP_MS = 8000;
+  const deadline = Date.now() + DORMANT_RETRY_MS;
+  for (let attempt = 1; ; attempt++) {
+    const r = await tryReadParserStorage(expr);
+    if (r.storage) return { ok: true, storage: r.storage, wsUrl: r.wsUrl };
+    if (r.down) return { ok: false, reason: 'cdp_down' };   // Chrome закрыт — реальное условие, не ждём
+    if (Date.now() >= deadline) return { ok: false, reason: 'ext_missing' };
+    log(`readParserStorage: SW парсера не виден (спит?), попытка ${attempt}, жду ${STEP_MS / 1000}s и пробую снова…`);
+    await sleep(STEP_MS);
   }
-  return { ok: false, reason: 'ext_missing' };
 }
 
 // ---------- команда расширению (автопочинка, инцидент 2026-07-03) ----------
