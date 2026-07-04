@@ -757,6 +757,10 @@ function parseOrders() {
     console.log('\n📦 STEP 2: Processing each order (limit: 150)...');
 
     const processedOrders = new Set();
+    // Дедуп по ОТГРУЗКЕ (заказ+трек), а не по заказу: сплит-заказ iHerb приезжает
+    // несколькими <article> с одним data-order-number, но разными треками — каждый
+    // пакет должен пройти как своя строка. (сплит-фикс 2026-07-04)
+    const processedShipments = new Set();
     const MAX_ORDERS = 150;
 
     // Дата-пол глубины парса iHerb (оператор 2026-07-04). Новые аккаунты
@@ -790,15 +794,39 @@ function parseOrders() {
         const orderId = headerObj.orderId;
         if (!orderId) return;
 
-        // Skip duplicates
-        if (processedOrders.has(orderId)) {
-            console.log(`  ⏭️  Skipping duplicate Order #${orderId}`);
+        // Use the element directly as container (it's already the article element)
+        const orderContainer = headerObj.element;
+
+        // Извлекаем трек РАНЬШЕ дедупа — он нужен для сплит-осознанного ключа.
+        // Сплит-заказ iHerb приезжает несколькими <article> с ОДИНАКОВЫМ data-order-number,
+        // но каждый пакет — отдельная отгрузка (orderNumber-0/-1/-2) со своим треком. Дедуп
+        // по (заказ+трек), а не по заказу, иначе второй пакет схлопывается как «дубликат» и
+        // его товары теряются (недосбор). На повторном проходе новый пакет = новый трек =
+        // новые строки; строки первого пакета стабильны. (сплит-фикс 2026-07-04)
+        let trackingNumber = '';
+        const trackBtn = orderContainer.querySelector('a[href*="carrierTracking"]');
+        if (trackBtn) {
+            try {
+                const url = new URL(trackBtn.getAttribute('href'), 'https://secure.iherb.com');
+                trackingNumber = url.searchParams.get('trackingNumber') || '';
+            } catch (_) {}
+            console.log(`    🚚 Tracking: ${trackingNumber}`);
+        } else {
+            console.log('    ⚠️  No Track button (Fulfilling status)');
+        }
+
+        // Дедуп по ОТГРУЗКЕ (заказ+трек): пакеты сплита с разными треками проходят оба,
+        // повтор той же отгрузки в одном проходе — отсекается. MAX_ORDERS/счётчик остаются
+        // по уникальному заказу (processedOrders), пакеты его не раздувают.
+        const shipmentKey = `${orderId}|${trackingNumber || 'notrack'}`;
+        if (processedShipments.has(shipmentKey)) {
+            console.log(`  ⏭️  Skipping duplicate shipment #${orderId} (track ${trackingNumber || '—'})`);
             return;
         }
+        processedShipments.add(shipmentKey);
         processedOrders.add(orderId);
 
-        const isFirstOrder = processedOrders.size === 1;
-        console.log(`\n  ✅ Processing Order #${orderId} (${processedOrders.size}/${MAX_ORDERS})`);
+        console.log(`\n  ✅ Processing Order #${orderId} shipment ${trackingNumber || '(no track)'} (${processedShipments.size})`);
 
         // Send progress update
         chrome?.runtime?.sendMessage?.({
@@ -808,9 +836,6 @@ function parseOrders() {
             total: Math.min(orderHeaders.length, MAX_ORDERS),
             status: `Processing order ${processedOrders.size}/${MAX_ORDERS}...`
         });
-
-        // Use the element directly as container (it's already the article element)
-        let orderContainer = headerObj.element;
 
         // Extract date if available
         const dateMatch = orderContainer.textContent.match(/Placed\s+on\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})/i);
@@ -838,17 +863,7 @@ function parseOrders() {
         }
         if (reachedOldOrders) return;
 
-        // Extract tracking number from DOM (no API calls)
-        let trackingNumber = '';
-        const trackBtn = orderContainer.querySelector('a[href*="carrierTracking"]');
-        if (trackBtn) {
-            const href = trackBtn.getAttribute('href');
-            const url = new URL(href, 'https://secure.iherb.com');
-            trackingNumber = url.searchParams.get('trackingNumber') || '';
-            console.log(`    🚚 Tracking: ${trackingNumber}`);
-        } else {
-            console.log('    ⚠️  No Track button (Fulfilling status)');
-        }
+        // (трек и trackBtn уже извлечены выше — до сплит-осознанного дедупа)
 
         // Очередь скриншота заказа iHerb — страница carrierTracking (по кнопке Track shipment).
         // НЕ фильтруем по возрасту заказа: дедуп «уже отправляли» делает background
