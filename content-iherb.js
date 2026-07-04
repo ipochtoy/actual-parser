@@ -260,6 +260,21 @@ async function retryOnServiceUnavailable(maxRetries = 5, baseDelay = 20000) {
   console.log('🔍 Quick check - has orders:', hasOrders);
 
   if (!hasOrders) {
+    // PerimeterX "Press & Hold to confirm you are a human"? Это не пустой SPA-shell,
+    // а поведенческий челлендж. Content-script не может его пройти (JS-события
+    // isTrusted:false). Делегируем background'у — там chrome.debugger генерит
+    // настоящие mouse-события (isTrusted:true) и зажимает кнопку ~11с. После успеха
+    // background перезагрузит /orders, и этот IIFE перезапустится уже с заказами.
+    const phText = (document.body?.innerText || '').toLowerCase();
+    const isPressHold = /press\s*&?\s*hold/.test(phText) &&
+                        (/confirm you are a human/.test(phText) || /reference id/.test(phText));
+    if (isPressHold) {
+      console.log('🧩 Press & Hold detected — delegating to background solver');
+      await sendLog('-', '-', '🧩 Captcha', 'Press & Hold — авто-решение (human-hold)');
+      try { chrome.runtime.sendMessage({ action: 'solveIherbPressHold' }); } catch (_) {}
+      return; // не парсим; background решит челлендж и перезагрузит страницу
+    }
+
     // Orders not loaded yet - wait more
     console.log('⏳ No orders yet, waiting 5 more seconds...');
     await new Promise(resolve => setTimeout(resolve, 5000));

@@ -369,14 +369,13 @@ const PIPELINE_STALE_TIMEOUT_MS = 15 * 60 * 1000;
 // Primary account = isPrimary:true, идёт ПЕРВЫМ в массиве (парсится первым
 // для iHerb, финальный возврат — для Amazon).
 const DEFAULT_ACCOUNTS_CONFIG = {
-  // iHerb — временно ТОЛЬКО photopochtoy (оператор 2026-07-03). questburgh и
-  // oksanasorokapocht залогинены и device-trusted, но пока НЕ парсятся: без
-  // secondaries парсер не делает sign-out dance. Чтобы вернуть мульти-аккаунт —
-  // раскомментируй строки ниже и бампни флаг миграции.
+  // iHerb — все три аккаунта (оператор 2026-07-04: «выпарсить все три»).
+  // primary photopochtoy парсится по fast-path (уже залогинен), secondaries
+  // проходят sign-out dance + логин. Все device-trusted.
   iherb: [
-    { email: 'photopochtoy@gmail.com',     password: 'jSt0ldU%W55!', isPrimary: true  }
-    // { email: 'questburgh@gmail.com',        password: '1Svetakurz@',  isPrimary: false },
-    // { email: 'oksanasorokapocht@gmail.com', password: '1Svetakurz@',  isPrimary: false }
+    { email: 'photopochtoy@gmail.com',     password: 'jSt0ldU%W55!', isPrimary: true  },
+    { email: 'questburgh@gmail.com',        password: '1Svetakurz@',  isPrimary: false },
+    { email: 'oksanasorokapocht@gmail.com', password: '1Svetakurz@',  isPrimary: false }
   ],
   amazon: [
     { email: 'ipochtoy@gmail.com',     isPrimary: true  },
@@ -421,6 +420,30 @@ async function migrateIherbAccounts_20260703() {
   }
 }
 migrateIherbAccounts_20260703();
+
+// --- One-time migration 2026-07-04: вернуть все 3 iHerb-аккаунта ---
+// Прошлая миграция (_20260703) записала в storage одно-аккаунтный список
+// (только photopochtoy). Теперь оператор хочет все три — перезаписываем
+// сохранённый accountsConfig.iherb новым 3-аккаунтным дефолтом. Отдельный флаг.
+async function migrateIherbAccounts_20260704() {
+  try {
+    const r = await chrome.storage.local.get(['accountsConfig', 'iherbAccountsMigrated_20260704']);
+    if (r.iherbAccountsMigrated_20260704) return;
+    if (r.accountsConfig) {
+      await chrome.storage.local.set({
+        accountsConfig: { ...r.accountsConfig, iherb: DEFAULT_ACCOUNTS_CONFIG.iherb.map(a => ({ ...a })) },
+        iherbAccountsMigrated_20260704: true
+      });
+      console.log('🔄 [migrate] accountsConfig.iherb → все 3 аккаунта (photopochtoy + questburgh + oksanasorokapocht)');
+    } else {
+      await chrome.storage.local.set({ iherbAccountsMigrated_20260704: true });
+      console.log('🔄 [migrate] accountsConfig отсутствует — 3-аккаунтный DEFAULT актуален, флаг выставлен');
+    }
+  } catch (e) {
+    console.warn('⚠️ [migrate] iHerb accounts 20260704 migration failed:', e?.message || e);
+  }
+}
+migrateIherbAccounts_20260704();
 
 function getPrimary(list)     { return list.find(a => a.isPrimary) || list[0]; }
 function getSecondaries(list) { return list.filter(a => !a.isPrimary); }
@@ -1184,6 +1207,57 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 console.warn('🧩 [2captcha] solve failed:', err?.message || err);
                 sendResponse({ ok: false, reason: err?.message || String(err) });
             });
+        return true; // async
+    } else if (request.action === "solveIherbPressHold") {
+        // PerimeterX "Press & Hold" на iHerb /orders. Content-script задетектил
+        // челлендж и делегировал сюда (там chrome.debugger может сгенерить
+        // isTrusted:true mouse-события). Решаем, при успехе перезагружаем /orders
+        // для свежего парса; после PRESS_HOLD_MAX_ATTEMPTS — пропускаем стадию iHerb.
+        (async () => {
+            try {
+                const stored = await chrome.storage.local.get(['iherbParserTabId', 'iherbPressHoldAttempts']);
+                const tabId = sender.tab?.id || stored.iherbParserTabId;
+                if (!tabId) { sendResponse({ solved: false, reason: 'no_tab' }); return; }
+
+                const attempts = (stored.iherbPressHoldAttempts || 0) + 1;
+                await chrome.storage.local.set({ iherbPressHoldAttempts: attempts });
+
+                if (attempts > PRESS_HOLD_MAX_ATTEMPTS) {
+                    console.warn(`🧩 [P&H] max attempts (${PRESS_HOLD_MAX_ATTEMPTS}) — skip iHerb stage`);
+                    await chrome.storage.local.remove(['iherbPressHoldAttempts']);
+                    sendResponse({ solved: false, reason: 'max_attempts' });
+                    if (isMultiAccountIherb) await abortIherbStageDueToCaptcha(currentIherbAccount || 'unknown');
+                    return;
+                }
+
+                const r = await solveIherbPressHold(tabId);
+                if (r.solved) {
+                    console.log('🧩 [P&H] solved ✅ — re-navigating /orders for fresh parse');
+                    sendTelegramMessage('✅ iHerb Press & Hold пройден — продолжаю парсинг').catch(() => {});
+                    await chrome.storage.local.remove(['iherbPressHoldAttempts', 'iherbOrdersReloadDone']);
+                    // iherbSwitchInProgress остаётся true → IIFE content-script снова
+                    // авто-парсит после reload. Ставим свежий маркер для watchdog.
+                    await chrome.storage.local.set({ iherbParseStartedAt: Date.now() });
+                    await new Promise(res => setTimeout(res, 1200 + Math.random() * 800));
+                    await chrome.tabs.update(tabId, { url: 'https://secure.iherb.com/myaccount/orders', active: true });
+                    sendResponse({ solved: true });
+                } else {
+                    console.warn(`🧩 [P&H] not solved (${r.reason}) attempt ${attempts}/${PRESS_HOLD_MAX_ATTEMPTS}`);
+                    sendResponse({ solved: false, reason: r.reason });
+                    if (attempts >= PRESS_HOLD_MAX_ATTEMPTS) {
+                        await chrome.storage.local.remove(['iherbPressHoldAttempts']);
+                        if (isMultiAccountIherb) await abortIherbStageDueToCaptcha(currentIherbAccount || 'unknown');
+                    } else {
+                        // ещё попытка: reload → content-script снова задетектит P&H
+                        await new Promise(res => setTimeout(res, 2000));
+                        await chrome.tabs.update(tabId, { url: 'https://secure.iherb.com/myaccount/orders', active: true });
+                    }
+                }
+            } catch (e) {
+                console.error('🧩 [P&H] handler error:', e?.message || e);
+                sendResponse({ solved: false, reason: String(e?.message || e) });
+            }
+        })();
         return true; // async
     } else if (request.action === "parsingProgress") {
         // Handle parsingProgress from content scripts (convert to progress format)
@@ -2019,6 +2093,111 @@ async function hoverAndFind(tabId, trigger, evalExpr, maxAttempts = 3) {
     }
     console.error(`🌿 [iHerb UI] hoverAndFind giving up after ${maxAttempts}: ${lastReason}`);
     return null;
+}
+
+// ─── PerimeterX "Press & Hold" (HUMAN challenge) detector + solver ─────────
+// iHerb иногда подменяет /myaccount/orders блок-страницей PerimeterX
+// "Press & Hold to confirm you are a human". Это ПОВЕДЕНЧЕСКИЙ челлендж: надо
+// зажать кнопку ~11с, PerimeterX анализирует сенсорику мыши (микродвижения,
+// тайминги). JS-клик (isTrusted:false) он отсекает мгновенно — поэтому жмём
+// через chrome.debugger Input.dispatchMouseEvent (isTrusted:true, как настоящая
+// физическая мышь) + держим с микро-джиттером. После успеха PerimeterX сам
+// редиректит на реальную страницу заказов.
+const PRESS_HOLD_MAX_ATTEMPTS = 3; // circuit-breaker против бесконечного цикла
+
+// Лёгкая детекция БЕЗ debugger-attach — читаем текст страницы через chrome.scripting.
+async function detectIherbPressHold(tabId) {
+    try {
+        const [res] = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: () => {
+                const txt = (document.body?.innerText || '').toLowerCase();
+                const isPH = /press\s*&?\s*hold/.test(txt) &&
+                    (/confirm you are a human/.test(txt) || /reference id/.test(txt));
+                return { isPH, vw: window.innerWidth, vh: window.innerHeight };
+            }
+        });
+        return res?.result || { isPH: false };
+    } catch (e) {
+        console.warn('🧩 [P&H] detect failed:', e?.message || e);
+        return { isPH: false };
+    }
+}
+
+// Пытается найти живой rect кнопки "Press & Hold". Может лежать в обычном DOM
+// (тогда найдём), либо в iframe #px-captcha (тогда null → fallback на пропорции).
+async function findPressHoldButton(tabId) {
+    try {
+        const [res] = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: () => {
+                const cand = [...document.querySelectorAll('button, [role="button"], #px-captcha, div, p')]
+                    .filter(el => {
+                        const t = (el.innerText || el.textContent || '').toLowerCase();
+                        if (!/press\s*&?\s*hold/.test(t)) return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width > 40 && r.height > 20 && r.width < 600 && r.height < 200;
+                    })
+                    .sort((a, b) => a.getBoundingClientRect().width - b.getBoundingClientRect().width);
+                const el = cand[0];
+                if (!el) return null;
+                const r = el.getBoundingClientRect();
+                return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+            }
+        });
+        return res?.result || null;
+    } catch (_) { return null; }
+}
+
+// Проходит один Press & Hold. Возвращает { solved, reason }.
+async function solveIherbPressHold(tabId) {
+    const det = await detectIherbPressHold(tabId);
+    if (!det.isPH) return { solved: true, reason: 'no_press_hold' }; // нечего решать
+
+    const vw = det.vw || 1000, vh = det.vh || 800;
+    const btn = await findPressHoldButton(tabId);
+    // Fallback: PerimeterX-кнопка центрирована по X, ~0.57 высоты (проверено вживую).
+    const BX = Math.round(btn?.x ?? vw / 2);
+    const BY = Math.round(btn?.y ?? vh * 0.57);
+    console.log(`🧩 [P&H] solving at (${BX},${BY}) viewport ${vw}x${vh} rect=${btn ? 'found' : 'proportional'}`);
+    sendTelegramMessage('🧩 iHerb Press & Hold — решаю сам (human-hold)…').catch(() => {});
+
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    const jit = () => (Math.random() * 5 - 2.5); // ±2.5px дрожание руки
+
+    await dbgAttach(tabId);
+    try {
+        // approach: подводим мышь несколькими шагами (не телепорт к кнопке)
+        for (let i = 6; i >= 1; i--) {
+            await dbgSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: BX - i * 14, y: BY + i * 6 });
+            await sleep(50 + Math.random() * 60);
+        }
+        await dbgSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: BX, y: BY });
+        await sleep(150 + Math.random() * 150);
+
+        // press
+        await dbgSend(tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: BX, y: BY, button: 'left', buttons: 1, clickCount: 1 });
+
+        // hold ~11-13с с микро-джиттером (человек не держит кнопку идеально ровно)
+        const holdMs = 11000 + Math.random() * 2000;
+        const start = Date.now();
+        while (Date.now() - start < holdMs) {
+            await sleep(350 + Math.random() * 300);
+            await dbgSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: BX + jit(), y: BY + jit(), button: 'left', buttons: 1 });
+        }
+
+        // release
+        await dbgSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: BX + jit(), y: BY + jit(), button: 'left', buttons: 1, clickCount: 1 });
+    } catch (e) {
+        console.warn('🧩 [P&H] mouse sequence error:', e?.message || e);
+    } finally {
+        await dbgDetach(tabId); // отпускаем debugger — иначе баннер мешает редиректу PerimeterX
+    }
+
+    // PerimeterX валидирует сенсорику и редиректит ~5с
+    await sleep(5000);
+    const after = await detectIherbPressHold(tabId);
+    return { solved: !after.isPH, reason: after.isPH ? 'still_present' : 'solved' };
 }
 
 // ─── Sign-out flow: direct URL redirect (no chrome.debugger) ──
