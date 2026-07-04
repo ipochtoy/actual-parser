@@ -759,6 +759,15 @@ function parseOrders() {
     const processedOrders = new Set();
     const MAX_ORDERS = 150;
 
+    // Дата-пол глубины парса iHerb (оператор 2026-07-04). Новые аккаунты
+    // (questburgh/oksanasorokapocht) без истории дедупа иначе уходят вглубь до
+    // февраля и спамят старьё. Заказы на странице идут новейшие→старые, поэтому
+    // встретив ПЕРВЫЙ заказ старше пола — прекращаем обработку (всё глубже старее).
+    // Для устоявшихся аккаунтов дедуп и так держит глубину; пол — страховка от
+    // бэкфилла. Бампить дату по мере надобности. Формат YYYY-MM-DD (лексикогр.).
+    const IHERB_MIN_ORDER_DATE = '2026-05-15';
+    let reachedOldOrders = false;
+
     // Send initial processing progress
     chrome?.runtime?.sendMessage?.({
         action: 'progress',
@@ -769,6 +778,8 @@ function parseOrders() {
     });
 
     orderHeaders.forEach((headerObj, headerIndex) => {
+        // Дата-пол пройден на предыдущей итерации → всё дальше старее, выходим сразу.
+        if (reachedOldOrders) return;
         // LIMIT: Stop at 76 orders
         if (processedOrders.size >= MAX_ORDERS) {
             console.log(`\n⏹️  Reached ${MAX_ORDERS} orders limit - stopping processing`);
@@ -807,6 +818,25 @@ function parseOrders() {
         if (orderDate) {
             console.log(`    📅 Date: ${orderDate}`);
         }
+
+        // Дата-пол: заказ старше пола → стоп (заказы идут новейшие→старые, значит
+        // всё дальше ещё старее). Пустую/непарсибельную дату НЕ считаем старой,
+        // чтобы не оборваться раньше времени на редком заказе без даты.
+        if (orderDate && orderDate < IHERB_MIN_ORDER_DATE) {
+            console.log(`  ⏹️  Order #${orderId} placed ${orderDate} < floor ${IHERB_MIN_ORDER_DATE} — stopping (older orders skipped)`);
+            reachedOldOrders = true;
+            // Durable-маркер для контроля глубины из SW (оператор видит, что пол сработал).
+            try {
+                chrome.storage.local.get(['multiAccountIherbState'], (acc) => {
+                    const accEmail = acc?.multiAccountIherbState?.currentIherbAccount || '';
+                    chrome.storage.local.set({ iherbFloorStopLast: {
+                        account: accEmail, boundaryOrderId: orderId, boundaryDate: orderDate,
+                        floor: IHERB_MIN_ORDER_DATE, processedBeforeFloor: processedOrders.size - 1, at: Date.now()
+                    }});
+                });
+            } catch (_) {}
+        }
+        if (reachedOldOrders) return;
 
         // Extract tracking number from DOM (no API calls)
         let trackingNumber = '';
