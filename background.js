@@ -2903,6 +2903,15 @@ async function checkAllStoresCompleted() {
                 if (shopParts.length) report += `\n   (${shopParts.join(', ')})`;
             }
 
+            // 🆕 Новизна прогона — сколько свежего реально ушло в лист (после дедупа)
+            const nu = parseReport.newUploads;
+            if (nu) {
+                report += `\n\n🆕 Новых в листе: ${nu.tracks} треков, ${nu.rows} строк`;
+                const nparts = Object.entries(nu.byShop || {}).map(([s, n]) => `${s}: ${n}`);
+                if (nparts.length) report += `\n   (${nparts.join(', ')})`;
+                if (nu.qtyUpdated) report += `\n   +${nu.qtyUpdated} обновлено кол-во`;
+            }
+
             report += `\n\n✅ Выгрузка в Google Sheets завершена`;
 
             // Сохраняем сводку прогона в storage — чтобы «как прошло» можно было
@@ -2913,6 +2922,7 @@ async function checkAllStoresCompleted() {
                     durationSec: elapsed,
                     stores: parseReport.stores,
                     screenshots: parseReport.screenshots,
+                    newUploads: parseReport.newUploads || null,
                     report
                 };
                 const prev = await chrome.storage.local.get(['parseRunSummaries']);
@@ -3052,6 +3062,42 @@ async function uploadToSheets() {
                      newValues.push(r);
                  }
              }
+        }
+
+        // 🆕 Счётчик новизны прогона — сколько РЕАЛЬНО новых строк и трек-номеров ушло
+        // в лист после дедупа, с разбивкой по магазину. Раньше нигде не сохранялось —
+        // ответ на «сколько свежих треков за прогон» приходилось выводить по косвенным
+        // (byShop скринов). Пишем в parseReport (для сводки) + storage.lastUpload (для
+        // ответа в любой момент). Только warehouse-режим: в financial r[2] — это дата. (2026-07-05)
+        if (parseMode !== 'financial') {
+            try {
+                const shopOf = (s) => {
+                    const t = String(s || '').toLowerCase();
+                    return t.includes('amazon') ? 'Amazon' : t.includes('iherb') ? 'iHerb' : t.includes('ebay') ? 'eBay' : 'прочее';
+                };
+                const newTrackSet = new Set();
+                const byShopTracks = {};
+                for (const r of newValues) {
+                    const track = r[2] || '';
+                    if (!track) continue;
+                    const shop = shopOf(r[0]);
+                    const tk = shop + '' + track;
+                    if (!newTrackSet.has(tk)) {
+                        newTrackSet.add(tk);
+                        byShopTracks[shop] = (byShopTracks[shop] || 0) + 1;
+                    }
+                }
+                const newUploads = {
+                    rows: newValues.length,
+                    tracks: newTrackSet.size,
+                    byShop: byShopTracks,
+                    qtyUpdated: rowsToUpdate.length,
+                    at: Date.now()
+                };
+                parseReport.newUploads = newUploads;
+                await chrome.storage.local.set({ lastUpload: newUploads });
+                console.log(`🆕 Новых в листе: ${newUploads.tracks} треков / ${newUploads.rows} строк`, byShopTracks);
+            } catch (e) { console.warn('newUploads counter failed:', e?.message || e); }
         }
 
         // Update existing rows with new qty
