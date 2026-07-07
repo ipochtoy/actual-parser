@@ -738,7 +738,10 @@ async function clearPipelineRuntimeState(reason) {
         'iherbOrdersReloadDone',
         'iherbParserTabId',
         'iherbParseStartedAt',
-        'iherbWatchdogRetried'
+        'iherbWatchdogRetried',
+        'iherbParsedAccounts',
+        'iherbRetryPassDone',
+        'iherbSkipReasons'
     ]);
 
     await chrome.storage.local.set({
@@ -895,6 +898,7 @@ async function handleProgressMessage(request) {
             if (storeKey === 'iherb' && isMultiAccountIherb && iherbAccountsQueue.length > 0) {
                 console.log('[handleProgress] iHerb multi-account: processing screenshots, then switching');
                 parseReport.stores[`iherb_${(currentIherbAccount || '').split('@')[0]}`] = { found: count, status: emoji };
+                await recordIherbParsedAccount(currentIherbAccount);
                 // Watchdog: cs дошёл до конца — снимаем marker
                 chrome.storage.local.remove(['iherbParseStartedAt', 'iherbWatchdogRetried']);
                 if (screenshotsEnabled && trackScreenshotQueue.length > 0) {
@@ -904,36 +908,22 @@ async function handleProgressMessage(request) {
                 }
                 return;
             }
-            // Multi-account iHerb: последний аккаунт обработан — финальный возврат
+            // Multi-account iHerb: очередь пуста — последний аккаунт этого прохода
+            // обработан. НЕ закрываем стадию напрямую: единый chokepoint
+            // finalizeIherbStage сам решит — сделать ограниченный retry по
+            // недопарсенным аккаунтам ИЛИ реально закрыть стадию (возврат на
+            // primary + roster + advance pipeline). Так стадия «complete» только
+            // когда учтены ВСЕ аккаунты, а не просто по пустой очереди.
             if (storeKey === 'iherb' && isMultiAccountIherb) {
-                console.log('[handleProgress] iHerb multi-account: last account done, final return');
+                console.log('[handleProgress] iHerb multi-account: queue drained, finalize');
                 parseReport.stores[`iherb_${(currentIherbAccount || '').split('@')[0]}`] = { found: count, status: emoji };
-                isMultiAccountIherb = false;
-                currentIherbAccount = null;
+                await recordIherbParsedAccount(currentIherbAccount);
                 chrome.storage.local.remove(['iherbParseStartedAt', 'iherbWatchdogRetried']);
                 if (screenshotsEnabled && trackScreenshotQueue.length > 0) {
-                    processScreenshotQueue().finally(() => finalReturnToIherbPrimary());
+                    processScreenshotQueue().finally(() => finalizeIherbStage());
                 } else {
-                    finalReturnToIherbPrimary();
+                    await finalizeIherbStage();
                 }
-                setParserLock('iherb', false);
-                storesCompleted.iherb = true;
-                setTimeout(() => uploadToSheets(), 1500);
-                // Pipeline advance немедленно (по аналогии с eBay ниже).
-                // До этого fix'а advance шёл через setTimeout 45s внутри
-                // finalReturnToIherbPrimary — фатально хрупко: если SW заснёт
-                // в эти 45 секунд, alarm не пнёт и pipeline зависнет на iherb.
-                // Guard по `stages[currentIndex] === 'iherb'` делает блок
-                // идемпотентным (повторный вызов из setTimeout safety net
-                // в finalReturnToIherbPrimary увидит уже сдвинутый currentIndex
-                // и просто проигнорирует).
-                chrome.storage.local.get(['pipelineStage']).then(r => {
-                    const p = r.pipelineStage;
-                    if (p && p.active && p.stages[p.currentIndex] === 'iherb') {
-                        advancePipelineStage().catch(() => {});
-                    }
-                });
-                checkAllStoresCompleted();
                 return;
             }
 
@@ -1186,11 +1176,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             } else {
                 console.log(`🚫 iHerb account ${email} skipped (failures: ${failures[email]}, reason: ${reason})`);
                 sendTelegramMessage(`🚫 iHerb аккаунт ${email.split('@')[0]} пропущен (${reason})`);
+                await recordIherbSkipReason(email, 'switch_failed');
                 await chrome.storage.local.remove(['iherbSwitchInProgress', 'iherbSwitchStartedAt', 'pendingIherbSwitch']);
                 if (iherbAccountsQueue.length > 0) {
                     switchToNextIherbAccount();
                 } else {
-                    finalReturnToIherbPrimary();
+                    await finalizeIherbStage();
                 }
             }
         })();
@@ -1435,23 +1426,18 @@ async function abortIherbStageDueToCaptcha(email) {
     console.warn(`🧩 [iHerb] captcha unsolved for ${email} — skipping iHerb stage, moving to next shop`);
     sendTelegramMessage(`🧩 iHerb: captcha не пройдена (${who}). Пропускаю iHerb, перехожу к следующему магазину.`).catch(() => {});
 
+    await recordIherbSkipReason(email, 'captcha');
     iherbAccountsQueue = [];
     await chrome.storage.local.remove([
-        'iherbSwitchInProgress', 'iherbSwitchStartedAt', 'pendingIherbSwitch',
-        'iherbFinalReturn', 'multiAccountIherbState'
+        'iherbSwitchInProgress', 'iherbSwitchStartedAt', 'pendingIherbSwitch'
     ]);
 
-    const r = await chrome.storage.local.get(['pipelineStage']);
-    const p = r.pipelineStage;
-    if (p && p.active && p.stages[p.currentIndex] === 'iherb') {
-        console.log('[pipeline] advancing past iherb due to captcha');
-        await advancePipelineStage();
-    } else {
-        // Legacy multi-account режим (без sequential pipeline) — мягко возвращаемся
-        // на primary; если и там captcha, finalReturn сам не зациклится.
-        await finalReturnToIherbPrimary().catch(e =>
-            console.warn('finalReturn after captcha-abort failed:', e?.message || e));
-    }
+    // Всегда закрываем стадию через единый chokepoint: он гарантированно вернёт
+    // сессию на primary (оператор хочет always-return, даже после captcha),
+    // построит roster + алерт по пропущенным и сам двинет pipeline дальше.
+    // fromCaptcha=true отключает retry-проход (captcha по IP — повтор бессмыслен).
+    await finalizeIherbStage(undefined, { fromCaptcha: true }).catch(e =>
+        console.warn('finalizeIherbStage after captcha-abort failed:', e?.message || e));
 }
 
 // Switch to next Amazon account for multi-account parsing
@@ -1582,6 +1568,9 @@ async function startSequentialPipeline() {
     'iherbOrdersReloadDone',
     'pendingIherbSwitch',
     'multiAccountIherbState',
+    'iherbParsedAccounts',
+    'iherbRetryPassDone',
+    'iherbSkipReasons',
     'pendingAccountSwitch',
     'amazonFinalReturn',
     'accountSwitchFailures',
@@ -1721,10 +1710,19 @@ async function startMultiAccountIherbParsing() {
         multiAccountIherbState: {
             isMultiAccountIherb: true,
             iherbAccountsQueue,
-            currentIherbAccount: null
+            currentIherbAccount: null,
+            // Зеркалим per-run учёт в snapshot restore (top-level ключи — канон).
+            iherbParsedAccounts: [],
+            iherbRetryPassDone: false,
+            iherbSkipReasons: {}
         },
         iherbFinalReturn: null,
-        pendingIherbSwitch: null
+        pendingIherbSwitch: null,
+        // Per-run учёт аккаунтов: кто реально отпарсился / был ли retry-проход /
+        // причины пропуска. Стартуем прогон с чистого листа.
+        iherbParsedAccounts: [],
+        iherbRetryPassDone: false,
+        iherbSkipReasons: {}
     });
     await chrome.storage.local.remove([
         'pendingIherbSwitch',
@@ -1754,8 +1752,8 @@ async function switchToNextIherbAccount() {
     }
 
     if (iherbAccountsQueue.length === 0) {
-        console.log('📋 No more iHerb accounts — final return');
-        return finalReturnToIherbPrimary();
+        console.log('📋 No more iHerb accounts — finalize');
+        return finalizeIherbStage();
     }
 
     const next = iherbAccountsQueue.shift();
@@ -1865,10 +1863,131 @@ async function handleIherbSwitchFailure(email, reason) {
     } else {
         console.log(`🚫 iHerb ${email} skipped (failures=${failures[email]}, reason=${reason})`);
         sendTelegramMessage(`🚫 iHerb ${email.split('@')[0]} пропущен (${reason})`).catch(() => {});
+        await recordIherbSkipReason(email, 'switch_failed');
         await chrome.storage.local.remove(['iherbSwitchInProgress', 'iherbSwitchStartedAt', 'pendingIherbSwitch']);
         if (iherbAccountsQueue.length > 0) switchToNextIherbAccount();
-        else finalReturnToIherbPrimary();
+        else await finalizeIherbStage();
     }
+}
+
+// ─── Per-run iHerb account accounting helpers ──────────────────────────────
+// Записывает аккаунт, который РЕАЛЬНО отпарсился (дал parseReport-запись) в этом
+// прогоне. Dedupe. Персист top-level — chrome.storage.local переживает рестарт SW.
+async function recordIherbParsedAccount(email) {
+    if (!email) return [];
+    const r = await chrome.storage.local.get(['iherbParsedAccounts']);
+    const arr = Array.isArray(r.iherbParsedAccounts) ? r.iherbParsedAccounts : [];
+    if (!arr.includes(email)) arr.push(email);
+    await chrome.storage.local.set({ iherbParsedAccounts: arr });
+    return arr;
+}
+
+// Записывает причину, по которой аккаунт НЕ отпарсился: 'captcha' | 'switch_failed'.
+async function recordIherbSkipReason(email, reason) {
+    if (!email) return {};
+    const r = await chrome.storage.local.get(['iherbSkipReasons']);
+    const map = (r.iherbSkipReasons && typeof r.iherbSkipReasons === 'object') ? r.iherbSkipReasons : {};
+    map[email] = reason;
+    await chrome.storage.local.set({ iherbSkipReasons: map });
+    return map;
+}
+
+// ─── ЕДИНЫЙ chokepoint завершения iHerb-стадии ─────────────────────────────
+// До этого стадия закрывалась «complete» просто по iherbAccountsQueue.length===0,
+// без учёта того, сколько аккаунтов РЕАЛЬНО отпарсилось. Если аккаунт скипался
+// (login/switch fail ≥2 раза, не captcha), он тихо уходил из очереди без парса, а
+// прогон рапортовал iHerb done. Теперь ВСЕ пути завершения идут сюда.
+//   1. Считаем сколько аккаунтов реально отпарсилось vs всего в конфиге.
+//   2. Если есть пропущенные (не captcha) и мы ещё не делали retry-проход —
+//      делаем ОДИН ограниченный retry по ним (свежие 2 попытки на аккаунт).
+//   3. Иначе реально закрываем стадию: гарантированный возврат на primary +
+//      roster + алерт оператору если кого-то недосчитались + advance pipeline.
+// Идемпотентна: если storesCompleted.iherb уже true — no-op (защита от двойного
+// завершения из watchdog / handleProgressMessage / captcha-abort).
+async function finalizeIherbStage(tabId, { fromCaptcha = false } = {}) {
+    if (storesCompleted && storesCompleted.iherb === true) {
+        console.log('[finalizeIherb] stage already completed — no-op');
+        return { retrying: false };
+    }
+
+    const cfg = await loadAccountsConfig();
+    const allEmails = cfg.iherb.map(a => a.email);
+
+    const st = await chrome.storage.local.get([
+        'iherbParsedAccounts', 'iherbRetryPassDone', 'iherbSkipReasons'
+    ]);
+    const parsed = new Set(Array.isArray(st.iherbParsedAccounts) ? st.iherbParsedAccounts : []);
+    const retryPassDone = !!st.iherbRetryPassDone;
+    const skipReasons = (st.iherbSkipReasons && typeof st.iherbSkipReasons === 'object') ? st.iherbSkipReasons : {};
+
+    const missing = allEmails.filter(e => !parsed.has(e));
+    // captcha привязана к IP — повторять бессмысленно, следующий аккаунт упрётся в неё же.
+    const retriable = missing.filter(e => skipReasons[e] !== 'captcha');
+
+    // ── ОДИН ограниченный retry-проход по недопарсенным (не captcha) аккаунтам ──
+    if (!fromCaptcha && retriable.length > 0 && !retryPassDone) {
+        console.log(`[finalizeIherb] retry pass for missing accounts: ${retriable.join(', ')}`);
+
+        // Даём каждому retriable-аккаунту свежие 2 попытки (сбрасываем его счётчик).
+        const fd = await chrome.storage.local.get(['iherbSwitchFailures']);
+        const failures = fd.iherbSwitchFailures || {};
+        for (const e of retriable) delete failures[e];
+
+        // Пересобираем очередь ТОЛЬКО из retriable-аккаунтов (в исходном порядке конфига).
+        iherbAccountsQueue = cfg.iherb.filter(a => retriable.includes(a.email));
+        isMultiAccountIherb = true;
+        currentIherbAccount = null;
+
+        await chrome.storage.local.set({
+            iherbRetryPassDone: true,
+            iherbSwitchFailures: failures,
+            multiAccountIherbState: {
+                isMultiAccountIherb: true,
+                iherbAccountsQueue,
+                currentIherbAccount: null,
+                iherbParsedAccounts: [...parsed],
+                iherbRetryPassDone: true,
+                iherbSkipReasons: skipReasons
+            }
+        });
+
+        const names = retriable.map(e => e.split('@')[0]).join(', ');
+        console.log(`♻️ iHerb: повтор для пропущенных аккаунтов: ${names}`);
+        sendTelegramMessage(`♻️ iHerb: повтор для пропущенных аккаунтов: ${names}`).catch(() => {});
+
+        await switchToNextIherbAccount(tabId);
+        return { retrying: true };
+    }
+
+    // ── Реальное завершение стадии ──
+    isMultiAccountIherb = false;
+    await finalReturnToIherbPrimary(tabId);
+
+    parseReport.iherbRoster = { parsed: [...parsed], missing, total: allEmails.length };
+
+    if (missing.length > 0) {
+        const reasonRu = (e) => {
+            const rr = skipReasons[e];
+            if (rr === 'switch_failed') return 'не удалось войти';
+            if (rr === 'captcha') return 'капча';
+            return 'не дошёл';
+        };
+        const lines = missing.map(e => `${e.split('@')[0]} (${reasonRu(e)})`).join(', ');
+        sendTelegramMessage(`⚠️ iHerb: отпарсилось ${parsed.size} из ${allEmails.length} аккаунтов. Пропущены: ${lines}`).catch(() => {});
+    }
+
+    setParserLock('iherb', false);
+    storesCompleted.iherb = true;
+    setTimeout(() => uploadToSheets(), 1500);
+    // Pipeline advance (идемпотентный guard по текущей стадии — как в старой :908 ветке).
+    chrome.storage.local.get(['pipelineStage']).then(r => {
+        const p = r.pipelineStage;
+        if (p && p.active && p.stages[p.currentIndex] === 'iherb') {
+            advancePipelineStage().catch(() => {});
+        }
+    });
+    checkAllStoresCompleted();
+    return { retrying: false };
 }
 
 async function finalReturnToIherbPrimary() {
@@ -1892,8 +2011,16 @@ async function finalReturnToIherbPrimary() {
 
     // iherbIsLoggedIn() only proves "some account is logged in"; it cannot
     // identify which email. Skip re-login only when our own state says the last
-    // parsed account was already primary.
-    const alreadyOnPrimary = lastKnownAccount === primary.email && await iherbIsLoggedIn(tabId);
+    // parsed account was already primary AND this run didn't parse any secondary
+    // (if it did, some secondary is almost certainly the account currently logged
+    // in — trusting iherbIsLoggedIn() would leave the session on the wrong email).
+    // Correctness over saving one login: when in doubt, do the full return.
+    const parsedData = await chrome.storage.local.get(['iherbParsedAccounts']);
+    const parsedAccts = Array.isArray(parsedData.iherbParsedAccounts) ? parsedData.iherbParsedAccounts : [];
+    const anySecondaryParsed = parsedAccts.some(e => e !== primary.email);
+    const alreadyOnPrimary = lastKnownAccount === primary.email
+        && !anySecondaryParsed
+        && await iherbIsLoggedIn(tabId);
     if (alreadyOnPrimary) {
         console.log(`✅ Already on primary ${primary.email} — final return no-op`);
         sendTelegramMessage(`✅ iHerb уже на ${primary.email.split('@')[0]} — возврат не нужен`).catch(() => {});
@@ -1905,11 +2032,22 @@ async function finalReturnToIherbPrimary() {
         return;
     }
 
-    try {
-        await iherbUiSignOutAndNavigateToLogin(tabId);
-    } catch (e) {
-        console.error('❌ iHerb final return failed:', e);
-        sendTelegramMessage(`⚠️ iHerb final return упал: ${e.message || e}`).catch(() => {});
+    // Возврат на primary критичен: иначе следующий прогон стартует с чужого
+    // аккаунта. Пробуем sign-out+login ДВАЖДЫ; если оба раза упало — громкий
+    // алерт оператору (руками проверить), но НЕ бросаем — pipeline должен жить.
+    let returned = false;
+    for (let attempt = 1; attempt <= 2 && !returned; attempt++) {
+        try {
+            await iherbUiSignOutAndNavigateToLogin(tabId);
+            returned = true;
+        } catch (e) {
+            console.error(`❌ iHerb final return attempt ${attempt}/2 failed:`, e);
+            if (attempt >= 2) {
+                sendTelegramMessage(`⚠️ iHerb: не смог вернуться на основной аккаунт photopochtoy — проверь вручную`).catch(() => {});
+            } else {
+                await new Promise(r => setTimeout(r, 5000));
+            }
+        }
     }
 
     // Pipeline advance: safety net через ~45с (sign-out + login + orders page).
@@ -2624,14 +2762,12 @@ async function handleIherbWatchdog() {
     }
     if (isMultiAccountIherb && iherbAccountsQueue.length > 0) {
         switchToNextIherbAccount();
-    } else {
-        // Закрываем iherb stage чтобы pipeline двигался дальше
-        isMultiAccountIherb = false;
-        currentIherbAccount = null;
-        if (typeof storesCompleted === 'object') storesCompleted.iherb = true;
-        setParserLock('iherb', false);
-        await finalReturnToIherbPrimary().catch(e => console.warn('finalReturn failed:', e?.message || e));
-        if (typeof checkAllStoresCompleted === 'function') checkAllStoresCompleted();
+    } else if (isMultiAccountIherb) {
+        // Очередь пуста, но стадия ещё не закрыта — закрываем через единый
+        // chokepoint (возврат на primary + roster + алерт + advance pipeline).
+        // Guard `isMultiAccountIherb` + внутренний storesCompleted-guard
+        // finalizeIherbStage защищают от двойного завершения.
+        await finalizeIherbStage(tabId).catch(e => console.warn('finalizeIherbStage failed:', e?.message || e));
     }
 }
 
@@ -2910,6 +3046,15 @@ async function checkAllStoresCompleted() {
                 const nparts = Object.entries(nu.byShop || {}).map(([s, n]) => `${s}: ${n}`);
                 if (nparts.length) report += `\n   (${nparts.join(', ')})`;
                 if (nu.qtyUpdated) report += `\n   +${nu.qtyUpdated} обновлено кол-во`;
+            }
+
+            // 🌿 iHerb ростер — сколько из скольких аккаунтов реально отпарсилось
+            const roster = parseReport.iherbRoster;
+            if (roster) {
+                report += `\n\n🌿 iHerb аккаунты: ${roster.parsed.length}/${roster.total}`;
+                if (roster.missing && roster.missing.length > 0) {
+                    report += ` — пропущены: ${roster.missing.map(e => e.split('@')[0]).join(', ')}`;
+                }
             }
 
             report += `\n\n✅ Выгрузка в Google Sheets завершена`;
