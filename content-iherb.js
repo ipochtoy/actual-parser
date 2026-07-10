@@ -688,8 +688,29 @@ function extractTrackingFromDOM(orderContainer, orderId, isFirstOrder = false) {
     return '';
 }
 
+// CANCELLED-ORDER DETECTION (money-safety). Отменённый заказ iHerb приходит БЕЗ трек-номера,
+// поэтому фильтр «только с треком» ниже его молча выбрасывает — а в Pochtoy он всё ещё
+// «Выкуплен» (клиент заплатил, товар не придёт). Читаем короткие текст-метки статуса внутри
+// <article>, исключая кнопки/ссылки (чтобы кнопка «Cancel order» на активном заказе не давала
+// ложное срабатывание). Ничего не удаляем — только собираем в отдельный список для отчёта.
+function detectIherbCancelled(container) {
+    if (!container) return { cancelled: false };
+    const els = container.querySelectorAll('span, p, div, strong, b, h2, h3, [class*="status"]');
+    for (const el of els) {
+        if (el.children.length > 0) continue;            // только листовой текст
+        if (el.closest('a, button, [role="button"]')) continue; // не элемент-действие
+        const t = (el.innerText || el.textContent || '').trim();
+        if (!t || t.length > 40) continue;               // метка статуса короткая
+        if (/^(cancell?ed|order\s+cancell?ed)\b/i.test(t)) return { cancelled: true, status_text: t.slice(0, 60) };
+        if (/^(refunded|refund\s+issued)\b/i.test(t)) return { cancelled: true, status_text: t.slice(0, 60) };
+    }
+    return { cancelled: false };
+}
+
 function parseOrders() {
     const orders = [];
+    const cancelledThisRun = [];   // отменённые/возвращённые заказы этого прогона (money-safety)
+    const cancelledSeen = new Set();
 
     console.log('🧪 === IHERB PARSER (REAL STRUCTURE - Jan 2026) ===');
     console.log('🕐 Parse time:', new Date().toISOString());
@@ -796,6 +817,23 @@ function parseOrders() {
 
         // Use the element directly as container (it's already the article element)
         const orderContainer = headerObj.element;
+
+        // CANCELLED-ORDER DETECTION (money-safety) — до дедупа/фильтра по треку.
+        try {
+            const cxl = detectIherbCancelled(orderContainer);
+            if (cxl.cancelled && !cancelledSeen.has(orderId)) {
+                cancelledSeen.add(orderId);
+                const prodLink = orderContainer.querySelector('a[href*="/pr/"]');
+                cancelledThisRun.push({
+                    store_name: 'iHerb',
+                    order_id: orderId,
+                    product_name: (prodLink ? prodLink.textContent.trim() : '').slice(0, 120),
+                    status_text: cxl.status_text,
+                    account_name: window.__iherbCurrentAccountName || ''
+                });
+                console.log(`🚫 ОТМЕНЁН заказ iHerb #${orderId} — "${cxl.status_text}"`);
+            }
+        } catch (_) {}
 
         // Извлекаем трек РАНЬШЕ дедупа — он нужен для сплит-осознанного ключа.
         // Сплит-заказ iHerb приезжает несколькими <article> с ОДИНАКОВЫМ data-order-number,
@@ -1021,9 +1059,14 @@ function parseOrders() {
         console.log(`  Orders without tracking: ${fulfillingCount}`);
     }
 
+    if (cancelledThisRun.length) {
+        console.log(`🚫 Отменённых iHerb-заказов на странице: ${cancelledThisRun.length}`);
+    }
+
     return {
         success: true,
         orders: shippedOrders,
+        cancelled: cancelledThisRun,
         uniqueOrdersCount: uniqueOrderIds.size,
         totalProductsCount: shippedOrders.length
     };
@@ -1195,6 +1238,21 @@ async function exportOrders() {
             iherbLastUpdate: Date.now()
         });
         console.log('💾 Auto-saved to iherbOrders:', result.orders.length);
+
+        // Persist CANCELLED iHerb orders (money-safety) — append across accounts, dedup by order_id.
+        // background.js обнуляет iherbCancelledOrders в начале прогона, поэтому за ночь копится
+        // объединённый список всех отменённых по всем аккаунтам iHerb.
+        try {
+            const cxlNew = Array.isArray(result.cancelled) ? result.cancelled : [];
+            const prev = await chrome.storage.local.get(['iherbCancelledOrders']);
+            const merged = Array.isArray(prev.iherbCancelledOrders) ? prev.iherbCancelledOrders.slice() : [];
+            const seen = new Set(merged.map(o => o.order_id));
+            for (const c of cxlNew) {
+                if (!seen.has(c.order_id)) { seen.add(c.order_id); merged.push(c); }
+            }
+            await chrome.storage.local.set({ iherbCancelledOrders: merged, iherbCancelledUpdatedAt: Date.now() });
+            if (cxlNew.length) console.log(`🚫 Отменённых iHerb-заказов за прогон: ${cxlNew.length}`);
+        } catch (_) {}
 
         // NO auto-download - user will use Copy button for Google Sheets
         // CSV download only via popup "Export to CSV" button if needed

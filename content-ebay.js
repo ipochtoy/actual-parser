@@ -21,6 +21,43 @@ let isParsingInProgress = false;
 // eBay account email (single account in this extension). Preloaded by
 // parseEbayOrders() before calling parseItem() so every row carries it.
 let __ebayAccountName = '';
+// CANCELLED / REFUNDED orders caught this run (money-safety) — reset at parse start,
+// persisted to storage `ebayCancelledOrders` at the end for the background night report.
+let __ebayCancelledOrders = [];
+
+// Collect display (human-visible) text spans from an eBay feed item — status labels
+// live in secondaryMessage / primaryMessage / title, NOT in action buttons (actionList).
+function ebayItemDisplayText(item) {
+  const out = [];
+  const pushDisplays = (arr) => {
+    if (!Array.isArray(arr)) return;
+    for (const d of arr) {
+      const ts = d?.textSpans;
+      if (Array.isArray(ts)) for (const s of ts) if (s && s.text) out.push(String(s.text));
+    }
+  };
+  pushDisplays(item?.secondaryMessage);
+  pushDisplays(item?.primaryMessage);
+  if (item?.title?.textSpans) pushDisplays([item.title]);
+  for (const k of ['status', 'orderStatus', 'statusMessage', 'shippingStatus']) {
+    const v = item && item[k];
+    if (typeof v === 'string') out.push(v);
+    else if (v && v.textSpans) pushDisplays([v]);
+  }
+  return out;
+}
+
+// Detect a cancelled/refunded eBay purchase from the already-fetched feed item.
+// Start-anchored on the status word to avoid "eligible for refund" / "return window"
+// false positives. Reads only data eBay already sent — zero extra network hits.
+function detectEbayCancelled(item) {
+  for (const t of ebayItemDisplayText(item)) {
+    if (/^(cancell?ed|order\s+cancell?ed|refunded|refund\s+issued)\b/i.test((t || '').trim())) {
+      return { cancelled: true, status_text: (t || '').trim().slice(0, 60) };
+    }
+  }
+  return { cancelled: false };
+}
 
 async function getEbayAccount() {
   try {
@@ -267,6 +304,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 async function parseEbayOrders() {
   console.log(`🚀 parseEbayOrders() started (Mode: ${PARSE_MODE})`);
+  __ebayCancelledOrders = []; // fresh per run
   console.log('📍 Current URL:', window.location.href);
 
   // Resolve eBay account_name BEFORE we call parseItem() so every row
@@ -500,6 +538,13 @@ async function parseEbayOrders() {
     });
     console.log('💾 Auto-saved to ebayOrders:', allOrders.length);
 
+    // Persist CANCELLED orders (money-safety) — single-account, overwrite per run.
+    chrome.storage.local.set({
+      ebayCancelledOrders: __ebayCancelledOrders.slice(),
+      ebayCancelledUpdatedAt: Date.now()
+    });
+    if (__ebayCancelledOrders.length) console.log(`🚫 Отменённых eBay-заказов за прогон: ${__ebayCancelledOrders.length}`);
+
     // Send completion progress
     chrome.runtime.sendMessage({
       action: 'progress',
@@ -672,6 +717,26 @@ function parseItem(item) {
     if (orderId === 'N/A' && params.transactionId) {
       orderId = params.transactionId;
     }
+
+    // --- CANCELLED / REFUNDED DETECTION (money-safety) ---
+    // Independent of the tracking gate below: a cancelled order (no tracking) would
+    // otherwise be dropped, while Pochtoy may still show it as "Выкуплен".
+    try {
+      const cxl = detectEbayCancelled(item);
+      if (cxl.cancelled && orderId && orderId !== 'N/A') {
+        if (!__ebayCancelledOrders.some(o => o.order_id === orderId)) {
+          __ebayCancelledOrders.push({
+            store_name: 'eBay',
+            order_id: orderId,
+            product_name: (cleanName || '').slice(0, 120),
+            status_text: cxl.status_text,
+            account_name: __ebayAccountName || ''
+          });
+          console.log(`🚫 ОТМЕНЁН заказ eBay: ${orderId} — ${cxl.status_text}`);
+        }
+      }
+    } catch (_) {}
+    // -----------------------------------------------------
 
     // Find tracking number robustly (covers Delivered/Combined cases)
     const pickBestTracking = (text) => {

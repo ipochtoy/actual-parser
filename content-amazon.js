@@ -814,6 +814,24 @@
     return m ? m[1] : ""; 
   }
 
+  // Detect a CANCELLED / REFUNDED order from its card (money-safety net).
+  // Verified live 2026-07-09: cancelled orders render the status word inside
+  // `.delivery-box__primary-text` / `.yohtmlc-shipment-status-primaryText`
+  // (text "Cancelled") — NOT in an action button, so no "Cancel order"-button
+  // false positive. Such orders have no tracking → would otherwise be silently
+  // dropped, while Pochtoy may still show them as "Выкуплен".
+  function detectAmazonCancelled(card) {
+    const statusEls = card.querySelectorAll(
+      '.delivery-box__primary-text, .yohtmlc-shipment-status-primaryText, [class*="shipment-status-primaryText"]'
+    );
+    for (const el of statusEls) {
+      const t = (el.innerText || el.textContent || '').trim();
+      if (/^cancell?ed\b|order\s+cancell?ed/i.test(t)) return { cancelled: true, status_text: t.slice(0, 60) };
+      if (/^refund(ed)?\b|refund\s+issued/i.test(t)) return { cancelled: true, status_text: t.slice(0, 60) };
+    }
+    return { cancelled: false };
+  }
+
   async function parseAmazonOrders(currentPage = 1, totalPages = 1) {
     console.log(`\n📦 Запуск парсера Amazon для страницы ${currentPage}/${totalPages}`);
 
@@ -836,6 +854,7 @@
     }
 
     const allOrders = [];
+    const cancelledThisPage = [];
     let processedCards = 0;
     const maxCards = Math.min(cards.length, 10); // Обрабатываем максимум 10 карточек
 
@@ -853,6 +872,26 @@
           console.log("⚠️ Order ID не найден, пропускаем");
           continue;
         }
+
+        // --- CANCELLED / REFUNDED DETECTION (money-safety) ---
+        // Cancelled orders have no Track button → the shipment loop below produces
+        // no rows and the order would vanish. Capture it here so background alerts
+        // the operator (order may still show "Выкуплен" in Pochtoy).
+        const cxl = detectAmazonCancelled(card);
+        if (cxl.cancelled) {
+          let nm = '';
+          try { nm = (extractTitleFromDOM(card) || '').trim(); } catch (_) {}
+          const acctForCxl = await getAmazonAccount();
+          cancelledThisPage.push({
+            store_name: 'Amazon',
+            order_id: orderId,
+            product_name: nm.slice(0, 120),
+            status_text: cxl.status_text,
+            account_name: acctForCxl || ''
+          });
+          console.log(`🚫 ОТМЕНЁН заказ Amazon: ${orderId} — ${cxl.status_text}`);
+        }
+        // -----------------------------------------------------
 
         // --- FINANCIAL MODE HOOK ---
         let financialData = {};
@@ -1029,7 +1068,7 @@
       status: `Page ${currentPage}/${totalPages} done.` 
     });
 
-    return { success: true, orders: allOrders, stats: { totalCount: allOrders.length } };
+    return { success: true, orders: allOrders, cancelled: cancelledThisPage, stats: { totalCount: allOrders.length } };
   }
 
 
@@ -1153,6 +1192,28 @@
     });
     
     chrome.storage.local.set({ amazonOrders: state.allOrders });
+
+    // Persist CANCELLED orders (money-safety) — append across accounts, dedup by order_id.
+    // Background reads `amazonCancelledOrders` when building the night report + alert.
+    try {
+      const cxlNew = Array.isArray(state.cancelledOrders) ? state.cancelledOrders : [];
+      await new Promise((resolve) => {
+        chrome.storage.local.get(['amazonCancelledOrders'], (r) => {
+          const prev = Array.isArray(r.amazonCancelledOrders) ? r.amazonCancelledOrders : [];
+          const merged = [...prev, ...cxlNew];
+          const seen = new Set();
+          const uniq = merged.filter((o) => {
+            const k = o && o.order_id;
+            if (!k || seen.has(k)) return false;
+            seen.add(k);
+            return true;
+          });
+          chrome.storage.local.set({ amazonCancelledOrders: uniq, amazonCancelledUpdatedAt: Date.now() }, resolve);
+        });
+      });
+      if (cxlNew.length) console.log(`🚫 Сохранено отменённых Amazon-заказов (этот аккаунт): ${cxlNew.length}`);
+    } catch (e) { console.warn('cancelled persist failed:', e?.message || e); }
+
     console.log("🔥 CALLING CLEAR PAGINATION"); await clearPaginationState();
     
     // НАДЕЖНЫЙ механизм: записываем флаг завершения напрямую в storage
@@ -1225,6 +1286,7 @@
         currentPage: 1,
         totalPages: maxPagesToParse,
         allOrders: [],
+        cancelledOrders: [],
         startedAt: Date.now()
       };
       await savePaginationState(state);
@@ -1283,6 +1345,10 @@
       
       // Добавляем к общему списку
       state.allOrders.push(...pageOrders);
+      if (!state.cancelledOrders) state.cancelledOrders = [];
+      if (Array.isArray(pageResult.cancelled) && pageResult.cancelled.length) {
+        state.cancelledOrders.push(...pageResult.cancelled);
+      }
       state.currentPage++;
       
       // Промежуточное сохранение - save current account progress only (NOT appending)
