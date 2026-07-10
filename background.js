@@ -1127,7 +1127,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 await chrome.storage.local.remove(['accountSwitchStartedAt']);
                 switchToNextAmazonAccount();
             } else {
-                sendTelegramMessage(`⚠️ Не удалось переключиться на ${email.split('@')[0]} (попытка ${failures[email]}/${MAX_ACCOUNT_SWITCH_ATTEMPTS}), пробую ещё раз...`);
+                console.log(`⚠️ Не удалось переключиться на ${email.split('@')[0]} (попытка ${failures[email]}/${MAX_ACCOUNT_SWITCH_ATTEMPTS}), пробую ещё раз...`);
                 amazonAccountsQueue.unshift(email);
                 await chrome.storage.local.set({
                     multiAccountState: {
@@ -1144,7 +1144,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             const reason = request.reason || 'unknown';
             const email = request.email || 'unknown';
             console.warn(`❌ iHerb switch failed for ${email}: ${reason}`);
-            sendTelegramMessage(`⚠️ iHerb: переключение на ${email.split('@')[0]} не удалось (${reason})`);
             const failData = await chrome.storage.local.get(['iherbSwitchFailures']);
             const failures = failData.iherbSwitchFailures || {};
             failures[email] = (failures[email] || 0) + 1;
@@ -1224,7 +1223,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 const r = await solveIherbPressHold(tabId);
                 if (r.solved) {
                     console.log('🧩 [P&H] solved ✅ — re-navigating /orders for fresh parse');
-                    sendTelegramMessage('✅ iHerb Press & Hold пройден — продолжаю парсинг').catch(() => {});
                     await chrome.storage.local.remove(['iherbPressHoldAttempts', 'iherbOrdersReloadDone']);
                     // iherbSwitchInProgress остаётся true → IIFE content-script снова
                     // авто-парсит после reload. Ставим свежий маркер для watchdog.
@@ -1474,7 +1472,7 @@ async function switchToNextAmazonAccount() {
                 });
                 summary = `✅ Amazon мульти-прогон завершён:\n${lines.join('\n')}`;
             }
-            sendTelegramMessage(summary).catch(e => console.warn('summary tg failed:', e?.message || e));
+            console.log(summary);
         } catch (e) {
             console.warn('amazon summary build failed:', e?.message || e);
         }
@@ -1574,12 +1572,18 @@ async function startSequentialPipeline() {
     'pendingAccountSwitch',
     'amazonFinalReturn',
     'accountSwitchFailures',
-    'amazonPaginationState'
+    'amazonPaginationState',
+    // Списки отменённых заказов — обнуляем на старте прогона, чтобы отчёт показывал
+    // только отменённые ЭТОГО прогона (notifiedCancelledOrderIds НЕ трогаем — это
+    // память «о чём уже сообщили оператору», должна пережить прогон).
+    'iherbCancelledOrders',
+    'ebayCancelledOrders',
+    'amazonCancelledOrders'
   ]);
   await chrome.storage.local.set({
     pipelineStage: { active: true, stages: PIPELINE_STAGES, currentIndex: 0, startedAt: Date.now() }
   });
-  sendTelegramMessage('🚀 Sequential pipeline started: iHerb → eBay → Amazon').catch(() => {});
+  console.log('🚀 Sequential pipeline started: iHerb → eBay → Amazon');
   await runPipelineStage('iherb');
 }
 
@@ -1614,7 +1618,7 @@ async function runPipelineStage(stageName) {
       lastDailyAutoParseStatus: 'completed',
       lastDailyAutoParseFinishedAt: Date.now()
     });
-    sendTelegramMessage('✅ Sequential pipeline done').catch(() => {});
+    console.log('✅ Sequential pipeline done');
     return;
   }
 }
@@ -1760,7 +1764,6 @@ async function switchToNextIherbAccount() {
     currentIherbAccount = next.email;
 
     console.log(`🔄 Switching to iHerb account: ${next.email}`);
-    sendTelegramMessage(`🔄 iHerb: переключение на ${next.email.split('@')[0]}`).catch(() => {});
 
     await chrome.storage.local.set({
         pendingIherbSwitch: { email: next.email, password: next.password },
@@ -1795,7 +1798,6 @@ async function switchToNextIherbAccount() {
     const alreadyLoggedIn = isPrimaryAttempt && await iherbIsLoggedIn(tabId);
     if (alreadyLoggedIn) {
         console.log(`✅ Already logged in — skipping sign-out dance, parsing as ${next.email}`);
-        sendTelegramMessage(`✅ iHerb уже залогинен — парсим ${next.email.split('@')[0]} напрямую`).catch(() => {});
         await chrome.storage.local.remove(['pendingIherbSwitch']);
         // iherbSwitchInProgress=true уже выставлен выше — content-iherb.js auto-parse.
         // iherb watchdog: marker для проверки залипания cs (Extension context invalidated и т.п.)
@@ -1810,7 +1812,7 @@ async function switchToNextIherbAccount() {
         // прочитает pendingIherbSwitch и залогинит нужный аккаунт.
     } catch (e) {
         console.error('❌ iHerb UI sign-out flow failed:', e);
-        sendTelegramMessage(`⚠️ iHerb UI sign-out упал для ${next.email.split('@')[0]}: ${e.message || e}`).catch(() => {});
+        console.warn(`⚠️ iHerb UI sign-out упал для ${next.email.split('@')[0]}: ${e.message || e}`);
         await handleIherbSwitchFailure(next.email, 'ui_signout_failed');
     }
 }
@@ -1973,7 +1975,7 @@ async function finalizeIherbStage(tabId, { fromCaptcha = false } = {}) {
             return 'не дошёл';
         };
         const lines = missing.map(e => `${e.split('@')[0]} (${reasonRu(e)})`).join(', ');
-        sendTelegramMessage(`⚠️ iHerb: отпарсилось ${parsed.size} из ${allEmails.length} аккаунтов. Пропущены: ${lines}`).catch(() => {});
+        console.log(`⚠️ iHerb: отпарсилось ${parsed.size} из ${allEmails.length} аккаунтов. Пропущены: ${lines}`);
     }
 
     setParserLock('iherb', false);
@@ -1994,7 +1996,6 @@ async function finalReturnToIherbPrimary() {
     const cfg = await loadAccountsConfig();
     const primary = getPrimary(cfg.iherb);
     console.log(`🏁 iHerb final return to ${primary.email}`);
-    sendTelegramMessage(`🏁 Возврат на основной iHerb-аккаунт: ${primary.email.split('@')[0]}`).catch(() => {});
 
     const stored = await chrome.storage.local.get(['iherbParserTabId', 'multiAccountIherbState']);
     const lastKnownAccount = currentIherbAccount || stored.multiAccountIherbState?.currentIherbAccount || null;
@@ -2023,7 +2024,6 @@ async function finalReturnToIherbPrimary() {
         && await iherbIsLoggedIn(tabId);
     if (alreadyOnPrimary) {
         console.log(`✅ Already on primary ${primary.email} — final return no-op`);
-        sendTelegramMessage(`✅ iHerb уже на ${primary.email.split('@')[0]} — возврат не нужен`).catch(() => {});
         await chrome.storage.local.remove(['pendingIherbSwitch', 'iherbFinalReturn', 'iherbSwitchInProgress', 'iherbSwitchStartedAt']);
         await chrome.tabs.update(tabId, { url: 'https://www.iherb.com/', active: false });
         // Advance faster — нет 45s login wait. Guarded: если handleProgressMessage
@@ -2298,7 +2298,7 @@ async function solveIherbPressHold(tabId) {
     const BX = Math.round(btn?.x ?? vw / 2);
     const BY = Math.round(btn?.y ?? vh * 0.57);
     console.log(`🧩 [P&H] solving at (${BX},${BY}) viewport ${vw}x${vh} rect=${btn ? 'found' : 'proportional'}`);
-    sendTelegramMessage('🧩 iHerb Press & Hold — решаю сам (human-hold)…').catch(() => {});
+    console.log('🧩 iHerb Press & Hold — решаю сам (human-hold)…');
 
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
     const jit = () => (Math.random() * 5 - 2.5); // ±2.5px дрожание руки
@@ -2390,7 +2390,6 @@ async function finalReturnToPrimaryAmazon() {
     const cfg = await loadAccountsConfig();
     const primary = getPrimary(cfg.amazon);
     console.log(`🏁 Amazon final return to ${primary.email}`);
-    sendTelegramMessage(`🏁 Amazon: возврат на ${primary.email.split('@')[0]}`).catch(() => {});
 
     await chrome.storage.local.set({
         pendingAccountSwitch: { email: primary.email },
@@ -2645,7 +2644,6 @@ async function handleSheetsUploadWatchdog() {
         await uploadLogsToSheet();
         await markSheetsUploadSuccess();
         console.log(`✅ sheetsUploadWatchdog: догнал выгрузку (попытка ${retryCount + 1})`);
-        sendTelegramMessage('✅ Догнал выгрузку в Google Sheets (со стороннего ретрая)').catch(() => {});
     } catch (e) {
         console.error(`❌ sheetsUploadWatchdog: попытка ${retryCount + 1} провалилась:`, e?.message || e);
         // Просто выходим — alarm повторит через 2 мин.
@@ -2737,7 +2735,7 @@ async function handleIherbWatchdog() {
     if (!stored.iherbWatchdogRetried) {
         // First retry: reload tab → cs снова auto-parse'нет.
         await chrome.storage.local.set({ iherbWatchdogRetried: true, iherbParseStartedAt: Date.now() });
-        sendTelegramMessage(`⚠️ iHerb (${acc.split('@')[0]}) залип ${Math.round(elapsed/1000)}с, retry...`).catch(()=>{});
+        console.log(`⚠️ iHerb (${acc.split('@')[0]}) залип ${Math.round(elapsed/1000)}с, retry...`);
         if (tabId) {
             try {
                 await chrome.tabs.update(tabId, { url: 'https://secure.iherb.com/myaccount/orders', active: true });
@@ -3020,44 +3018,159 @@ async function checkAllStoresCompleted() {
             const elapsed = parseReport.startedAt ? Math.round((Date.now() - parseReport.startedAt) / 1000) : 0;
             const mins = Math.floor(elapsed / 60);
             const secs = elapsed % 60;
-            let report = `📊 Парсинг завершён за ${mins}м ${secs}с\n\n`;
-            
-            for (const [key, val] of Object.entries(parseReport.stores)) {
-                const name = key.startsWith('amazon_') ? `Amazon (${key.replace('amazon_', '')})` : key.charAt(0).toUpperCase() + key.slice(1);
-                report += `${val.status} ${name}: ${val.found} заказов\n`;
-            }
-            
-            const ss = parseReport.screenshots;
-            if (ss.sent > 0 || ss.skipped > 0 || ss.broken > 0) {
-                report += `\n📸 Скриншоты: ${ss.sent} отправлено`;
-                if (ss.skipped > 0) report += `, ${ss.skipped} уже было`;
-                if (ss.broken > 0) report += `, ${ss.broken} пропущено (битые)`;
-                if (ss.failed > 0) report += `, ${ss.failed} ошибок`;
-                // Разбивка по магазинам — сразу видно, если по iHerb внезапно мало скринов
-                const byShop = ss.byShop || {};
-                const shopParts = Object.entries(byShop).map(([s, n]) => `${s}: ${n}`);
-                if (shopParts.length) report += `\n   (${shopParts.join(', ')})`;
+            // ── Человекочитаемая ночная сводка (вместо технического дампа) ──
+            const uploadOk = !sheetsUploadErr;         // тот же флаг, что гейтит "❗ не удалось после 3 попыток"
+            const stores = parseReport.stores || {};
+            const roster = parseReport.iherbRoster || null;
+            const ss = parseReport.screenshots || {};
+            const nu = parseReport.newUploads || null;
+
+            // Собираем заказы по МАГАЗИНУ (не по аккаунту): iherb_* → iHerb, amazon_* → Amazon и т.д.
+            const STATUS_RANK = { '❌': 3, '⏱': 2, '⚠️': 2, '✅': 1 };
+            const bucketFor = (key) => {
+                if (/^iherb/i.test(key)) return { id: 'iherb', name: 'iHerb' };
+                if (/^amazon/i.test(key)) return { id: 'amazon', name: 'Amazon' };
+                if (/^ebay/i.test(key)) return { id: 'ebay', name: 'eBay' };
+                return { id: key, name: key.charAt(0).toUpperCase() + key.slice(1) };
+            };
+            const buckets = {};
+            let amazonAcctCount = 0;
+            for (const [key, val] of Object.entries(stores)) {
+                if (/^amazon/i.test(key)) amazonAcctCount++;
+                const b = bucketFor(key);
+                if (!buckets[b.id]) buckets[b.id] = { name: b.name, found: 0, worst: '✅', worstRank: 0 };
+                const bk = buckets[b.id];
+                bk.found += Number(val && val.found) || 0;
+                const st = (val && val.status) || '✅';
+                const rank = STATUS_RANK[st] || 0;
+                if (rank > bk.worstRank) { bk.worstRank = rank; bk.worst = st; }
             }
 
-            // 🆕 Новизна прогона — сколько свежего реально ушло в лист (после дедупа)
-            const nu = parseReport.newUploads;
+            // Проблемы (дедуп по магазину — один шоп не повторяется дважды)
+            const problems = [];
+            const seenShops = new Set();
+            const addProblem = (shopId, text) => {
+                if (shopId) { if (seenShops.has(shopId)) return; seenShops.add(shopId); }
+                problems.push(text);
+            };
+            const rosterMissing = (roster && Array.isArray(roster.missing)) ? roster.missing : [];
+            if (roster && rosterMissing.length > 0) {
+                const parsedN = Array.isArray(roster.parsed) ? roster.parsed.length : 0;
+                const names = rosterMissing.map(e => String(e).split('@')[0]).join(', ');
+                addProblem('iherb', `iHerb: собрал ${parsedN} из ${roster.total} — не вошёл в ${names}`);
+            }
+            for (const [id, bk] of Object.entries(buckets)) {
+                if (bk.worst === '❌') addProblem(id, `${bk.name}: ошибка при сборе`);
+                else if (bk.worst === '⏱' || bk.worst === '⚠️') addProblem(id, `${bk.name}: не доделал (завис)`);
+            }
+            if (!uploadOk) addProblem('sheets', 'таблица не выгрузилась в Google');
+
+            // ── Header ──
+            const dateStr = new Date().toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' });
+            let report = `🌙 Ночной парсинг — ${dateStr}, готово за ${mins}м ${secs}с`;
+            if (problems.length > 0) report += ` ⚠️ с заминками`;
+
+            // ── Блок проблем ──
+            if (problems.length > 0) {
+                report += `\n\n⚠️ Обрати внимание:\n` + problems.map(p => `   • ${p}`).join('\n');
+            }
+
+            // ── Собрано заказов (по магазину) ──
+            const bucketOrder = ['iherb', 'ebay', 'amazon'];
+            const orderedIds = [
+                ...bucketOrder.filter(id => buckets[id]),
+                ...Object.keys(buckets).filter(id => !bucketOrder.includes(id))
+            ];
+            if (orderedIds.length > 0) {
+                report += `\n\n📦 Собрано заказов:\n`;
+                report += orderedIds.map(id => {
+                    const bk = buckets[id];
+                    let line = `   ${bk.worst} ${bk.name} — ${bk.found}`;
+                    if (id === 'iherb' && roster) {
+                        line += (rosterMissing.length === 0)
+                            ? `  (все ${roster.total} аккаунта)`
+                            : `  (${Array.isArray(roster.parsed) ? roster.parsed.length : 0} из ${roster.total})`;
+                    } else if (id === 'amazon' && amazonAcctCount > 0) {
+                        line += `  (${amazonAcctCount} акк.)`;
+                    }
+                    return line;
+                }).join('\n');
+            }
+
+            // ── 🆕 Новизна прогона ──
             if (nu) {
-                report += `\n\n🆕 Новых в листе: ${nu.tracks} треков, ${nu.rows} строк`;
-                const nparts = Object.entries(nu.byShop || {}).map(([s, n]) => `${s}: ${n}`);
-                if (nparts.length) report += `\n   (${nparts.join(', ')})`;
-                if (nu.qtyUpdated) report += `\n   +${nu.qtyUpdated} обновлено кол-во`;
+                report += `\n\n🆕 Новых в таблице: ${nu.tracks} трек, ${nu.rows} строк`;
+                const nparts = Object.entries(nu.byShop || {})
+                    .filter(([, n]) => Number(n) > 0)
+                    .map(([s, n]) => `${s} ${n}`);
+                if (nparts.length) report += `\n   ${nparts.join(' · ')}`;
+                if (Number(nu.qtyUpdated) > 0) report += `\n   +${nu.qtyUpdated} где обновилось количество`;
             }
 
-            // 🌿 iHerb ростер — сколько из скольких аккаунтов реально отпарсилось
-            const roster = parseReport.iherbRoster;
-            if (roster) {
-                report += `\n\n🌿 iHerb аккаунты: ${roster.parsed.length}/${roster.total}`;
-                if (roster.missing && roster.missing.length > 0) {
-                    report += ` — пропущены: ${roster.missing.map(e => e.split('@')[0]).join(', ')}`;
+            // ── 📸 Скриншоты ──
+            if (ss.sent > 0 || ss.skipped > 0 || ss.broken > 0 || ss.failed > 0) {
+                report += `\n\n📸 Скриншоты: ${ss.sent || 0} новых`;
+                if (ss.skipped > 0) report += `, ${ss.skipped} уже были`;
+                if (ss.broken > 0) report += `, ${ss.broken} пропущено`;
+                if (ss.failed > 0) report += `, ${ss.failed} ошибок`;
+            }
+
+            // ── 🚫 Отменённые заказы (money-safety) ──
+            // Магазины (iHerb/eBay/Amazon) отменённые заказы приходят без трек-номера
+            // и в таблицу не попадают, но в Pochtoy они «Выкуплены» — клиент заплатил,
+            // товар не придёт. Собираем из storage, показываем в отчёте и отдельно ГРОМКО
+            // уведомляем про НОВЫЕ (которых оператор ещё не видел).
+            try {
+                const cxlStore = await chrome.storage.local.get([
+                    'iherbCancelledOrders', 'ebayCancelledOrders', 'amazonCancelledOrders',
+                    'notifiedCancelledOrderIds'
+                ]);
+                const allCancelled = [
+                    ...(Array.isArray(cxlStore.iherbCancelledOrders) ? cxlStore.iherbCancelledOrders : []),
+                    ...(Array.isArray(cxlStore.ebayCancelledOrders) ? cxlStore.ebayCancelledOrders : []),
+                    ...(Array.isArray(cxlStore.amazonCancelledOrders) ? cxlStore.amazonCancelledOrders : [])
+                ];
+                // Дедуп по order_id (один заказ мог попасть из нескольких проходов пагинации).
+                const cxlSeen = new Set();
+                const cancelled = [];
+                for (const c of allCancelled) {
+                    const oid = String(c.order_id || '');
+                    if (!oid || cxlSeen.has(oid)) continue;
+                    cxlSeen.add(oid);
+                    cancelled.push(c);
                 }
+
+                if (cancelled.length > 0) {
+                    report += `\n\n🚫 Отменённые заказы (клиент заплатил — товар не придёт), ${cancelled.length}:\n`;
+                    report += cancelled.map(c => {
+                        const prod = c.product_name ? ` — ${String(c.product_name).slice(0, 50)}` : '';
+                        return `   • ${c.store_name} #${c.order_id}${prod}`;
+                    }).join('\n');
+
+                    // Отдельный ГРОМКИЙ алерт только про НОВЫЕ отменённые (дедуп между прогонами).
+                    const notified = Array.isArray(cxlStore.notifiedCancelledOrderIds) ? cxlStore.notifiedCancelledOrderIds : [];
+                    const notifiedSet = new Set(notified.map(String));
+                    const fresh = cancelled.filter(c => !notifiedSet.has(String(c.order_id)));
+                    if (fresh.length > 0) {
+                        let alert = `🚨🚫 ВНИМАНИЕ: найдены ОТМЕНЁННЫЕ заказы в магазине — их ${fresh.length}.\n`;
+                        alert += `Клиент заплатил, а товар не придёт (в Pochtoy заказ числится «Выкуплен»). Нужен оператор:\n\n`;
+                        alert += fresh.map(c => {
+                            const prod = c.product_name ? `\n     ${String(c.product_name).slice(0, 70)}` : '';
+                            const acct = c.account_name ? ` (акк. ${c.account_name})` : '';
+                            return `   • ${c.store_name} #${c.order_id}${acct}${prod}`;
+                        }).join('\n');
+                        try { await sendTelegramMessage(alert); } catch (_) {}
+                        // Запоминаем, что уже сообщили — чтобы не спамить теми же заказами каждую ночь.
+                        const merged = [...notifiedSet, ...fresh.map(c => String(c.order_id))];
+                        await chrome.storage.local.set({ notifiedCancelledOrderIds: merged.slice(-500) });
+                    }
+                }
+            } catch (e) {
+                console.warn('⚠️ Не удалось собрать отменённые заказы:', e?.message || e);
             }
 
-            report += `\n\n✅ Выгрузка в Google Sheets завершена`;
+            // ── Footer (честный статус выгрузки) ──
+            report += `\n\n${uploadOk ? '✅ Всё выгружено в таблицу' : '❗ Таблица не выгрузилась — нужен оператор'}`;
 
             // Сохраняем сводку прогона в storage — чтобы «как прошло» можно было
             // посмотреть в любой момент с цифрами, без раскопок. История — 20 прогонов. (2026-06-08)
@@ -3818,7 +3931,7 @@ async function sendParseCommandsWithRetry(openedTabs) {
 // а auto-cart блокирует авто-выкуп на этот шоп пока флаг on.
 async function setParserLock(shop, on) {
     const cmd = `/parser_lock ${shop} ${on ? 'on' : 'off'}`;
-    try { await sendTelegramMessage(cmd); } catch (_) {}
+    console.log(cmd);
 }
 
 async function launchParsersFromBackground() {
@@ -3877,7 +3990,7 @@ async function launchParsersFromBackground() {
     // Watchdog: Check progress after 3 minutes
     setTimeout(() => {
         if (isParsingAllStores && !storesCompleted.ebay && !storesCompleted.iherb && !storesCompleted.amazon) {
-             sendTelegramMessage(`⚠️ Внимание: Прошло 3 минуты, а парсинг не завершен. Проверьте вкладки браузера.`);
+             console.log(`⚠️ Внимание: Прошло 3 минуты, а парсинг не завершен. Проверьте вкладки браузера.`);
         }
     }, 180000);
 }
