@@ -6,4 +6,4 @@ node_modules/
 
 # parser watchdog local state
 watchdog/.watchdog-state.json
-
+watchdog/telegram-creds.json

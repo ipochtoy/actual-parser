@@ -638,7 +638,9 @@ async function uploadLogsToSheet() {
 }
 
 // --- Telegram Bot State ---
-let tgBotToken = '8274480416:AAEIvhNsqzDl-dYHMOpjTJ0b1XyS_0lW88w'; // Default token provided by user
+// The token is provisioned through chrome.storage.local by the popup/runtime.
+// Never keep a fallback bot credential in tracked source.
+let tgBotToken = '';
 // Log channel — text messages (progress, errors, /status). Defaults to "Скрины" group
 // (-1003888176404, ex-"Amazon"). Auto-set from first chat if still null. Override via popup.
 let tgChatId = '-1003888176404';
@@ -661,12 +663,11 @@ chrome.storage.local.get(['progressState', 'tgBotToken', 'tgChatId', 'tgPhotoCha
         console.log('🔄 Restored parsing state:', { isParsingAllStores, storesCompleted });
     }
 
-    // Prefer saved token if exists and not empty, otherwise use default
+    // The runtime storage is the only source of the Telegram token.
     if (result.tgBotToken && result.tgBotToken.length > 10) {
         tgBotToken = result.tgBotToken;
     } else {
-        // Ensure default is saved if nothing was there
-        chrome.storage.local.set({ tgBotToken });
+        console.warn('⚠️ Telegram token is not configured; polling stays disabled');
     }
 
     // Prefer saved chat id if it's a group/supergroup (starts with '-'); DM chat_ids are

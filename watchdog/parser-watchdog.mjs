@@ -20,8 +20,20 @@ const DRY_RUN = process.argv.includes('--dry-run');
 const CDP_PORT = process.env.CDP_PORT || '9222';
 const CDP_HOST = '127.0.0.1';
 
-// Telegram — те же значения, что в парсере (background.js ~614/617).
-const TG_TOKEN = '8274480416:AAEIvhNsqzDl-dYHMOpjTJ0b1XyS_0lW88w';
+// Telegram credential is local-only. Preferred source is the launchd
+// environment; telegram-creds.json is an ignored 0600 fallback.
+const TG_CREDS_FILE = new URL('telegram-creds.json', import.meta.url).pathname;
+function loadTelegramToken() {
+  const fromEnv = String(process.env.PARSER_TELEGRAM_BOT_TOKEN || '').trim();
+  if (fromEnv) return fromEnv;
+  try {
+    const local = JSON.parse(readFileSync(TG_CREDS_FILE, 'utf8'));
+    return String(local.tgBotToken || local.telegramBotToken || '').trim();
+  } catch {
+    return '';
+  }
+}
+const TG_TOKEN = loadTelegramToken();
 const TG_CHAT = '-1003888176404';
 
 const PARSER_MANIFEST_NAME = 'Pochtoy Parsing';
@@ -57,6 +69,10 @@ async function drainAlerts() { await Promise.allSettled(pendingSends); }
 
 async function _sendAlert(text) {
   if (DRY_RUN) { console.log('\n[DRY-RUN ALERT] ' + text + '\n'); return; }
+  if (!TG_TOKEN) {
+    log('telegram send skipped: local token is not configured');
+    return;
+  }
   try {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), NET_TIMEOUT_MS);
