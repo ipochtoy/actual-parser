@@ -742,7 +742,8 @@ async function clearPipelineRuntimeState(reason) {
         'iherbWatchdogRetried',
         'iherbParsedAccounts',
         'iherbRetryPassDone',
-        'iherbSkipReasons'
+        'iherbSkipReasons',
+        'screenshotStageBudget'
     ]);
 
     await chrome.storage.local.set({
@@ -901,12 +902,14 @@ async function handleProgressMessage(request) {
                 parseReport.stores[`iherb_${(currentIherbAccount || '').split('@')[0]}`] = { found: count, status: emoji };
                 await recordIherbParsedAccount(currentIherbAccount);
                 // Watchdog: cs дошёл до конца — снимаем marker
-                chrome.storage.local.remove(['iherbParseStartedAt', 'iherbWatchdogRetried']);
-                if (screenshotsEnabled && trackScreenshotQueue.length > 0) {
-                    processScreenshotQueue().finally(() => switchToNextIherbAccount());
-                } else {
-                    switchToNextIherbAccount();
-                }
+                await chrome.storage.local.remove(['iherbParseStartedAt', 'iherbWatchdogRetried']);
+                // Не используем processScreenshotQueue().finally(...): при уже
+                // активном processor re-entry guard возвращает Promise сразу и
+                // переключает кабинет с недоснятой очередью. iHerb-карточки
+                // доступны только в своём аккаунте, поэтому ждём реальный drain
+                // без таймаута и только затем меняем login.
+                await waitForScreenshotsDrained({ maxWaitMs: null });
+                await switchToNextIherbAccount();
                 return;
             }
             // Multi-account iHerb: очередь пуста — последний аккаунт этого прохода
@@ -919,12 +922,9 @@ async function handleProgressMessage(request) {
                 console.log('[handleProgress] iHerb multi-account: queue drained, finalize');
                 parseReport.stores[`iherb_${(currentIherbAccount || '').split('@')[0]}`] = { found: count, status: emoji };
                 await recordIherbParsedAccount(currentIherbAccount);
-                chrome.storage.local.remove(['iherbParseStartedAt', 'iherbWatchdogRetried']);
-                if (screenshotsEnabled && trackScreenshotQueue.length > 0) {
-                    processScreenshotQueue().finally(() => finalizeIherbStage());
-                } else {
-                    await finalizeIherbStage();
-                }
+                await chrome.storage.local.remove(['iherbParseStartedAt', 'iherbWatchdogRetried']);
+                await waitForScreenshotsDrained({ maxWaitMs: null });
+                await finalizeIherbStage();
                 return;
             }
 
@@ -1172,14 +1172,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     }
                 });
                 await new Promise(r => setTimeout(r, 5000));
-                switchToNextIherbAccount();
+                await switchToNextIherbAccount();
             } else {
                 console.log(`🚫 iHerb account ${email} skipped (failures: ${failures[email]}, reason: ${reason})`);
                 sendTelegramMessage(`🚫 iHerb аккаунт ${email.split('@')[0]} пропущен (${reason})`);
                 await recordIherbSkipReason(email, 'switch_failed');
                 await chrome.storage.local.remove(['iherbSwitchInProgress', 'iherbSwitchStartedAt', 'pendingIherbSwitch']);
                 if (iherbAccountsQueue.length > 0) {
-                    switchToNextIherbAccount();
+                    await switchToNextIherbAccount();
                 } else {
                     await finalizeIherbStage();
                 }
@@ -1289,8 +1289,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             .catch(err => sendResponse({ ok: false, map: {}, error: String(err?.message || err) }));
         return true; // async
     } else if (request.action === "queueTrackScreenshot") {
-        queueTrackScreenshot(request.orderId, request.trackNumber, request.trackUrl, request.accountName);
-        sendResponse({status: "queued"});
+        queueTrackScreenshot(request.orderId, request.trackNumber, request.trackUrl, request.accountName)
+            .then(() => sendResponse({status: "queued"}))
+            .catch(error => sendResponse({status: "error", error: String(error?.message || error)}));
+        return true; // response только после persisted commit (важно для MV3 sleep)
     } else if (request.action === "processScreenshotQueue") {
         processScreenshotQueue();
         sendResponse({status: "processing"});
@@ -1449,6 +1451,13 @@ async function switchToNextAmazonAccount() {
         currentAmazonAccount = stored.multiAccountState.currentAmazonAccount;
         console.log('🔄 Restored multi-account state:', stored.multiAccountState);
     }
+
+    // Amazon tracking/order pages тоже account-bound. Этот общий gate покрывает
+    // штатное завершение и timeout-переход: ни одна карточка текущего кабинета
+    // не переносится под следующий login.
+    if (currentAmazonAccount) {
+        await waitForScreenshotsDrained({ maxWaitMs: null });
+    }
     
     if (amazonAccountsQueue.length === 0) {
         console.log('📋 No more Amazon accounts to parse');
@@ -1570,6 +1579,7 @@ async function startSequentialPipeline() {
     'iherbParsedAccounts',
     'iherbRetryPassDone',
     'iherbSkipReasons',
+    'screenshotStageBudget',
     'pendingAccountSwitch',
     'amazonFinalReturn',
     'accountSwitchFailures',
@@ -1597,7 +1607,19 @@ async function runPipelineStage(stageName) {
     try {
       const st = await chrome.storage.local.get(['pipelineStage']);
       if (st.pipelineStage) {
-        await chrome.storage.local.set({ pipelineStage: { ...st.pipelineStage, stageStartedAt: Date.now(), stageName } });
+        const stageStartedAt = Date.now();
+        await chrome.storage.local.set({
+          pipelineStage: { ...st.pipelineStage, stageStartedAt, stageName },
+          // Счётчик живёт ровно одну pipeline-стадию. Время реальной рассылки
+          // кадров не должно съедать лимит парсинга, но старый счётчик от
+          // предыдущей стадии/прогона тоже не должен продлевать новый этап.
+          screenshotStageBudget: {
+            stageName,
+            stageStartedAt,
+            accruedMs: 0,
+            activeSince: null
+          }
+        });
       }
     } catch (_) {}
   }
@@ -1616,6 +1638,7 @@ async function runPipelineStage(stageName) {
     // ночной парс" always looked in-progress even when the run had long finished/frozen.
     await chrome.storage.local.set({
       pipelineStage: { active: false, stages: PIPELINE_STAGES, currentIndex: PIPELINE_STAGES.length - 1, startedAt: null, stageStartedAt: null },
+      screenshotStageBudget: null,
       lastDailyAutoParseStatus: 'completed',
       lastDailyAutoParseFinishedAt: Date.now()
     });
@@ -1630,31 +1653,72 @@ async function runPipelineStage(stageName) {
 // is already draining, which would let the next stage start too early. This
 // helper polls until both flags are clear, kicking off a drain itself if the
 // queue has items but nobody is running.
-async function waitForScreenshotsDrained(maxWaitMs = 10 * 60 * 1000) {
-  if (!screenshotsEnabled) return;
+async function waitForScreenshotsDrained(options = {}) {
+  const maxWaitMs = typeof options === 'number'
+    ? options
+    : (Object.prototype.hasOwnProperty.call(options || {}, 'maxWaitMs')
+        ? options.maxWaitMs
+        : 10 * 60 * 1000);
   const start = Date.now();
   // SW мог уснуть между queueTrackScreenshot и этим вызовом — in-memory очередь
   // тогда пуста, а в storage скрины ещё ждут. Без restore цикл ниже не стартует
   // и аккаунт переключится с недоснятыми скринами. Подтягиваем недостающие.
-  try {
-    const { trackScreenshotQueue: storedQ = [] } = await chrome.storage.local.get('trackScreenshotQueue');
-    if (Array.isArray(storedQ) && storedQ.length > trackScreenshotQueue.length) {
-      const seen = new Set(trackScreenshotQueue.map(x => x.trackNumber));
-      for (const item of storedQ) {
-        if (!seen.has(item.trackNumber)) trackScreenshotQueue.push(item);
+  while (true) {
+    try {
+      const settings = await chrome.storage.local.get(['screenshotsEnabled', 'trackScreenshotQueue']);
+      screenshotsEnabled = settings.screenshotsEnabled || false;
+      const storedQ = settings.trackScreenshotQueue || [];
+      if (!screenshotsEnabled
+          && !isProcessingScreenshots
+          && (!Array.isArray(storedQ) || storedQ.length === 0)
+          && trackScreenshotQueue.length === 0) {
+        return true;
       }
+      if (Array.isArray(storedQ) && storedQ.length > trackScreenshotQueue.length) {
+        const seen = new Set(trackScreenshotQueue.map(x => `${x.accountName || ''}|${x.orderId || ''}|${x.trackNumber || ''}`));
+        for (const item of storedQ) {
+          const key = `${item.accountName || ''}|${item.orderId || ''}|${item.trackNumber || ''}`;
+          if (!seen.has(key)) {
+            trackScreenshotQueue.push(item);
+            seen.add(key);
+          }
+        }
+      }
+      break;
+    } catch (e) {
+      if (Number.isFinite(maxWaitMs) && Date.now() - start > maxWaitMs) {
+        console.warn('⏰ waitForScreenshotsDrained: storage restore timed out:', e?.message || e);
+        return false;
+      }
+      await new Promise(r => setTimeout(r, 1000));
     }
-  } catch (_) {}
+  }
   while (trackScreenshotQueue.length > 0 || isProcessingScreenshots) {
-    if (Date.now() - start > maxWaitMs) {
-      console.warn('⏰ waitForScreenshotsDrained: timed out, advancing anyway');
-      return;
+    if (Number.isFinite(maxWaitMs) && Date.now() - start > maxWaitMs) {
+      console.warn('⏰ waitForScreenshotsDrained: timed out with queue still pending');
+      return false;
     }
     if (!isProcessingScreenshots && trackScreenshotQueue.length > 0) {
       processScreenshotQueue().catch(() => {});
     }
     await new Promise(r => setTimeout(r, 1000));
   }
+  // Финальный [] должен быть в storage ДО account/stage switch. Одной пустой
+  // in-memory очереди недостаточно: MV3 может заснуть между этими действиями.
+  await persistScreenshotQueue();
+  const finalState = await chrome.storage.local.get('trackScreenshotQueue');
+  const finalStored = Array.isArray(finalState.trackScreenshotQueue)
+    ? finalState.trackScreenshotQueue
+    : [];
+  if (trackScreenshotQueue.length > 0 || isProcessingScreenshots || finalStored.length > 0) {
+    // Новая карточка могла прийти между проверкой while и финальным commit.
+    return waitForScreenshotsDrained({
+      maxWaitMs: Number.isFinite(maxWaitMs)
+        ? Math.max(0, maxWaitMs - (Date.now() - start))
+        : null
+    });
+  }
+  return true;
 }
 
 async function advancePipelineStage() {
@@ -1671,9 +1735,15 @@ async function advancePipelineStage() {
   // the previous stage's screenshots finish before any new tab steals focus.
   if (screenshotsEnabled && (trackScreenshotQueue.length > 0 || isProcessingScreenshots)) {
     console.log(`⏸  Pipeline: waiting for screenshot queue to drain (${trackScreenshotQueue.length} queued, processing=${isProcessingScreenshots})`);
-    await waitForScreenshotsDrained();
-    console.log('▶  Pipeline: screenshot queue drained, advancing');
   }
+  // Вызываем даже при пустой in-memory очереди: после MV3 restart persisted
+  // карточки могут ещё не успеть восстановиться callback'ом и иначе stage сменится.
+  const drained = await waitForScreenshotsDrained();
+  if (!drained) {
+    console.warn('⏸  Pipeline: screenshot queue is not drained; refusing to change stage');
+    return;
+  }
+  if (screenshotsEnabled) console.log('▶  Pipeline: screenshot queue drained, advancing');
 
   const nextIndex = p.currentIndex + 1;
   if (nextIndex >= p.stages.length) {
@@ -1744,7 +1814,7 @@ async function startMultiAccountIherbParsing() {
     const tabId = await ensureIherbParserTab();
     await chrome.storage.local.set({ iherbParserTabId: tabId });
 
-    switchToNextIherbAccount();
+    await switchToNextIherbAccount();
 }
 
 async function switchToNextIherbAccount() {
@@ -1754,6 +1824,12 @@ async function switchToNextIherbAccount() {
         isMultiAccountIherb = stored.multiAccountIherbState.isMultiAccountIherb;
         iherbAccountsQueue  = stored.multiAccountIherbState.iherbAccountsQueue || [];
         currentIherbAccount = stored.multiAccountIherbState.currentIherbAccount;
+    }
+
+    // Единый safety gate для ВСЕХ путей (обычный Done, watchdog, login retry):
+    // карточки текущего iHerb-кабинета нельзя открывать после смены аккаунта.
+    if (currentIherbAccount) {
+        await waitForScreenshotsDrained({ maxWaitMs: null });
     }
 
     if (iherbAccountsQueue.length === 0) {
@@ -1862,13 +1938,13 @@ async function handleIherbSwitchFailure(email, reason) {
             }
         });
         await new Promise(r => setTimeout(r, 5000));
-        switchToNextIherbAccount();
+        await switchToNextIherbAccount();
     } else {
         console.log(`🚫 iHerb ${email} skipped (failures=${failures[email]}, reason=${reason})`);
         sendTelegramMessage(`🚫 iHerb ${email.split('@')[0]} пропущен (${reason})`).catch(() => {});
         await recordIherbSkipReason(email, 'switch_failed');
         await chrome.storage.local.remove(['iherbSwitchInProgress', 'iherbSwitchStartedAt', 'pendingIherbSwitch']);
-        if (iherbAccountsQueue.length > 0) switchToNextIherbAccount();
+        if (iherbAccountsQueue.length > 0) await switchToNextIherbAccount();
         else await finalizeIherbStage();
     }
 }
@@ -1911,6 +1987,14 @@ async function finalizeIherbStage(tabId, { fromCaptcha = false } = {}) {
     if (storesCompleted && storesCompleted.iherb === true) {
         console.log('[finalizeIherb] stage already completed — no-op');
         return { retrying: false };
+    }
+
+    // finalize вызывается не только из обычного Done, но и из watchdog/captcha
+    // путей. Ни retry-login, ни возврат на primary не имеют права сменить
+    // кабинет, пока карточки текущего аккаунта реально не записаны и очередь
+    // не закреплена persisted [].
+    if (currentIherbAccount) {
+        await waitForScreenshotsDrained({ maxWaitMs: null });
     }
 
     const cfg = await loadAccountsConfig();
@@ -2461,7 +2545,7 @@ async function startMultiAccountAmazonParsing() {
     startCompletionWatchdog();
     
     // Start with first account switch
-    switchToNextAmazonAccount();
+    await switchToNextAmazonAccount();
 }
 
 // Watchdog using chrome.alarms (reliable even when Service Worker sleeps)
@@ -2495,10 +2579,66 @@ const PIPELINE_STAGE_MAX_MS = {
   ebay:  6 * 60_000,   // 40 pages + detail-page tracking enrichment; generous
   amazon: 15 * 60_000  // multi-account; has its own watchdog too, this is a backstop
 };
+// Очередь кадров может быть большой (129 карточек заняли 32 минуты в ночь
+// 17→18.08). Эти минуты не являются зависанием парсера и не должны съедать
+// stage cap. Кредит всё равно ограничен: сломанная/вечная очередь не сможет
+// скрывать зависшую стадию бесконечно.
+const SCREENSHOT_STAGE_BUDGET_MAX_MS = 45 * 60_000;
 chrome.alarms.create(PIPELINE_WATCHDOG_ALARM, { delayInMinutes: 1, periodInMinutes: 1 });
 
+function getScreenshotStageBudgetCreditMs({
+  budget,
+  stageName,
+  stageStartedAt,
+  queueHasItems,
+  now = Date.now()
+}) {
+  if (!budget
+      || budget.stageName !== stageName
+      || budget.stageStartedAt !== stageStartedAt) {
+    return 0;
+  }
+
+  let creditMs = Math.max(0, Number(budget.accruedMs) || 0);
+  // activeSince переживает сон/рестарт MV3. Открытый хвост считаем только
+  // когда persisted queue действительно непуста. Иначе stale activeSince
+  // мог бы спрятать настоящее зависание стадии после уже очищенной очереди.
+  if (queueHasItems && Number.isFinite(budget.activeSince)) {
+    creditMs += Math.max(0, now - Math.max(stageStartedAt, budget.activeSince));
+  }
+  return Math.min(creditMs, SCREENSHOT_STAGE_BUDGET_MAX_MS);
+}
+
+function getEffectivePipelineStageElapsedMs({ now, startedAt, screenshotCreditMs }) {
+  const wallMs = Math.max(0, now - startedAt);
+  return Math.max(0, wallMs - Math.max(0, Number(screenshotCreditMs) || 0));
+}
+
+async function closeStaleScreenshotStageBudget(pipelineStage, budget) {
+  if (!budget?.activeSince) return;
+  const stageName = pipelineStage?.stages?.[pipelineStage.currentIndex];
+  const stageStartedAt = pipelineStage?.stageStartedAt || pipelineStage?.startedAt || 0;
+  if (budget.stageName !== stageName || budget.stageStartedAt !== stageStartedAt) return;
+
+  // Перечитываем прямо перед записью: queueTrackScreenshot мог долить карточку,
+  // пока watchdog считал elapsed.
+  const fresh = await chrome.storage.local.get(['screenshotStageBudget', 'trackScreenshotQueue']);
+  const freshBudget = fresh.screenshotStageBudget;
+  if (!freshBudget
+      || freshBudget.activeSince !== budget.activeSince
+      || (Array.isArray(fresh.trackScreenshotQueue) && fresh.trackScreenshotQueue.length > 0)) {
+    return;
+  }
+  await chrome.storage.local.set({
+    screenshotStageBudget: { ...freshBudget, activeSince: null, staleClosedAt: Date.now() }
+  });
+  console.warn('[pipelineWatchdog] closed stale screenshotStageBudget: persisted queue is empty');
+}
+
 async function handlePipelineWatchdog() {
-  const r = await chrome.storage.local.get(['pipelineStage']);
+  const r = await chrome.storage.local.get([
+    'pipelineStage', 'screenshotStageBudget', 'trackScreenshotQueue'
+  ]);
   const p = r.pipelineStage;
   if (!p || !p.active) return;
   const stage = p.stages[p.currentIndex];
@@ -2506,11 +2646,28 @@ async function handlePipelineWatchdog() {
   // stageStartedAt is stamped in runPipelineStage; fall back to pipeline startedAt.
   const startedAt = p.stageStartedAt || p.startedAt || 0;
   if (!startedAt) return;
-  const elapsed = Date.now() - startedAt;
+  const now = Date.now();
+  const rawElapsed = now - startedAt;
+  const queueHasItems = Array.isArray(r.trackScreenshotQueue) && r.trackScreenshotQueue.length > 0;
+  const screenshotCreditMs = getScreenshotStageBudgetCreditMs({
+    budget: r.screenshotStageBudget,
+    stageName: stage,
+    stageStartedAt: startedAt,
+    queueHasItems,
+    now
+  });
+  if (r.screenshotStageBudget?.activeSince && !queueHasItems) {
+    await closeStaleScreenshotStageBudget(p, r.screenshotStageBudget);
+  }
+  const elapsed = getEffectivePipelineStageElapsedMs({
+    now,
+    startedAt,
+    screenshotCreditMs
+  });
   const cap = PIPELINE_STAGE_MAX_MS[stage] || 15 * 60_000;
   if (elapsed < cap) return;
 
-  console.warn(`[pipelineWatchdog] stage '${stage}' stuck ${Math.round(elapsed/1000)}s (cap ${Math.round(cap/1000)}s) — force-advancing so the run can still upload`);
+  console.warn(`[pipelineWatchdog] stage '${stage}' stuck ${Math.round(elapsed/1000)}s effective (${Math.round(rawElapsed/1000)}s wall, screenshot credit ${Math.round(screenshotCreditMs/1000)}s, cap ${Math.round(cap/1000)}s) — force-advancing so the run can still upload`);
   // Mark the stuck store 'completed' so the final upload gate can pass without it.
   // It TIMED OUT (not succeeded) — its data just won't be fresh this run; the other
   // stores still upload. Mirrors the proven iHerb-watchdog pattern (storesCompleted +
@@ -2760,7 +2917,7 @@ async function handleIherbWatchdog() {
         currentIherbAccount = stored.multiAccountIherbState.currentIherbAccount;
     }
     if (isMultiAccountIherb && iherbAccountsQueue.length > 0) {
-        switchToNextIherbAccount();
+        await switchToNextIherbAccount();
     } else if (isMultiAccountIherb) {
         // Очередь пуста, но стадия ещё не закрыта — закрываем через единый
         // chokepoint (возврат на primary + roster + алерт + advance pipeline).
@@ -2935,9 +3092,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             // аккаунтом → скрины первого аккаунта снимались под вторым и бились
             // (симптом: «скрины только одного из двух аккаунтов»).
             // waitForScreenshotsDrained крутится пока очередь реально не опустеет.
-            if (screenshotsEnabled) {
-                await waitForScreenshotsDrained();
-            }
+            await waitForScreenshotsDrained({ maxWaitMs: null });
             
             if (isMultiAccountParsing && amazonAccountsQueue.length > 0) {
                 await switchToNextAmazonAccount();
@@ -4057,6 +4212,7 @@ async function sendSelfDeletingMessage(text, deleteAfterSec = 60) {
 let trackScreenshotQueue = [];
 let isProcessingScreenshots = false;
 let screenshotsEnabled = false;
+let screenshotQueuePersistChain = Promise.resolve();
 
 chrome.storage.local.get(['screenshotsEnabled', 'trackScreenshotQueue'], (res) => {
     screenshotsEnabled = res.screenshotsEnabled || false;
@@ -4066,8 +4222,124 @@ chrome.storage.local.get(['screenshotsEnabled', 'trackScreenshotQueue'], (res) =
     }
 });
 
-function persistScreenshotQueue() {
-    try { chrome.storage.local.set({ trackScreenshotQueue }); } catch (_) {}
+async function persistScreenshotQueue() {
+    // storage.local.set сериализует не мгновенно. Передаём самостоятельный
+    // snapshot и выстраиваем записи в цепочку, иначе поздняя запись старой
+    // очереди может затереть финальный []. Await удерживает MV3 worker живым
+    // до фактического commit в storage.
+    const snapshot = trackScreenshotQueue.map(item => ({
+        ...item,
+        extraTracks: Array.isArray(item.extraTracks) ? [...item.extraTracks] : []
+    }));
+    // Перед финальным [] переносим уже прошедший active-хвост в accruedMs.
+    // Watchdog обязан игнорировать activeSince при пустой persisted queue; без
+    // checkpoint он бы вместе со stale-маркером потерял весь кредит длинного drain.
+    const shouldCheckpointBudget = snapshot.length === 0 && isProcessingScreenshots;
+    screenshotQueuePersistChain = screenshotQueuePersistChain
+        .catch(() => {})
+        .then(async () => {
+            if (shouldCheckpointBudget) await checkpointScreenshotStageBudget();
+            await chrome.storage.local.set({ trackScreenshotQueue: snapshot });
+        });
+    try {
+        await screenshotQueuePersistChain;
+        return true;
+    } catch (e) {
+        console.warn('⚠️ Failed to persist screenshot queue:', e?.message || e);
+        throw e;
+    }
+}
+
+async function beginScreenshotStageBudget() {
+    try {
+        const state = await chrome.storage.local.get(['pipelineStage', 'screenshotStageBudget']);
+        const p = state.pipelineStage;
+        if (!p?.active) return;
+        const stageName = p.stages?.[p.currentIndex];
+        const stageStartedAt = p.stageStartedAt || p.startedAt || 0;
+        if (!stageName || stageName === 'done' || !stageStartedAt) return;
+
+        const old = state.screenshotStageBudget;
+        const sameStage = old?.stageName === stageName && old?.stageStartedAt === stageStartedAt;
+        const next = sameStage ? { ...old } : {
+            stageName,
+            stageStartedAt,
+            accruedMs: 0,
+            activeSince: null
+        };
+        // Если MV3 worker умер посреди рассылки, persisted activeSince уже есть.
+        // Не сбрасываем его при resume: watchdog должен исключить весь открытый
+        // участок, пока persisted queue остаётся непустой.
+        if (!Number.isFinite(next.activeSince)) next.activeSince = Date.now();
+        await chrome.storage.local.set({ screenshotStageBudget: next });
+    } catch (e) {
+        console.warn('⚠️ Failed to start screenshot stage budget:', e?.message || e);
+    }
+}
+
+async function finishScreenshotStageBudget() {
+    try {
+        const state = await chrome.storage.local.get(['pipelineStage', 'screenshotStageBudget']);
+        const p = state.pipelineStage;
+        const budget = state.screenshotStageBudget;
+        const stageName = p?.stages?.[p.currentIndex];
+        const stageStartedAt = p?.stageStartedAt || p?.startedAt || 0;
+        if (!budget
+            || budget.stageName !== stageName
+            || budget.stageStartedAt !== stageStartedAt
+            || !Number.isFinite(budget.activeSince)) {
+            return;
+        }
+        const now = Date.now();
+        const segmentMs = Math.max(0, now - Math.max(stageStartedAt, budget.activeSince));
+        await chrome.storage.local.set({
+            screenshotStageBudget: {
+                ...budget,
+                accruedMs: Math.min(
+                    SCREENSHOT_STAGE_BUDGET_MAX_MS,
+                    Math.max(0, Number(budget.accruedMs) || 0) + segmentMs
+                ),
+                activeSince: null,
+                lastFinishedAt: now
+            }
+        });
+    } catch (e) {
+        console.warn('⚠️ Failed to finish screenshot stage budget:', e?.message || e);
+    }
+}
+
+async function checkpointScreenshotStageBudget() {
+    try {
+        const state = await chrome.storage.local.get(['pipelineStage', 'screenshotStageBudget']);
+        const p = state.pipelineStage;
+        const budget = state.screenshotStageBudget;
+        const stageName = p?.stages?.[p.currentIndex];
+        const stageStartedAt = p?.stageStartedAt || p?.startedAt || 0;
+        if (!budget
+            || budget.stageName !== stageName
+            || budget.stageStartedAt !== stageStartedAt
+            || !Number.isFinite(budget.activeSince)) {
+            return;
+        }
+        const now = Date.now();
+        const segmentMs = Math.max(0, now - Math.max(stageStartedAt, budget.activeSince));
+        await chrome.storage.local.set({
+            screenshotStageBudget: {
+                ...budget,
+                accruedMs: Math.min(
+                    SCREENSHOT_STAGE_BUDGET_MAX_MS,
+                    Math.max(0, Number(budget.accruedMs) || 0) + segmentMs
+                ),
+                // Оставляем новый открытый хвост до process finally. Если worker
+                // умрёт после commit [], watchdog увидит пустую очередь и закроет
+                // его, не потеряв уже checkpointed accruedMs.
+                activeSince: now,
+                lastCheckpointAt: now
+            }
+        });
+    } catch (e) {
+        console.warn('⚠️ Failed to checkpoint screenshot stage budget:', e?.message || e);
+    }
 }
 
 async function sendTelegramPhoto(base64Data, caption) {
@@ -4200,7 +4472,7 @@ async function sendScreenshotToArchive(base64Data, caption) {
     }
 }
 
-function queueTrackScreenshot(orderId, trackNumber, trackUrl, accountName) {
+async function queueTrackScreenshot(orderId, trackNumber, trackUrl, accountName) {
     if (!screenshotsEnabled) return;
     const url = String(trackUrl || '');
     // eBay/iHerb: одна страница заказа на все товары/треки → дедуп по orderId.
@@ -4213,7 +4485,7 @@ function queueTrackScreenshot(orderId, trackNumber, trackUrl, accountName) {
             existing.extraTracks = existing.extraTracks || [];
             if (trackNumber && trackNumber !== existing.trackNumber && !existing.extraTracks.includes(trackNumber)) {
                 existing.extraTracks.push(trackNumber);
-                persistScreenshotQueue();
+                await persistScreenshotQueue();
                 console.log(`📸 Merged track ${trackNumber} into existing order ${orderId} (extras: ${existing.extraTracks.length})`);
             }
             return;
@@ -4224,7 +4496,7 @@ function queueTrackScreenshot(orderId, trackNumber, trackUrl, accountName) {
     }
     const resolvedAccount = accountName || (currentAmazonAccount ? currentAmazonAccount.split('@')[0] : '');
     trackScreenshotQueue.push({ orderId, trackNumber, trackUrl, accountName: resolvedAccount, extraTracks: [] });
-    persistScreenshotQueue();
+    await persistScreenshotQueue();
     console.log(`📸 Queued screenshot: ${orderId} / ${trackNumber} (queue: ${trackScreenshotQueue.length})`);
 }
 
@@ -4281,13 +4553,18 @@ async function processScreenshotQueue() {
 
     if (isProcessingScreenshots || trackScreenshotQueue.length === 0) return;
     isProcessingScreenshots = true;
+    await beginScreenshotStageBudget();
+
+    try {
 
     const beforeFilter = trackScreenshotQueue.length;
     trackScreenshotQueue = await filterAlreadySent(trackScreenshotQueue);
     parseReport.screenshots.skipped += (beforeFilter - trackScreenshotQueue.length);
+    // Важно персистить и непустой отфильтрованный snapshot, и особенно [].
+    // Иначе после сна MV3 восстановится старая очередь и карточки уйдут повторно.
+    await persistScreenshotQueue();
     if (trackScreenshotQueue.length === 0) {
         console.log('📸 All screenshots already sent');
-        isProcessingScreenshots = false;
         return;
     }
 
@@ -4340,7 +4617,7 @@ async function processScreenshotQueue() {
         if (itemTracks.length > 0 && itemTracks.every(t => sentSet.has(t))) {
             console.log(`⏭  skip already-sent order ${item.orderId} (${itemTracks.length} track(s))`);
             parseReport.screenshots.skipped++;
-            persistScreenshotQueue();
+            await persistScreenshotQueue();
             continue;
         }
         // Магазин по trackUrl — чтобы в сводке прогона видеть «сколько скринов ушло по iHerb / Amazon / eBay»
@@ -4350,8 +4627,7 @@ async function processScreenshotQueue() {
             const result = await captureTrackScreenshot(item, done, total, reuseTab?.id);
             if (result === 'CAPTCHA') {
                 trackScreenshotQueue.unshift(item); // Вернуть в очередь
-                persistScreenshotQueue();
-                isProcessingScreenshots = false;
+                await persistScreenshotQueue();
                 captchaPaused = true; // не закрываем reuseTab — юзер будет решать капчу там
                 break;
             }
@@ -4366,7 +4642,7 @@ async function processScreenshotQueue() {
             parseReport.screenshots.byShop = parseReport.screenshots.byShop || {};
             parseReport.screenshots.byShop[shop] = (parseReport.screenshots.byShop[shop] || 0) + 1;
             await markAsSent(tracksToMark);
-            persistScreenshotQueue();
+            await persistScreenshotQueue();
             // Update progress message
             if (progressMsgId) {
                 const remaining = trackScreenshotQueue.length;
@@ -4380,6 +4656,8 @@ async function processScreenshotQueue() {
             console.error(`❌ Screenshot failed for ${item.orderId}:`, e);
             parseReport.screenshots.failed++;
             console.error(`❌ Screenshot ${done}/${total} failed: ${item.orderId} — ${e.message || e}`);
+            // item уже снят из очереди; фиксируем это до возможного сна worker.
+            await persistScreenshotQueue();
         }
         // Пауза между заказами: 1.2-2.2 сек базово; iHerb триггерит на бота → 3-6 сек.
         const isIherbItem = /(secure\.|www\.)?iherb\.com/i.test(String(item.trackUrl || ''));
@@ -4393,7 +4671,7 @@ async function processScreenshotQueue() {
     }
 
     if (sentTracks.length > 0) await markAsSent(sentTracks);
-    persistScreenshotQueue();
+    await persistScreenshotQueue();
     console.log(`✅ Screenshots done: ${done}/${total}`);
     // Delete progress message — final stats will be in the summary report
     if (progressMsgId) {
@@ -4403,7 +4681,10 @@ async function processScreenshotQueue() {
             body: JSON.stringify({ chat_id: tgChatId, message_id: progressMsgId })
         }).catch(() => {});
     }
-    isProcessingScreenshots = false;
+    } finally {
+        isProcessingScreenshots = false;
+        await finishScreenshotStageBudget();
+    }
 }
 
 
