@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Pochtoy Parsing",
-  "version": "7.7.5",
+  "version": "7.8.0",
   "description": "\ud83c\udde7\ud83c\uddfe Parse orders from eBay, iHerb, Amazon and export to Google Sheets",
   "permissions": [
     "storage",

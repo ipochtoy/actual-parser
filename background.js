@@ -1,15 +1,19 @@
-// Background script for Pochtoy Parser - v7.5.0 (Fix: multi-product deduplication, eBay error handling)
+// Background script for Pochtoy Parser - v7.8.0 (reliable sequential six-cabinet nightly run)
 
 // --- Daily Auto-Parse at 23:00 ---
 const DAILY_PARSE_HOUR = 23; // 23:00 local time
 const DAILY_PARSE_MINUTE = 0;
 const DAILY_ALARM_NAME = 'dailyAutoParse';
-const DAILY_ALARM_PERIOD_MINUTES = 24 * 60;
 const DAILY_ALARM_DRIFT_TOLERANCE_MS = 2 * 60 * 1000;
 const DAILY_MISSED_RUN_CATCHUP_MS = 2 * 60 * 60 * 1000;
 const DAILY_DIAGNOSTICS_KEY = 'dailyAutoParseDiagnostics';
 const DAILY_DIAGNOSTICS_LIMIT = 80;
 let dailyDiagnosticWriteQueue = Promise.resolve();
+let dailyRunStartInFlight = null;
+let resolveStartupPipelineReconciled = null;
+const startupPipelineReconciled = new Promise(resolve => {
+    resolveStartupPipelineReconciled = resolve;
+});
 
 function addDailyDiagnostic(event, details = {}) {
     dailyDiagnosticWriteQueue = dailyDiagnosticWriteQueue
@@ -81,7 +85,7 @@ function formatDailyDiagnostic(entry) {
 }
 
 function getNextDailyRun(now = new Date()) {
-    const next = new Date();
+    const next = new Date(now.getTime());
     next.setHours(DAILY_PARSE_HOUR, DAILY_PARSE_MINUTE, 0, 0);
 
     if (now >= next) {
@@ -106,10 +110,9 @@ function setupDailyAlarm(reason = 'setup') {
 
     console.log(`⏰ Daily parse scheduled for ${next.toLocaleString('ru-RU')} (in ${Math.round(minutesUntilNext)} minutes)`);
 
-    chrome.alarms.create(DAILY_ALARM_NAME, {
-        delayInMinutes: minutesUntilNext,
-        periodInMinutes: DAILY_ALARM_PERIOD_MINUTES
-    });
+    // One-shot local-time alarm. A repeating 1440-minute alarm drifts to
+    // 22:00/00:00 Pittsburgh when DST changes.
+    chrome.alarms.create(DAILY_ALARM_NAME, { when: next.getTime() });
 
     chrome.storage.local.set({
         dailyAlarmLastCheckedAt: now.getTime(),
@@ -144,7 +147,7 @@ async function ensureDailyAlarm(reason = 'ensure') {
     const existingTime = existing?.scheduledTime || 0;
     const driftMs = Math.abs(existingTime - expected.getTime());
 
-    if (!existing || driftMs > DAILY_ALARM_DRIFT_TOLERANCE_MS || existing.periodInMinutes !== DAILY_ALARM_PERIOD_MINUTES) {
+    if (!existing || driftMs > DAILY_ALARM_DRIFT_TOLERANCE_MS || existing.periodInMinutes != null) {
         await addDailyDiagnostic(existing ? 'alarm-reschedule-needed' : 'alarm-missing', {
             reason,
             existingScheduledTime: existing?.scheduledTime || null,
@@ -168,24 +171,150 @@ async function ensureDailyAlarm(reason = 'ensure') {
 }
 
 async function runDailyAutoParse(source) {
+    if (dailyRunStartInFlight) {
+        await addDailyDiagnostic('run-skip', { source, skipReason: 'start-already-in-flight' });
+        return dailyRunStartInFlight;
+    }
+    dailyRunStartInFlight = runDailyAutoParseOnce(source);
+    try {
+        return await dailyRunStartInFlight;
+    } finally {
+        dailyRunStartInFlight = null;
+    }
+}
+
+async function runDailyAutoParseOnce(source) {
     console.log(`⏰ Daily auto-parse started (${source})`);
     await addDailyDiagnostic('run-start', { source });
 
-    await chrome.storage.local.set({
-        lastDailyAutoParseTriggeredAt: Date.now(),
-        lastDailyAutoParseSource: source,
-        lastDailyAutoParseStatus: 'started'
-    });
+    // A repeated alarm, watchdog command or manual click must never reset a live
+    // run. The old path wrote fresh state and launched a second iHerb pipeline,
+    // so both flows raced for the same parser tab/account.
+    const beforeStart = await chrome.storage.local.get([
+        'pipelineStage', 'parsingState', 'screenshotQueueBlocked', 'trackScreenshotQueue',
+        'pendingSheetsUpload', 'iherbHumanChallenge'
+    ]);
+    if (beforeStart.pipelineStage?.active || beforeStart.parsingState?.isParsingAllStores) {
+        await addDailyDiagnostic('run-skip', {
+            source,
+            skipReason: 'pipeline-already-active',
+            stage: beforeStart.pipelineStage?.stages?.[beforeStart.pipelineStage?.currentIndex] || null
+        });
+        console.warn(`⏸ Daily auto-parse ignored (${source}): pipeline already active`);
+        return false;
+    }
+    if (beforeStart.iherbHumanChallenge?.status === 'awaiting-human') {
+        await chrome.storage.local.set({
+            lastDailyAutoParseAttemptedAt: Date.now(),
+            lastDailyAutoParseSource: source,
+            lastDailyAutoParseStatus: 'blocked-human-captcha',
+            lastDailyAutoParseError: 'iHerb Press & Hold still requires a human'
+        });
+        await addDailyDiagnostic('run-skip', {
+            source,
+            skipReason: 'iherb-press-hold-human-required'
+        });
+        return false;
+    }
+    if (beforeStart.screenshotQueueBlocked
+        && Array.isArray(beforeStart.trackScreenshotQueue)
+        && beforeStart.trackScreenshotQueue.length > 0) {
+        await chrome.storage.local.set({
+            lastDailyAutoParseAttemptedAt: Date.now(),
+            lastDailyAutoParseSource: source,
+            lastDailyAutoParseStatus: 'blocked-screenshots',
+            lastDailyAutoParseError: 'account-bound screenshot queue requires recovery'
+        });
+        await addDailyDiagnostic('run-skip', { source, skipReason: 'screenshot-queue-blocked' });
+        return false;
+    }
+    if (beforeStart.pendingSheetsUpload?.runId) {
+        await chrome.storage.local.set({
+            lastDailyAutoParseAttemptedAt: Date.now(),
+            lastDailyAutoParseSource: source,
+            lastDailyAutoParseStatus: 'blocked-pending-sheets',
+            lastDailyAutoParseError: 'previous run still has an unresolved Sheets upload'
+        });
+        await addDailyDiagnostic('run-skip', { source, skipReason: 'pending-sheets-upload' });
+        return false;
+    }
 
-    sendTelegramMessage('⏰ Автоматический ночной парсинг запущен (23:00)...');
+    // Sequential pipeline avoids active-tab races between shop flows. Await the
+    // durable start commit: otherwise a storage/navigation error leaves status
+    // "started" forever while no pipeline exists.
+    let pipelineRun = null;
+    try {
+        pipelineRun = await createPipelineRun(source);
+        await chrome.storage.local.set({
+            lastDailyAutoParseAttemptedAt: pipelineRun.attemptedAt,
+            lastDailyAutoParseSource: source,
+            lastDailyAutoParseStatus: 'starting',
+            lastDailyAutoParseError: null
+        });
 
-    // Reset states and start parsing.
-    cachedProgressState = {};
-    await chrome.storage.local.set({ progressState: cachedProgressState, stopAllParsers: false });
-    await clearParsingLogs();
+        // Reset states and start parsing.
+        cachedProgressState = {};
+        parseReport = {
+            stores: {},
+            screenshots: { sent: 0, skipped: 0, failed: 0, broken: 0 },
+            startedAt: pipelineRun.attemptedAt,
+            runId: pipelineRun.id
+        };
+        await chrome.storage.local.set({ progressState: cachedProgressState, stopAllParsers: false });
+        await clearParsingLogs();
 
-    // Sequential pipeline avoids active-tab races between shop flows.
-    startSequentialPipeline();
+        const started = await startSequentialPipeline();
+        if (started?.started === false) {
+            const status = started.reason === 'screenshot-queue-blocked'
+                ? 'blocked-screenshots'
+                : 'failed-to-start';
+            await chrome.storage.local.set({
+                lastDailyAutoParseStatus: status,
+                lastDailyAutoParseFinishedAt: Date.now(),
+                lastDailyAutoParseError: started.reason || 'start-refused'
+            });
+            await updatePipelineRun(run => ({
+                ...run,
+                status: status === 'blocked-screenshots' ? 'blocked' : 'failed_to_start',
+                finishedAt: Date.now(),
+                failures: [...(run.failures || []), { shop: 'pipeline', account: '', reason: started.reason || 'start-refused', at: Date.now() }]
+            }));
+            await addDailyDiagnostic('run-skip', { source, skipReason: started.reason || 'start-refused' });
+            return false;
+        }
+        // startSequentialPipeline commits pipelineRun + pipelineStage + the
+        // legacy trigger proof in one storage.set.  A crash can therefore leave
+        // either a retryable `starting` attempt or a fully owned running stage,
+        // never three mutually contradictory half-start markers.
+        sendTelegramMessage('⏰ Автоматический ночной парсинг запущен (23:00)...').catch(() => {});
+        return true;
+    } catch (error) {
+        const message = String(error?.message || error).slice(0, 300);
+        isParsingAllStores = false;
+        const failedState = await chrome.storage.local.get(['pipelineStage']);
+        await chrome.storage.local.set({
+            pipelineStage: failedState.pipelineStage
+                ? { ...failedState.pipelineStage, active: false, failedAt: Date.now(), failedReason: message }
+                : null,
+            parsingState: { isParsingAllStores: false, storesCompleted },
+            lastDailyAutoParseTriggeredAt: null,
+            lastDailyAutoParseStartedAt: null,
+            lastDailyAutoParseStatus: 'failed-to-start',
+            lastDailyAutoParseFinishedAt: Date.now(),
+            lastDailyAutoParseError: message
+        });
+        if (pipelineRun) {
+            await updatePipelineRun(run => ({
+                ...run,
+                status: 'failed_to_start',
+                finishedAt: Date.now(),
+                failures: [...(run.failures || []), { shop: 'pipeline', account: '', reason: message, at: Date.now() }]
+            }));
+        }
+        await addDailyDiagnostic('run-failed', { source, reason: message });
+        sendTelegramMessage(`❌ Ночной парсинг не стартовал: ${message}`).catch(() => {});
+        throw error;
+    }
 }
 
 async function runMissedDailyAutoParseIfNeeded(reason = 'startup') {
@@ -244,6 +373,7 @@ async function runMissedDailyAutoParseIfNeeded(reason = 'startup') {
 
 // Initialize and self-heal daily alarm on extension/service-worker start.
 ensureDailyAlarm('service-worker-start')
+    .then(() => startupPipelineReconciled)
     .then(() => runMissedDailyAutoParseIfNeeded('service-worker-start'))
     .catch(error => console.warn('⚠️ Daily alarm init failed:', error?.message || error));
 
@@ -253,6 +383,7 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.runtime.onStartup.addListener(() => {
     ensureDailyAlarm('runtime.onStartup')
+        .then(() => startupPipelineReconciled)
         .then(() => runMissedDailyAutoParseIfNeeded('runtime.onStartup'))
         .catch(error => console.warn('⚠️ Daily alarm startup init failed:', error?.message || error));
 });
@@ -373,9 +504,9 @@ const DEFAULT_ACCOUNTS_CONFIG = {
   // primary photopochtoy парсится по fast-path (уже залогинен), secondaries
   // проходят sign-out dance + логин. Все device-trusted.
   iherb: [
-    { email: 'photopochtoy@gmail.com',     password: 'jSt0ldU%W55!', isPrimary: true  },
-    { email: 'questburgh@gmail.com',        password: '1Svetakurz@',  isPrimary: false },
-    { email: 'oksanasorokapocht@gmail.com', password: '1Svetakurz@',  isPrimary: false }
+    { email: 'photopochtoy@gmail.com',     password: '', isPrimary: true  },
+    { email: 'questburgh@gmail.com',        password: '', isPrimary: false },
+    { email: 'oksanasorokapocht@gmail.com', password: '', isPrimary: false }
   ],
   amazon: [
     { email: 'ipochtoy@gmail.com',     isPrimary: true  },
@@ -386,9 +517,230 @@ const DEFAULT_ACCOUNTS_CONFIG = {
   ]
 };
 
+// The nightly job is an exact six-cabinet contract, not merely a count.  A
+// popup typo must fail before we clear orderData or navigate a shared browser.
+const EXPECTED_PIPELINE_ROSTER = Object.freeze({
+  iherb: Object.freeze([
+    'photopochtoy@gmail.com',
+    'questburgh@gmail.com',
+    'oksanasorokapocht@gmail.com'
+  ]),
+  ebay: Object.freeze(['ipochtoy@gmail.com']),
+  amazon: Object.freeze(['ipochtoy@gmail.com', 'photopochtoy@gmail.com'])
+});
+
 async function loadAccountsConfig() {
   const r = await chrome.storage.local.get(['accountsConfig']);
   return r.accountsConfig || DEFAULT_ACCOUNTS_CONFIG;
+}
+
+function mergeIherbAccountsWithoutSecrets(existing = [], desired = []) {
+  const byEmail = new Map(existing.map(a => [normalizeAccountEmail(a?.email), a]));
+  return desired.map(account => {
+    const saved = byEmail.get(normalizeAccountEmail(account.email));
+    return { ...account, password: saved?.password || '' };
+  });
+}
+
+function normalizeAccountEmail(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function buildExpectedPipelineRoster(config) {
+  const roster = {
+    iherb: (config?.iherb || []).map(a => normalizeAccountEmail(a.email)).filter(Boolean),
+    ebay: (config?.ebay || []).map(a => normalizeAccountEmail(a.email)).filter(Boolean),
+    amazon: (config?.amazon || []).map(a => normalizeAccountEmail(a.email)).filter(Boolean)
+  };
+  const primaryCounts = {
+    iherb: (config?.iherb || []).filter(a => a?.isPrimary).length,
+    ebay: (config?.ebay || []).filter(a => a?.isPrimary).length,
+    amazon: (config?.amazon || []).filter(a => a?.isPrimary).length
+  };
+  const exactRoster = ['iherb', 'ebay', 'amazon'].every(shop =>
+    roster[shop].length === EXPECTED_PIPELINE_ROSTER[shop].length
+      && roster[shop].every((email, index) => email === EXPECTED_PIPELINE_ROSTER[shop][index])
+  );
+  const primaryFirst = ['iherb', 'ebay', 'amazon'].every(shop =>
+    config?.[shop]?.[0]?.isPrimary === true && primaryCounts[shop] === 1
+  );
+  // iHerb must be able to return from the final secondary account to primary,
+  // therefore all three credentials are a preflight requirement.  We only
+  // validate presence; secrets never enter pipelineRun or logs.
+  const iherbCredentialsReady = (config?.iherb || []).every(account =>
+    typeof account?.password === 'string' && account.password.trim().length > 0
+  );
+  if (!exactRoster || !primaryFirst || !iherbCredentialsReady) {
+    throw new Error('accountsConfig must match the exact 3 iHerb, 1 eBay and 2 Amazon roster, primary first, with all iHerb credentials configured');
+  }
+  return roster;
+}
+
+let pipelineRunWriteChain = Promise.resolve();
+
+function withPipelineRunWrite(work) {
+  const task = pipelineRunWriteChain
+    .catch(() => {})
+    .then(work);
+  pipelineRunWriteChain = task.catch(() => {});
+  return task;
+}
+
+function applyPipelineAccountResult(run, shop, account, {
+  runId,
+  ok,
+  reason = '',
+  found = 0
+} = {}) {
+  const normalized = normalizeAccountEmail(account);
+  if (!runId || run?.id !== runId
+      || !['starting', 'running'].includes(run.status)
+      || !run.expected?.[shop]?.includes(normalized)) {
+    return null;
+  }
+
+  const next = structuredClone(run);
+  next.completed = next.completed && typeof next.completed === 'object'
+    ? next.completed
+    : {};
+  next.completed[shop] = Array.isArray(next.completed[shop])
+    ? next.completed[shop]
+    : [];
+  next.failures = Array.isArray(next.failures) ? next.failures : [];
+  if (ok) {
+    if (!next.completed[shop].includes(normalized)) next.completed[shop].push(normalized);
+    next.failures = next.failures.filter(f => !(
+      f.shop === shop && normalizeAccountEmail(f.account) === normalized
+    ));
+  } else {
+    // A terminal failure and a completion for the same exact cabinet must never
+    // coexist. A later explicitly accepted retry can add it back and remove the
+    // failure through the success branch above.
+    next.completed[shop] = next.completed[shop].filter(item =>
+      normalizeAccountEmail(item) !== normalized
+    );
+    if (!next.failures.some(f => f.shop === shop
+        && normalizeAccountEmail(f.account) === normalized
+        && f.reason === reason)) {
+      next.failures.push({
+        shop,
+        account: normalized,
+        reason: String(reason || 'failed').slice(0, 160),
+        found,
+        at: Date.now()
+      });
+    }
+  }
+  return next;
+}
+
+async function createPipelineRun(source) {
+  const config = await loadAccountsConfig();
+  const expected = buildExpectedPipelineRoster(config);
+  const now = Date.now();
+  const slotAt = getLastDailyRunSlot(new Date(now)).getTime();
+  const pipelineRun = {
+    id: `${slotAt}-${now}-${Math.random().toString(36).slice(2, 8)}`,
+    slotAt,
+    source,
+    status: 'starting',
+    attemptedAt: now,
+    startedAt: null,
+    finishedAt: null,
+    expected,
+    completed: { iherb: [], ebay: [], amazon: [] },
+    failures: []
+  };
+  await chrome.storage.local.set({ pipelineRun });
+  return pipelineRun;
+}
+
+function updatePipelineRun(mutator) {
+  return withPipelineRunWrite(async () => {
+      const state = await chrome.storage.local.get(['pipelineRun']);
+      if (!state.pipelineRun) return null;
+      const next = await mutator(structuredClone(state.pipelineRun));
+      if (!next) return state.pipelineRun;
+      await chrome.storage.local.set({ pipelineRun: next });
+      return next;
+  });
+}
+
+async function markPipelineAccountResult(shop, account, { runId, ok, reason = '', found = 0 } = {}) {
+  return updatePipelineRun(run =>
+    applyPipelineAccountResult(run, shop, account, { runId, ok, reason, found }) || run
+  );
+}
+
+function markPipelineStageTimeout(shop, accounts, generation) {
+  return withPipelineRunWrite(async () => {
+      const state = await chrome.storage.local.get(['pipelineRun', 'pipelineStage']);
+      if (!state.pipelineStage?.active
+          || !pipelineGenerationMatches(state.pipelineStage, generation)
+          || state.pipelineRun?.id !== generation?.runId
+          || !['starting', 'running'].includes(state.pipelineRun?.status)) {
+        return false;
+      }
+      const next = structuredClone(state.pipelineRun);
+      next.completed[shop] = Array.isArray(next.completed?.[shop]) ? next.completed[shop] : [];
+      next.failures = Array.isArray(next.failures) ? next.failures : [];
+      const completed = new Set(next.completed[shop].map(normalizeAccountEmail));
+      for (const rawAccount of accounts || []) {
+        const account = normalizeAccountEmail(rawAccount);
+        if (!account || completed.has(account)) continue;
+        if (!next.failures.some(f => f.shop === shop
+            && normalizeAccountEmail(f.account) === account
+            && f.reason === 'stage-timeout')) {
+          next.failures.push({
+            shop,
+            account,
+            reason: 'stage-timeout',
+            found: 0,
+            at: Date.now()
+          });
+        }
+      }
+      await chrome.storage.local.set({ pipelineRun: next });
+      return true;
+  });
+}
+
+function getPipelineRunOutcome(run) {
+  const missing = {};
+  for (const shop of ['iherb', 'ebay', 'amazon']) {
+    const done = new Set(run?.completed?.[shop] || []);
+    missing[shop] = (run?.expected?.[shop] || []).filter(account => !done.has(account));
+  }
+  const complete = Object.values(missing).every(list => list.length === 0)
+    && !(run?.failures || []).length;
+  return { status: complete ? 'completed' : 'degraded', missing };
+}
+
+function pipelineRunAccountIsTerminal(run, shop, account) {
+  const normalized = normalizeAccountEmail(account);
+  if (!normalized) return false;
+  if ((run?.completed?.[shop] || []).some(item => normalizeAccountEmail(item) === normalized)) {
+    return true;
+  }
+  return (run?.failures || []).some(failure => failure?.shop === shop
+    && normalizeAccountEmail(failure?.account) === normalized);
+}
+
+async function finalizePipelineRun(expectedRunId) {
+  const finalRun = await updatePipelineRun(run => {
+    if (!expectedRunId || run.id !== expectedRunId || !['starting', 'running'].includes(run.status)) {
+      return null;
+    }
+    const outcome = getPipelineRunOutcome(run);
+    run.status = outcome.status;
+    run.finishedAt = Date.now();
+    run.missing = outcome.missing;
+    return run;
+  });
+  return finalRun?.id === expectedRunId
+      && ['completed', 'degraded'].includes(finalRun.status)
+    ? finalRun
+    : null;
 }
 
 // --- One-time migration: перезаписать сохранённый iHerb-список на новый дефолт ---
@@ -403,7 +755,7 @@ async function migrateIherbAccounts_20260703() {
     if (r.accountsConfig) {
       const migrated = {
         ...r.accountsConfig,
-        iherb: DEFAULT_ACCOUNTS_CONFIG.iherb.map(a => ({ ...a }))
+        iherb: mergeIherbAccountsWithoutSecrets(r.accountsConfig.iherb, DEFAULT_ACCOUNTS_CONFIG.iherb)
       };
       await chrome.storage.local.set({
         accountsConfig: migrated,
@@ -431,7 +783,10 @@ async function migrateIherbAccounts_20260704() {
     if (r.iherbAccountsMigrated_20260704) return;
     if (r.accountsConfig) {
       await chrome.storage.local.set({
-        accountsConfig: { ...r.accountsConfig, iherb: DEFAULT_ACCOUNTS_CONFIG.iherb.map(a => ({ ...a })) },
+        accountsConfig: {
+          ...r.accountsConfig,
+          iherb: mergeIherbAccountsWithoutSecrets(r.accountsConfig.iherb, DEFAULT_ACCOUNTS_CONFIG.iherb)
+        },
         iherbAccountsMigrated_20260704: true
       });
       console.log('🔄 [migrate] accountsConfig.iherb → все 3 аккаунта (photopochtoy + questburgh + oksanasorokapocht)');
@@ -553,11 +908,16 @@ async function uploadLogsToSheet() {
     // Prevent double upload
     if (logsUploadInProgress) {
         console.log('📋 Logs upload already in progress, skipping');
-        return;
+        throw new Error('logs upload already in progress');
     }
     logsUploadInProgress = true;
-    
-    const parsingLogs = await getParsingLogs();
+    let parsingLogs;
+    try {
+        parsingLogs = await getParsingLogs();
+    } catch (error) {
+        logsUploadInProgress = false;
+        throw error;
+    }
     console.log(`📋 uploadLogsToSheet called. Logs count: ${parsingLogs.length}`);
     
     if (parsingLogs.length === 0) {
@@ -634,6 +994,7 @@ async function uploadLogsToSheet() {
         console.error('Failed to upload logs:', error);
         sendTelegramMessage(`⚠️ Не удалось сохранить логи: ${error.message}`);
         logsUploadInProgress = false;
+        throw error;
     }
 }
 
@@ -652,7 +1013,7 @@ let tgPollingInterval = null;
 
 // Initialize cache on startup
 let cachedProgressState = {};
-chrome.storage.local.get(['progressState', 'tgBotToken', 'tgChatId', 'tgPhotoChatId', 'lastUpdateId', 'parsingState'], (result) => {
+chrome.storage.local.get(['progressState', 'tgBotToken', 'tgChatId', 'tgPhotoChatId', 'lastUpdateId', 'parsingState'], async (result) => {
     if (result.tgPhotoChatId) tgPhotoChatId = result.tgPhotoChatId;
     cachedProgressState = result.progressState || {};
 
@@ -692,13 +1053,44 @@ chrome.storage.local.get(['progressState', 'tgBotToken', 'tgChatId', 'tgPhotoCha
     if (tgBotToken) startTelegramPolling();
     else console.warn('⚠️ No Telegram Token - polling disabled');
 
-    reconcileStalePipelineState().catch(error => {
+    try {
+        // Normalize a half-written `starting` run without destroying an old
+        // stage. The durable stage intent remains authoritative after an MV3 or
+        // machine restart even when Chrome lost the owned tab while asleep.
+        // Give the idempotent resume path one chance to recreate that exact
+        // stage, then run the destructive stale-state audit.
+        await reconcileStalePipelineState({ allowDestructiveCleanup: false });
+        await resumePreparedPipelineStageAfterRestart();
+        await reconcileStalePipelineState({ allowDestructiveCleanup: true });
+        await retryPendingIherbHumanChallengeAlert();
+    } catch (error) {
         console.warn('⚠️ Failed to reconcile parser pipeline state:', error?.message || error);
-    });
+    } finally {
+        // Catch-up must observe the reconciled state. Previously it raced this
+        // callback, saw yesterday's active run, skipped, and was never retried.
+        resolveStartupPipelineReconciled?.();
+        resolveStartupPipelineReconciled = null;
+    }
 });
 
 async function clearPipelineRuntimeState(reason) {
     console.warn(`🧹 Clearing stale parser pipeline state: ${reason}`);
+
+    const interruptedAt = Date.now();
+    await updatePipelineRun(run => {
+        if (!['starting', 'running'].includes(run.status)) return run;
+        const failure = {
+            shop: 'pipeline',
+            account: '',
+            reason: String(reason || 'stale pipeline state').slice(0, 160),
+            at: interruptedAt
+        };
+        run.status = 'degraded';
+        run.finishedAt = interruptedAt;
+        run.failures = [...(run.failures || []), failure];
+        run.missing = getPipelineRunOutcome(run).missing;
+        return run;
+    });
 
     isParsingAllStores = false;
     storesCompleted = { ebay: false, iherb: false, amazon: false };
@@ -725,9 +1117,12 @@ async function clearPipelineRuntimeState(reason) {
         'iherb_should_autoparse',
         'amazonPaginationState',
         'amazonNavigationGraceUntil',
+        'amazonNavigationRecovery',
+        'amazonParsingIncomplete',
+        'amazonTimeoutAttempt',
         'amazonParserTabId',
         'amazonFinalReturn',
-        'amazonParsingComplete',
+        'amazonParsingComplete', 'amazonPaginationState',
         'accountSwitchStartedAt',
         'accountSwitchFailures',
         'lastAmazonProgressAt',
@@ -741,6 +1136,9 @@ async function clearPipelineRuntimeState(reason) {
         'iherbOrdersReloadDone',
         'iherbParserTabId',
         'iherbParseStartedAt',
+        'iherbParseAttemptId',
+        'iherbTimeoutAttempt',
+        'iherbParsingComplete',
         'iherbWatchdogRetried',
         'iherbParsedAccounts',
         'iherbRetryPassDone',
@@ -753,26 +1151,107 @@ async function clearPipelineRuntimeState(reason) {
         parsingState: {
             isParsingAllStores,
             storesCompleted
-        }
+        },
+        // Do not leave an interrupted run looking active forever. External
+        // guards and the operator can now distinguish a stale cleanup from a
+        // successful terminal run.
+        lastDailyAutoParseStatus: 'interrupted',
+        lastDailyAutoParseFinishedAt: interruptedAt,
+        lastDailyAutoParseError: String(reason || 'stale pipeline state').slice(0, 300)
     });
 }
 
-async function reconcileStalePipelineState() {
+function isCanonicalResumablePipeline(run, pipeline) {
+    const exactStages = Array.isArray(pipeline?.stages)
+        && pipeline.stages.length === PIPELINE_STAGES.length
+        && pipeline.stages.every((stage, index) => stage === PIPELINE_STAGES[index]);
+    const exactRoster = ['iherb', 'ebay', 'amazon'].every(shop =>
+        Array.isArray(run?.expected?.[shop])
+        && run.expected[shop].length === EXPECTED_PIPELINE_ROSTER[shop].length
+        && run.expected[shop].every((email, index) =>
+            normalizeAccountEmail(email) === EXPECTED_PIPELINE_ROSTER[shop][index]
+        )
+    );
+    return !!run?.id
+        && pipeline?.active === true
+        && pipeline.runId === run.id
+        && ['starting', 'running'].includes(run.status)
+        && exactStages
+        && exactRoster
+        && Number.isInteger(pipeline.currentIndex)
+        && pipeline.currentIndex >= 0
+        && pipeline.currentIndex < PIPELINE_STAGES.length - 1;
+}
+
+async function reconcileStalePipelineState({ allowDestructiveCleanup = true } = {}) {
     const state = await chrome.storage.local.get([
+        'pipelineRun',
         'pipelineStage',
         'progressState',
+        'iherbParserTabId',
         'iherbParseStartedAt',
+        'multiAccountIherbState',
+        'pendingIherbSwitch',
+        'iherbSwitchInProgress',
+        'iherbSwitchStartedAt',
+        'iherbSwitchDispatch',
+        'iherbStageFinalizing',
+        'iherbFinalReturnConfirmed',
+        'amazonParserTabId',
+        'multiAccountState',
+        'pendingAccountSwitch',
+        'amazonSwitchDispatch',
+        'amazonStageFinalizing',
+        'amazonFinalReturnConfirmed',
+        'amazonParsingComplete',
+        'ebayParserTabId',
+        'ebayStageDispatch',
         'lastAmazonProgressAt',
-        'accountSwitchStartedAt'
+        'accountSwitchStartedAt',
+        'trackScreenshotQueue',
+        'screenshotStageBudget'
     ]);
+    const run = state.pipelineRun;
     const pipeline = state.pipelineStage;
+    if (run?.status === 'starting' && !pipeline?.active) {
+        const attemptAgeMs = Date.now() - (Number(run.attemptedAt) || 0);
+        if (attemptAgeMs >= 60_000) {
+            await updatePipelineRun(current => current.id === run.id && current.status === 'starting' ? ({
+                ...current,
+                status: 'failed_to_start',
+                finishedAt: Date.now(),
+                failures: [...(current.failures || []), {
+                    shop: 'pipeline', account: '', reason: 'startup interrupted before durable stage launch', at: Date.now()
+                }]
+            }) : current);
+        }
+        return;
+    }
+    if (run?.status === 'starting' && pipeline?.active && pipeline.runId === run.id) {
+        const startedAt = Number(pipeline.startedAt) || Date.now();
+        await chrome.storage.local.set({
+            pipelineRun: { ...run, status: 'running', startedAt },
+            lastDailyAutoParseTriggeredAt: startedAt,
+            lastDailyAutoParseStartedAt: startedAt,
+            lastDailyAutoParseStatus: 'running'
+        });
+    }
     if (!pipeline?.active) return;
 
     const currentStage = pipeline.stages?.[pipeline.currentIndex];
     if (!currentStage || currentStage === 'done') return;
+    if (!allowDestructiveCleanup) return;
+
+    // A structurally valid run is never "repaired" by deleting its ownership
+    // state. The idempotent resume path gets first refusal and the generation-
+    // fenced stage watchdog owns terminal timeout handling. Destructive cleanup
+    // is reserved for legacy/corrupt state that cannot belong to the six-cabinet
+    // contract at all.
+    if (isCanonicalResumablePipeline(run, pipeline)) return;
 
     const stageTimestamp = Math.max(
         pipeline.startedAt || 0,
+        pipeline.stageStartedAt || 0,
         state.progressState?.[currentStage]?.timestamp || 0,
         currentStage === 'iherb' ? (state.iherbParseStartedAt || 0) : 0,
         currentStage === 'amazon'
@@ -782,16 +1261,78 @@ async function reconcileStalePipelineState() {
     const stageAgeMs = stageTimestamp ? (Date.now() - stageTimestamp) : Number.POSITIVE_INFINITY;
     if (stageAgeMs < PIPELINE_STALE_TIMEOUT_MS) return;
 
+    const generation = pipelineGenerationFromStage(pipeline);
+    const queueHasItems = Array.isArray(state.trackScreenshotQueue)
+        && state.trackScreenshotQueue.length > 0;
+    const screenshotBudgetMatches = queueHasItems
+        && state.screenshotStageBudget?.stageName === currentStage
+        && state.screenshotStageBudget?.stageStartedAt === pipeline.stageStartedAt;
+    const exactTabIsLive = async (tabId, urlPattern) => {
+        if (!tabId) return false;
+        try {
+            const tab = await chrome.tabs.get(tabId);
+            return !!tab?.id && urlPattern.test(tab.url || '');
+        } catch (_) {
+            return false;
+        }
+    };
+
     let shouldClear = false;
     if (currentStage === 'iherb') {
-        const iherbTabs = await chrome.tabs.query({ url: 'https://*.iherb.com/*' });
-        shouldClear = iherbTabs.length === 0 || !state.iherbParseStartedAt;
+        const account = normalizeAccountEmail(state.multiAccountIherbState?.currentIherbAccount);
+        const pendingOwned = !!account
+            && state.pendingIherbSwitch?.runId === generation?.runId
+            && normalizeAccountEmail(state.pendingIherbSwitch?.email) === account;
+        const dispatchOwned = !!account
+            && pipelineGenerationMatches(state.iherbSwitchDispatch, generation)
+            && normalizeAccountEmail(state.iherbSwitchDispatch?.account) === account;
+        const finalizingOwned = pipelineGenerationMatches(state.iherbStageFinalizing, generation)
+            && state.iherbStageFinalizing?.shop === 'iherb';
+        const switchOwned = pendingOwned
+            && state.iherbSwitchInProgress === true
+            && Number.isFinite(Number(state.iherbSwitchStartedAt));
+        const tabIsLive = await exactTabIsLive(
+            state.iherbParserTabId,
+            /^https?:\/\/(?:www|secure|checkout)\.iherb\.com\//i
+        );
+        const parsingOwned = tabIsLive && Number.isFinite(Number(state.iherbParseStartedAt));
+        // Finalizers, prepared switches and a persisted screenshot drain are
+        // restart-resumable even when the exact tab has not been recreated yet.
+        // Never destroy them before resumePreparedPipelineStageAfterRestart runs.
+        shouldClear = !(finalizingOwned || pendingOwned || dispatchOwned || switchOwned
+            || parsingOwned || screenshotBudgetMatches);
     } else if (currentStage === 'ebay') {
-        const ebayTabs = await chrome.tabs.query({ url: 'https://www.ebay.com/mye/myebay/purchase*' });
-        shouldClear = ebayTabs.length === 0;
+        const ebayTabId = state.ebayParserTabId;
+        const terminalOwned = run?.id === generation?.runId
+            && pipelineRunAccountIsTerminal(run, 'ebay', run?.expected?.ebay?.[0]);
+        const dispatchOwned = pipelineGenerationMatches(state.ebayStageDispatch, generation);
+        const tabIsLive = await exactTabIsLive(
+            ebayTabId,
+            /^https?:\/\/www\.ebay\.com\/mye\/myebay\/purchase/i
+        );
+        shouldClear = !(terminalOwned || dispatchOwned || screenshotBudgetMatches || tabIsLive);
     } else if (currentStage === 'amazon') {
-        const amazonTabs = await chrome.tabs.query({ url: 'https://www.amazon.com/*' });
-        shouldClear = amazonTabs.length === 0 || !(state.lastAmazonProgressAt || state.accountSwitchStartedAt);
+        const account = normalizeAccountEmail(state.multiAccountState?.currentAmazonAccount);
+        const pendingOwned = !!account
+            && state.pendingAccountSwitch?.runId === generation?.runId
+            && normalizeAccountEmail(state.pendingAccountSwitch?.email) === account;
+        const dispatchOwned = !!account
+            && pipelineGenerationMatches(state.amazonSwitchDispatch, generation)
+            && normalizeAccountEmail(state.amazonSwitchDispatch?.account) === account;
+        const finalizingOwned = pipelineGenerationMatches(state.amazonStageFinalizing, generation)
+            && state.amazonStageFinalizing?.shop === 'amazon';
+        const completionOwned = !!state.amazonParsingComplete
+            && state.amazonParsingComplete.runId === generation?.runId
+            && normalizeAccountEmail(state.amazonParsingComplete.account) === account
+            && state.amazonParsingComplete.parserTabId === state.amazonParserTabId;
+        const tabIsLive = await exactTabIsLive(
+            state.amazonParserTabId,
+            /^https?:\/\/(?:www\.)?amazon\.com\//i
+        );
+        const parsingOwned = tabIsLive
+            && !!(state.lastAmazonProgressAt || state.accountSwitchStartedAt);
+        shouldClear = !(finalizingOwned || pendingOwned || dispatchOwned || completionOwned
+            || parsingOwned || screenshotBudgetMatches);
     }
 
     if (!shouldClear) return;
@@ -806,13 +1347,166 @@ async function reconcileStalePipelineState() {
     try {
         await uploadToSheets();
         await uploadLogsToSheet();
-        await chrome.storage.local.set({ lastSheetsUploadOkAt: Date.now() });
-        console.log('✅ Частичная выгрузка после протухшей стадии выполнена');
+        console.log('✅ Частичная выгрузка после протухшей стадии выполнена (без green stamp)');
     } catch (e) {
         console.error('❌ Частичная выгрузка после протухшей стадии не удалась:', e?.message || e);
     }
 
     await clearPipelineRuntimeState(`${currentStage} stage stale for ${ageMinutes} min without live runtime`);
+}
+
+async function resumePreparedPipelineStageAfterRestart() {
+    const state = await chrome.storage.local.get([
+        'pipelineRun', 'pipelineStage',
+        'multiAccountIherbState', 'pendingIherbSwitch', 'iherbSwitchInProgress',
+        'iherbParserTabId', 'iherbParseAttemptId', 'iherbTimeoutAttempt',
+        'iherbParsingComplete',
+        'ebayParserTabId', 'autoParsePending', 'ebayStageDispatch',
+        'multiAccountState', 'pendingAccountSwitch', 'amazonSwitchDispatch',
+        'amazonParserTabId', 'accountSwitchStartedAt', 'amazonTimeoutAttempt',
+        'amazonParsingComplete', 'amazonPaginationState',
+        'amazonStageFinalizing', 'amazonFinalReturn', 'amazonFinalReturnConfirmed',
+        'iherbSwitchDispatch', 'iherbStageFinalizing', 'iherbFinalReturnConfirmed',
+        'pendingSheetsUpload', 'lastSheetsUploadRunId', 'lastSheetsUploadOkAt'
+    ]);
+    const run = state.pipelineRun;
+    const stageState = state.pipelineStage;
+    if (run?.id !== stageState?.runId) return false;
+    const stage = stageState.stages?.[stageState.currentIndex];
+    const generation = pipelineGenerationFromStage(stageState);
+
+    if (stage === 'done' && ['starting', 'running', 'completed', 'degraded'].includes(run?.status)) {
+        const uploaded = state.lastSheetsUploadRunId === run.id
+            && Number.isFinite(state.lastSheetsUploadOkAt)
+            && Number.isFinite(run.finishedAt)
+            && state.lastSheetsUploadOkAt >= run.finishedAt;
+        const pendingOwned = state.pendingSheetsUpload?.runId === run.id;
+        if (!stageState.active && (uploaded || pendingOwned)) return false;
+        // Covers all terminal crash windows: before finalizePipelineRun, after
+        // finalize but before inactive commit, and after inactive commit but
+        // before pendingSheetsUpload/checkAllStoresCompleted.
+        return runPipelineStage('done', run.id);
+    }
+    if (!stageState.active || run?.status !== 'running') return false;
+
+    // The stage identity/timer is committed before any browser mutation. If the
+    // worker died in that narrow gap, resume only when the shop-specific durable
+    // launch proof is absent (or the account queue is still untouched).
+    if (stage === 'iherb') {
+        if (state.iherbStageFinalizing?.runId === run.id
+            && pipelineGenerationMatches(state.iherbStageFinalizing, generation)) {
+            return resumeIherbStageFinalization(state.iherbStageFinalizing, generation);
+        }
+        const multi = state.multiAccountIherbState;
+        if (!multi) return runPipelineStage('iherb', run.id);
+        if (iherbAttemptIdentityMatches(
+            state.iherbParsingComplete,
+            iherbAttemptRefFromState(state)
+        )) {
+            return consumeIherbCompletionMarker(generation);
+        }
+        const iherbPendingOwned = state.pendingIherbSwitch?.runId === run.id
+            && normalizeAccountEmail(state.pendingIherbSwitch?.email)
+                === normalizeAccountEmail(multi.currentIherbAccount);
+        if (multi.currentIherbAccount
+            && pipelineRunAccountIsTerminal(run, 'iherb', multi.currentIherbAccount)
+            && (!state.pendingIherbSwitch || iherbPendingOwned)) {
+            // A worker may die after the account outcome is committed but before
+            // its old login intent/timer is consumed. The durable terminal result
+            // wins; otherwise a stale pending flag can hold the run until stage cap.
+            if (iherbPendingOwned) {
+                await chrome.storage.local.remove([
+                    'pendingIherbSwitch', 'iherbSwitchInProgress', 'iherbSwitchStartedAt',
+                    'iherbSwitchDispatch', 'iherbParseStartedAt', 'iherbWatchdogRetried'
+                ]);
+            }
+            return switchToNextIherbAccount(generation);
+        }
+        if (multi.isMultiAccountIherb
+            && !multi.currentIherbAccount
+            && Array.isArray(multi.iherbAccountsQueue)
+            && multi.iherbAccountsQueue.length > 0
+            && !state.pendingIherbSwitch
+            && !state.iherbSwitchInProgress) {
+            return switchToNextIherbAccount(generation);
+        }
+        if (multi.isMultiAccountIherb
+            && multi.currentIherbAccount
+            && state.pendingIherbSwitch?.runId === run.id
+            && normalizeAccountEmail(state.pendingIherbSwitch.email)
+                === normalizeAccountEmail(multi.currentIherbAccount)
+            && (state.iherbSwitchDispatch?.phase !== 'dispatched'
+                || !pipelineGenerationMatches(state.iherbSwitchDispatch, generation)
+                || normalizeAccountEmail(state.iherbSwitchDispatch?.account)
+                    !== normalizeAccountEmail(multi.currentIherbAccount))) {
+            return dispatchCurrentIherbAccountSwitch(multi.currentIherbAccount, generation);
+        }
+    } else if (stage === 'ebay') {
+        const ebayAccount = run.expected?.ebay?.[0];
+        if (pipelineRunAccountIsTerminal(run, 'ebay', ebayAccount)) {
+            return advancePipelineStage(generation);
+        }
+        const markerMatches = state.ebayStageDispatch?.phase === 'dispatched'
+            && pipelineGenerationMatches(state.ebayStageDispatch, generation)
+            && state.ebayStageDispatch?.tabId === state.ebayParserTabId;
+        const tab = markerMatches ? await getEbayParserTab(state.ebayParserTabId) : null;
+        if (!markerMatches || !tab || !/\/mye\/myebay\/purchase/i.test(tab.url || '')) {
+            return startEbayStageForPipeline(generation);
+        }
+    } else if (stage === 'amazon') {
+        if (state.amazonStageFinalizing?.runId === run.id
+            && pipelineGenerationMatches(state.amazonStageFinalizing, generation)) {
+            return resumeAmazonStageFinalization(state.amazonStageFinalizing, generation);
+        }
+        const multi = state.multiAccountState;
+        if (!multi) return runPipelineStage('amazon', run.id);
+        const amazonPendingOwned = state.pendingAccountSwitch?.runId === run.id
+            && normalizeAccountEmail(state.pendingAccountSwitch?.email)
+                === normalizeAccountEmail(multi.currentAmazonAccount);
+        const amazonCompletionOwned = state.amazonParsingComplete?.runId === run.id
+            && normalizeAccountEmail(state.amazonParsingComplete?.account)
+                === normalizeAccountEmail(multi.currentAmazonAccount)
+            && state.amazonParsingComplete?.parserTabId === state.amazonParserTabId
+            && (!state.amazonPaginationState?.parseId
+                || state.amazonParsingComplete?.parseId === state.amazonPaginationState.parseId);
+        // A completion committed before an MV3 restart outranks an earlier
+        // timeout failure. Consume it first so success removes that failure;
+        // never delete a valid permit merely because the account is terminal.
+        if (amazonCompletionOwned) {
+            return consumeAmazonCompletionMarker(generation);
+        }
+        if (multi.currentAmazonAccount
+            && pipelineRunAccountIsTerminal(run, 'amazon', multi.currentAmazonAccount)
+            && (!state.pendingAccountSwitch || amazonPendingOwned)) {
+            if (amazonPendingOwned) {
+                await chrome.storage.local.remove([
+                    'pendingAccountSwitch', 'amazonSwitchDispatch',
+                    'accountSwitchStartedAt', 'lastAmazonProgressAt'
+                ]);
+            }
+            return switchToNextAmazonAccount(generation);
+        }
+        if (multi.isMultiAccountParsing
+            && !multi.currentAmazonAccount
+            && Array.isArray(multi.amazonAccountsQueue)
+            && multi.amazonAccountsQueue.length > 0
+            && !state.pendingAccountSwitch) {
+            return switchToNextAmazonAccount(generation);
+        }
+        if (multi.isMultiAccountParsing
+            && multi.currentAmazonAccount
+            && state.pendingAccountSwitch?.runId === run.id
+            && normalizeAccountEmail(state.pendingAccountSwitch.email)
+                === normalizeAccountEmail(multi.currentAmazonAccount)
+            && (state.amazonSwitchDispatch?.phase !== 'dispatched'
+                || state.amazonSwitchDispatch?.kind !== 'account-switch'
+                || !pipelineGenerationMatches(state.amazonSwitchDispatch, generation)
+                || normalizeAccountEmail(state.amazonSwitchDispatch?.account)
+                    !== normalizeAccountEmail(multi.currentAmazonAccount))) {
+            return dispatchCurrentAmazonAccountSwitch(multi.currentAmazonAccount, generation, 'account-switch');
+        }
+    }
+    return false;
 }
 
 // --- Progress Tracking State ---
@@ -836,13 +1530,7 @@ async function logMultiAccountStep(step, detail = {}) {
     } catch (e) { console.warn('logMultiAccountStep failed:', e?.message || e); }
 }
 
-function rememberAmazonParserTab(sender) {
-    const tab = sender?.tab;
-    if (!tab?.id || !/^https?:\/\/(?:[^/]+\.)?amazon\.com\//i.test(tab.url || '')) return;
-    chrome.storage.local.set({ amazonParserTabId: tab.id }).catch(() => {});
-}
-
-async function handleProgressMessage(request) {
+async function handleProgressMessage(request, sender = null) {
     // Legacy parsingProgress wrapper ({page, totalOrders}, no store) reaches here
     // via the converter below — without a store there is nothing to track.
     if (!request.store) return;
@@ -850,15 +1538,12 @@ async function handleProgressMessage(request) {
     const storeKey = request.store.toLowerCase();
     console.log(`📊 [BACKGROUND] Progress from ${request.store}:`, request.current, '/', request.total, request.status);
 
-    // Watchdog uses lastAmazonProgressAt to detect "content-amazon silent" case.
-    // Without this ping, a 20-page account gets killed after 90s because watchdog
-    // compares now() to accountSwitchStartedAt. Progress-based idle check fixes it.
-    if (storeKey === 'amazon') {
-        chrome.storage.local.set({ lastAmazonProgressAt: Date.now() });
-    }
-
     // Restore multi-account state from storage FIRST (Service Worker may have restarted)
-    const stored = await new Promise(resolve => chrome.storage.local.get(['multiAccountState', 'multiAccountIherbState'], resolve));
+    const stored = await new Promise(resolve => chrome.storage.local.get([
+        'multiAccountState', 'multiAccountIherbState', 'pipelineRun',
+        'amazonParserTabId', 'iherbParserTabId', 'ebayParserTabId', 'pipelineStage',
+        'iherbStageFinalizing', 'iherbParseAttemptId', 'iherbTimeoutAttempt'
+    ], resolve));
     if (stored.multiAccountState) {
         isMultiAccountParsing = stored.multiAccountState.isMultiAccountParsing;
         amazonAccountsQueue = stored.multiAccountState.amazonAccountsQueue || [];
@@ -870,10 +1555,50 @@ async function handleProgressMessage(request) {
         currentIherbAccount = stored.multiAccountIherbState.currentIherbAccount;
     }
 
+    // Any Amazon progress can extend the idle watchdog, so even non-completion
+    // pings must come from the tab explicitly created/owned by this run.
+    if (storeKey === 'amazon' && ['starting', 'running'].includes(stored.pipelineRun?.status)) {
+        if (!sender?.tab?.id || sender.tab.id !== stored.amazonParserTabId) {
+            console.warn('⏭ Ignoring Amazon progress from a non-parser tab');
+            return;
+        }
+        chrome.storage.local.set({ lastAmazonProgressAt: Date.now() });
+    }
+
     // Update completion status
     const isCompleted = request.status === 'Done ✅' || request.status === 'Error';
+    const activeRun = ['starting', 'running'].includes(stored.pipelineRun?.status);
+    if (isCompleted && activeRun) {
+        const expectedAccount = storeKey === 'iherb'
+            ? stored.multiAccountIherbState?.currentIherbAccount
+            : storeKey === 'amazon'
+                ? stored.multiAccountState?.currentAmazonAccount
+                : stored.pipelineRun?.expected?.ebay?.[0];
+        const wrongRun = !request.runId || request.runId !== stored.pipelineRun.id;
+        const wrongAccount = !request.account
+            || normalizeAccountEmail(request.account) !== normalizeAccountEmail(expectedAccount);
+        const wrongStage = stored.pipelineStage?.runId !== stored.pipelineRun.id
+            || stored.pipelineStage?.stages?.[stored.pipelineStage?.currentIndex] !== storeKey
+            || (storeKey === 'iherb' && stored.iherbStageFinalizing?.runId === stored.pipelineRun.id);
+        const wrongAttempt = storeKey === 'iherb'
+            && (!request.attemptId
+                || request.attemptId !== stored.iherbParseAttemptId
+                || iherbTimeoutAttemptMatchesRuntime(stored.iherbTimeoutAttempt, stored));
+        const wrongTab = storeKey === 'amazon'
+            ? (!sender?.tab?.id || sender.tab.id !== stored.amazonParserTabId)
+            : storeKey === 'iherb'
+                ? (!sender?.tab?.id || sender.tab.id !== stored.iherbParserTabId)
+                : storeKey === 'ebay'
+                    ? (!sender?.tab?.id || sender.tab.id !== stored.ebayParserTabId)
+                    : false;
+        if (wrongRun || wrongAccount || wrongStage || wrongTab || wrongAttempt) {
+            console.warn(`⏭ Ignoring stale completion for ${storeKey}: run/account/stage/tab/attempt fence failed`);
+            return;
+        }
+    }
     const shouldHandleCompletion = isCompleted && (isParsingAllStores || (storeKey === 'amazon' && isMultiAccountParsing) || (storeKey === 'iherb' && isMultiAccountIherb));
     const shouldNotifyTelegram = isCompleted && !shouldHandleCompletion;
+    const completionGeneration = pipelineGenerationFromStage(stored.pipelineStage);
     
     console.log(`🔍 [DEBUG] isCompleted: ${isCompleted}, isParsingAllStores: ${isParsingAllStores}, isMultiAccountParsing: ${isMultiAccountParsing}, shouldHandle: ${shouldHandleCompletion}`);
     
@@ -899,8 +1624,18 @@ async function handleProgressMessage(request) {
             
             // Multi-account Amazon: DON'T switch here — let the watchdog alarm handle it.
             // Watchdog is async and can properly await processScreenshotQueue() between accounts.
-            if (storeKey === 'amazon' && isMultiAccountParsing && amazonAccountsQueue.length > 0) {
+            if (storeKey === 'amazon' && isMultiAccountParsing) {
                 console.log('[handleProgress] Amazon multi-account: deferring to watchdog for screenshots + switch');
+                return;
+            }
+
+            if (storeKey === 'iherb'
+                && isMultiAccountIherb
+                && request.status === 'Done ✅') {
+                const consumed = await consumeIherbCompletionMarker(completionGeneration);
+                if (!consumed) {
+                    console.warn('⏭ iHerb Done had no exact durable completion permit');
+                }
                 return;
             }
 
@@ -908,7 +1643,14 @@ async function handleProgressMessage(request) {
             if (storeKey === 'iherb' && isMultiAccountIherb && iherbAccountsQueue.length > 0) {
                 console.log('[handleProgress] iHerb multi-account: processing screenshots, then switching');
                 parseReport.stores[`iherb_${(currentIherbAccount || '').split('@')[0]}`] = { found: count, status: emoji };
-                await recordIherbParsedAccount(currentIherbAccount);
+                if (request.status === 'Done ✅') {
+                    await recordIherbParsedAccount(currentIherbAccount, request.runId, request.attemptId);
+                } else {
+                    await recordIherbSkipReason(currentIherbAccount, 'parse_error', request.runId);
+                }
+                const iherbDoneGate = (await chrome.storage.local.get(['pipelineStage'])).pipelineStage;
+                if (!iherbDoneGate?.active
+                    || !pipelineGenerationMatches(iherbDoneGate, completionGeneration)) return;
                 // Watchdog: cs дошёл до конца — снимаем marker
                 await chrome.storage.local.remove(['iherbParseStartedAt', 'iherbWatchdogRetried']);
                 // Не используем processScreenshotQueue().finally(...): при уже
@@ -916,8 +1658,13 @@ async function handleProgressMessage(request) {
                 // переключает кабинет с недоснятой очередью. iHerb-карточки
                 // доступны только в своём аккаунте, поэтому ждём реальный drain
                 // без таймаута и только затем меняем login.
-                await waitForScreenshotsDrained({ maxWaitMs: null });
-                await switchToNextIherbAccount();
+                if (!await waitForScreenshotsDrained()) {
+                    return stopPipelineForScreenshotDrain(
+                        'iHerb account screenshots blocked',
+                        pipelineGenerationFromStage(stored.pipelineStage)
+                    );
+                }
+                await switchToNextIherbAccount(completionGeneration);
                 return;
             }
             // Multi-account iHerb: очередь пуста — последний аккаунт этого прохода
@@ -929,15 +1676,37 @@ async function handleProgressMessage(request) {
             if (storeKey === 'iherb' && isMultiAccountIherb) {
                 console.log('[handleProgress] iHerb multi-account: queue drained, finalize');
                 parseReport.stores[`iherb_${(currentIherbAccount || '').split('@')[0]}`] = { found: count, status: emoji };
-                await recordIherbParsedAccount(currentIherbAccount);
+                if (request.status === 'Done ✅') {
+                    await recordIherbParsedAccount(currentIherbAccount, request.runId, request.attemptId);
+                } else {
+                    await recordIherbSkipReason(currentIherbAccount, 'parse_error', request.runId);
+                }
+                const iherbDoneGate = (await chrome.storage.local.get(['pipelineStage'])).pipelineStage;
+                if (!iherbDoneGate?.active
+                    || !pipelineGenerationMatches(iherbDoneGate, completionGeneration)) return;
                 await chrome.storage.local.remove(['iherbParseStartedAt', 'iherbWatchdogRetried']);
-                await waitForScreenshotsDrained({ maxWaitMs: null });
-                await finalizeIherbStage();
+                if (!await waitForScreenshotsDrained()) {
+                    return stopPipelineForScreenshotDrain(
+                        'iHerb final screenshots blocked',
+                        pipelineGenerationFromStage(stored.pipelineStage)
+                    );
+                }
+                await finalizeIherbStage(undefined, { expectedGeneration: completionGeneration });
                 return;
             }
 
             storesCompleted[storeKey] = true;
             setParserLock(storeKey, false);
+
+            if (storeKey === 'ebay') {
+                const cfg = await loadAccountsConfig();
+                await markPipelineAccountResult('ebay', cfg.ebay?.[0]?.email, {
+                    runId: request.runId,
+                    ok: request.status === 'Done ✅',
+                    reason: request.status === 'Done ✅' ? '' : 'parse-error',
+                    found: count
+                });
+            }
 
             if (storeKey === 'amazon' && currentAmazonAccount) {
                 parseReport.stores[`amazon_${currentAmazonAccount.split('@')[0]}`] = { found: count, status: emoji };
@@ -947,9 +1716,6 @@ async function handleProgressMessage(request) {
                 parseReport.stores[storeKey] = { found: count, status: emoji };
             }
 
-            // Upload this store's data to Sheets immediately (dedupe handles duplicates)
-            setTimeout(() => uploadToSheets(), 1500);
-
             // Pipeline advance: if sequential pipeline is active and we just finished eBay,
             // jump ebay → amazon_primary. iHerb and Amazon advance from their own final-return
             // functions (with a 45s delay for picker/re-login to settle).
@@ -957,7 +1723,7 @@ async function handleProgressMessage(request) {
                 chrome.storage.local.get(['pipelineStage']).then(r => {
                     const p = r.pipelineStage;
                     if (p && p.active && p.stages[p.currentIndex] === 'ebay') {
-                        advancePipelineStage().catch(() => {});
+                        advancePipelineStage(pipelineGenerationFromStage(p)).catch(() => {});
                     }
                 });
             }
@@ -974,7 +1740,9 @@ async function handleProgressMessage(request) {
         sendTelegramMessage(`${emoji} ${request.store || storeKey}: Готово (${count} заказов)`);
         // Upload to Sheets immediately after standalone parse
         if (request.status !== 'Error') {
-            setTimeout(() => uploadToSheets(), 1500);
+            setTimeout(() => uploadToSheets().catch(error => {
+                console.warn('Standalone Sheets upload failed:', error?.message || error);
+            }), 1500);
         }
         if (screenshotsEnabled && trackScreenshotQueue.length > 0) {
             setTimeout(() => processScreenshotQueue(), 2000);
@@ -1005,6 +1773,215 @@ async function handleProgressMessage(request) {
     chrome.runtime.sendMessage(request).catch(() => {
         // Popup might be closed, ignore error
     });
+}
+
+async function validateParserSignal(request, sender) {
+    const store = String(request.store || '').toLowerCase();
+    if (!['iherb', 'ebay', 'amazon'].includes(store)) return null;
+    const state = await chrome.storage.local.get([
+        'pipelineRun', 'pipelineStage', 'multiAccountIherbState', 'multiAccountState',
+        'iherbParserTabId', 'ebayParserTabId', 'amazonParserTabId',
+        'iherbStageFinalizing', 'iherbParseAttemptId', 'iherbTimeoutAttempt'
+    ]);
+    const expectedAccount = store === 'iherb'
+        ? state.multiAccountIherbState?.currentIherbAccount
+        : store === 'amazon'
+            ? state.multiAccountState?.currentAmazonAccount
+            : state.pipelineRun?.expected?.ebay?.[0];
+    const expectedTabId = state[`${store}ParserTabId`];
+    const valid = ['starting', 'running'].includes(state.pipelineRun?.status)
+        && request.runId === state.pipelineRun.id
+        && normalizeAccountEmail(request.account) === normalizeAccountEmail(expectedAccount)
+        && state.pipelineStage?.active === true
+        && state.pipelineStage?.runId === state.pipelineRun.id
+        && state.pipelineStage?.stages?.[state.pipelineStage?.currentIndex] === store
+        && !(store === 'iherb' && state.iherbStageFinalizing?.runId === state.pipelineRun.id)
+        && !(store === 'iherb' && (
+            !request.attemptId
+            || request.attemptId !== state.iherbParseAttemptId
+            || iherbTimeoutAttemptMatchesRuntime(state.iherbTimeoutAttempt, state)
+        ))
+        && !!sender?.tab?.id
+        && sender.tab.id === expectedTabId;
+    return valid ? {
+        store,
+        runId: state.pipelineRun.id,
+        account: expectedAccount,
+        attemptId: store === 'iherb' ? state.iherbParseAttemptId : null
+    } : null;
+}
+
+function iherbOwnedActionMatches(state, expected) {
+    return !!expected?.runId
+        && !!expected?.tabId
+        && !!expected?.account
+        && state?.pipelineStage?.active === true
+        && pipelineGenerationMatches(state.pipelineStage, expected.generation)
+        && state.pipelineStage.stages?.[state.pipelineStage.currentIndex] === 'iherb'
+        && ['starting', 'running'].includes(state?.pipelineRun?.status)
+        && state.pipelineRun.id === expected.runId
+        && state.iherbParserTabId === expected.tabId
+        && state.iherbParseAttemptId === expected.attemptId
+        && normalizeAccountEmail(state.multiAccountIherbState?.currentIherbAccount)
+            === normalizeAccountEmail(expected.account);
+}
+
+async function readIherbOwnedActionState() {
+    return chrome.storage.local.get([
+        'pipelineRun', 'pipelineStage', 'multiAccountIherbState',
+        'iherbParserTabId', 'iherbPressHoldAttempts'
+    ]);
+}
+
+function iherbHumanChallengeMatches(marker, expected) {
+    return marker?.status === 'awaiting-human'
+        && marker.runId === expected?.runId
+        && normalizeAccountEmail(marker.account) === normalizeAccountEmail(expected?.account)
+        && marker.tabId === expected?.tabId
+        && marker.attemptId === expected?.attemptId
+        && pipelineGenerationMatches(marker, expected?.generation);
+}
+
+async function markIherbHumanChallengeAlerted(expected) {
+    const fresh = await chrome.storage.local.get(['iherbHumanChallenge']);
+    if (!iherbHumanChallengeMatches(fresh.iherbHumanChallenge, expected)) return false;
+    await chrome.storage.local.set({
+        iherbHumanChallenge: {
+            ...fresh.iherbHumanChallenge,
+            alertedAt: Date.now()
+        }
+    });
+    return true;
+}
+
+async function sendIherbHumanChallengeAlert(marker) {
+    await sendTelegramMessage(
+        `🛑 iHerb (${String(marker.account || '').split('@')[0]}): Press & Hold требует человека. `
+        + 'Ночной обход остановлен; вкладка оставлена без навигации. После ручного решения нужен отдельный подтверждённый запуск.'
+    );
+    return markIherbHumanChallengeAlerted({
+        runId: marker.runId,
+        account: marker.account,
+        tabId: marker.tabId,
+        attemptId: marker.attemptId,
+        generation: marker
+    });
+}
+
+async function retryPendingIherbHumanChallengeAlert() {
+    const state = await chrome.storage.local.get(['iherbHumanChallenge']);
+    const marker = state.iherbHumanChallenge;
+    if (marker?.status !== 'awaiting-human' || marker.alertedAt) return false;
+    await sendIherbHumanChallengeAlert(marker).catch(error => {
+        console.warn('⚠️ Failed to resend iHerb human-challenge alert:', error?.message || error);
+    });
+    return true;
+}
+
+async function handleIherbPressHoldDetected(request, sender) {
+    const commitTask = pipelineRunWriteChain
+        .catch(() => {})
+        .then(async () => {
+            const state = await chrome.storage.local.get([
+                'pipelineRun', 'pipelineStage', 'multiAccountIherbState',
+                'iherbParserTabId', 'iherbParseAttemptId', 'iherbHumanChallenge'
+            ]);
+            const generation = pipelineGenerationFromStage(state.pipelineStage);
+            const expected = {
+                runId: request.runId,
+                account: request.account,
+                tabId: sender?.tab?.id || null,
+                attemptId: request.attemptId,
+                generation
+            };
+            if (!iherbOwnedActionMatches(state, expected)) {
+                return { blocked: false, reason: 'stale_tab_or_run' };
+            }
+
+            if (iherbHumanChallengeMatches(state.iherbHumanChallenge, expected)) {
+                return {
+                    blocked: true,
+                    reason: 'human_required',
+                    marker: state.iherbHumanChallenge,
+                    alertNeeded: !state.iherbHumanChallenge.alertedAt
+                };
+            }
+
+            const now = Date.now();
+            const marker = {
+                ...generation,
+                runId: state.pipelineRun.id,
+                account: state.multiAccountIherbState.currentIherbAccount,
+                tabId: state.iherbParserTabId,
+                attemptId: state.iherbParseAttemptId,
+                kind: 'press-hold',
+                status: 'awaiting-human',
+                detectedAt: now,
+                alertedAt: null
+            };
+            const failure = {
+                shop: 'iherb',
+                account: normalizeAccountEmail(marker.account),
+                reason: 'press-hold-human-required',
+                at: now
+            };
+            const failures = Array.isArray(state.pipelineRun.failures)
+                ? state.pipelineRun.failures.filter(item => !(
+                    item?.shop === 'iherb'
+                    && normalizeAccountEmail(item?.account) === normalizeAccountEmail(marker.account)
+                    && item?.reason === failure.reason
+                ))
+                : [];
+            failures.push(failure);
+            const blockedRun = {
+                ...state.pipelineRun,
+                status: 'blocked',
+                finishedAt: now,
+                failures
+            };
+            const blockedStage = {
+                ...state.pipelineStage,
+                active: false,
+                blockedAt: now,
+                blockedReason: 'iherb-press-hold-human-required'
+            };
+
+            await chrome.storage.local.set({
+                pipelineRun: blockedRun,
+                pipelineStage: blockedStage,
+                iherbHumanChallenge: marker,
+                screenshotQueueBlocked: {
+                    reason: 'iherb-press-hold-human-required',
+                    runId: marker.runId,
+                    account: marker.account,
+                    at: now
+                },
+                parsingState: { isParsingAllStores: false, storesCompleted },
+                stopAllParsers: true,
+                lastDailyAutoParseStatus: 'blocked-human-captcha',
+                lastDailyAutoParseFinishedAt: now,
+                lastDailyAutoParseError: 'iHerb Press & Hold requires a human'
+            });
+            isParsingAllStores = false;
+            return {
+                blocked: true,
+                reason: 'human_required',
+                marker,
+                alertNeeded: true
+            };
+        });
+    pipelineRunWriteChain = commitTask.catch(() => {});
+    const result = await commitTask;
+    if (result?.blocked && result.alertNeeded) {
+        await sendIherbHumanChallengeAlert(result.marker).catch(error => {
+            console.warn('⚠️ Failed to send iHerb human-challenge alert:', error?.message || error);
+        });
+    }
+    return {
+        blocked: !!result?.blocked,
+        reason: result?.reason || 'unknown',
+        waitingForHuman: !!result?.blocked
+    };
 }
 
 // --- Message Listener ---
@@ -1081,33 +2058,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     } else if (request.action === "resetSheetMarks") {
         resetSheetMarks(request.options).then(()=>sendResponse({status:'ok'})).catch(e=>sendResponse({status:'error', message:String(e)}));
     } else if (request.action === "startParsingAllStores") {
-        // Initialize parsing state
-        isParsingAllStores = true;
-        storesCompleted = { ebay: false, iherb: false, amazon: false };
-        saveParsingState();
-
-        // Reset progress cache
-        cachedProgressState = {};
-        chrome.storage.local.set({ progressState: cachedProgressState });
-        
-        // Clear parsing logs for new session
-        clearParsingLogs();
-
-        parseReport = { stores: {}, screenshots: { sent: 0, skipped: 0, failed: 0, broken: 0 }, startedAt: Date.now() };
-        sendTelegramMessage('🚀 Запущен парсинг всех магазинов...');
-        sendResponse({status: "started"});
+        runDailyAutoParse('popup-legacy-all')
+            .then(started => sendResponse({ status: started ? 'started' : 'refused' }))
+            .catch(error => sendResponse({ status: 'error', error: String(error?.message || error) }));
+        return true;
     } else if (request.action === "startSequentialPipeline") {
-        // Sequential pipeline: iHerb → eBay → Amazon, one shop at a time, each
-        // draining its multi-account queue internally.
-        isParsingAllStores = true;
-        storesCompleted = { ebay: false, iherb: false, amazon: false };
-        saveParsingState();
-        cachedProgressState = {};
-        chrome.storage.local.set({ progressState: cachedProgressState });
-        clearParsingLogs();
-        parseReport = { stores: {}, screenshots: { sent: 0, skipped: 0, failed: 0, broken: 0 }, startedAt: Date.now() };
-        startSequentialPipeline();
-        sendResponse({ status: 'started' });
+        // Popup uses the same mutexed/durable door as alarm, Telegram and the
+        // external watchdog. No caller may reset state behind an active run.
+        runDailyAutoParse('popup')
+            .then(started => sendResponse({ status: started ? 'started' : 'refused' }))
+            .catch(error => sendResponse({ status: 'error', error: String(error?.message || error) }));
         return true;
     } else if (request.action === "getAccountsConfig") {
         loadAccountsConfig().then(cfg => sendResponse({ config: cfg, defaults: DEFAULT_ACCOUNTS_CONFIG }));
@@ -1116,27 +2076,67 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         chrome.storage.local.set({ accountsConfig: request.config }).then(() => sendResponse({ ok: true }));
         return true;
     } else if (request.action === "startMultiAccountAmazon") {
-        // Multi-account Amazon parsing: photopochtoy + ipochtoy sequentially.
-        // Re-enabled 2026-04-14 as part of warehouse-verify archive pipeline.
-        console.log('🔄 Multi-account Amazon parsing: launching');
-        startMultiAccountAmazonParsing();
-        sendResponse({status: "started"});
+        // A standalone Amazon run has no six-cabinet run identity and can race
+        // the book upload. Keep one authoritative launch door.
+        sendResponse({ status: 'refused', error: 'standalone-disabled-use-sequential-pipeline' });
     } else if (request.action === "accountSwitchFailed") {
         (async () => {
             console.log(`❌ Account switch failed for ${request.email}: ${request.error}`);
-            const failData = await chrome.storage.local.get(['accountSwitchFailures']);
-            const failures = failData.accountSwitchFailures || {};
+            const failData = await chrome.storage.local.get([
+                'accountSwitchFailures', 'pipelineRun', 'pipelineStage',
+                'multiAccountState', 'amazonParserTabId'
+            ]);
             const email = request.email || currentAmazonAccount || 'unknown';
+            const owned = !!sender?.tab?.id
+                && sender.tab.id === failData.amazonParserTabId
+                && request.runId === failData.pipelineRun?.id
+                && ['starting', 'running'].includes(failData.pipelineRun?.status)
+                && failData.pipelineStage?.runId === request.runId
+                && failData.pipelineStage?.stages?.[failData.pipelineStage?.currentIndex] === 'amazon'
+                && normalizeAccountEmail(email)
+                    === normalizeAccountEmail(failData.multiAccountState?.currentAmazonAccount);
+            if (!owned) {
+                console.warn('⏭ Ignoring stale Amazon account-switch failure');
+                return;
+            }
+            const generation = pipelineGenerationFromStage(failData.pipelineStage);
+            if (failData.multiAccountState) {
+                isMultiAccountParsing = failData.multiAccountState.isMultiAccountParsing;
+                amazonAccountsQueue = failData.multiAccountState.amazonAccountsQueue || [];
+                currentAmazonAccount = failData.multiAccountState.currentAmazonAccount;
+            }
+            const failures = failData.accountSwitchFailures || {};
             failures[email] = (failures[email] || 0) + 1;
             await chrome.storage.local.set({ accountSwitchFailures: failures });
             
             if (failures[email] >= MAX_ACCOUNT_SWITCH_ATTEMPTS) {
                 console.log(`🚫 Account ${email} failed ${failures[email]} times, skipping`);
                 sendTelegramMessage(`🚫 Аккаунт ${email.split('@')[0]} недоступен (попыток: ${failures[email]}), пропускаю`);
+                await markPipelineAccountResult('amazon', email, {
+                    runId: request.runId,
+                    ok: false,
+                    reason: 'account-switch-failed'
+                });
+                const failureGate = await chrome.storage.local.get([
+                    'pipelineRun', 'pipelineStage', 'multiAccountState'
+                ]);
+                if (failureGate.pipelineRun?.id !== request.runId
+                    || !failureGate.pipelineStage?.active
+                    || !pipelineGenerationMatches(failureGate.pipelineStage, generation)
+                    || normalizeAccountEmail(failureGate.multiAccountState?.currentAmazonAccount)
+                        !== normalizeAccountEmail(email)) return;
                 await chrome.storage.local.remove(['accountSwitchStartedAt']);
-                switchToNextAmazonAccount();
+                await switchToNextAmazonAccount(generation);
             } else {
                 console.log(`⚠️ Не удалось переключиться на ${email.split('@')[0]} (попытка ${failures[email]}/${MAX_ACCOUNT_SWITCH_ATTEMPTS}), пробую ещё раз...`);
+                const retryGate = await chrome.storage.local.get([
+                    'pipelineRun', 'pipelineStage', 'multiAccountState'
+                ]);
+                if (retryGate.pipelineRun?.id !== request.runId
+                    || !retryGate.pipelineStage?.active
+                    || !pipelineGenerationMatches(retryGate.pipelineStage, generation)
+                    || normalizeAccountEmail(retryGate.multiAccountState?.currentAmazonAccount)
+                        !== normalizeAccountEmail(email)) return;
                 amazonAccountsQueue.unshift(email);
                 await chrome.storage.local.set({
                     multiAccountState: {
@@ -1145,7 +2145,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         currentAmazonAccount: currentAmazonAccount
                     }
                 });
-                switchToNextAmazonAccount();
+                await switchToNextAmazonAccount(generation);
             }
         })();
     } else if (request.action === "iherbSwitchFailed") {
@@ -1153,45 +2153,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             const reason = request.reason || 'unknown';
             const email = request.email || 'unknown';
             console.warn(`❌ iHerb switch failed for ${email}: ${reason}`);
-            const failData = await chrome.storage.local.get(['iherbSwitchFailures']);
-            const failures = failData.iherbSwitchFailures || {};
-            failures[email] = (failures[email] || 0) + 1;
-            await chrome.storage.local.set({ iherbSwitchFailures: failures });
-
-            // CAPTCHA — особый случай: captcha обычно привязана к IP, поэтому
-            // следующий iHerb-аккаунт почти наверняка упрётся в неё же и сожжёт ещё
-            // 60с. Не перебираем аккаунты — пропускаем ВСЮ стадию iHerb и идём к
-            // следующему магазину (pipeline advance). Не застреваем на одном аккаунте.
-            if (reason === 'captcha') {
-                await abortIherbStageDueToCaptcha(email);
+            const gate = await chrome.storage.local.get(['iherbParserTabId', 'pipelineRun']);
+            if (!sender?.tab?.id || sender.tab.id !== gate.iherbParserTabId
+                || !request.runId || request.runId !== gate.pipelineRun?.id) {
+                console.warn('⏭ Ignoring iHerb switch failure from a stale tab/run');
                 return;
             }
-
-            const MAX_IH_ATTEMPTS = 2;
-            if (failures[email] < MAX_IH_ATTEMPTS && reason !== 'captcha') {
-                console.log(`🔁 Retry iHerb switch for ${email} (attempt ${failures[email]+1}/${MAX_IH_ATTEMPTS})`);
-                const cfgForRetry = await loadAccountsConfig();
-                iherbAccountsQueue.unshift({ email, password: (cfgForRetry.iherb.find(a => a.email === email) || {}).password });
-                await chrome.storage.local.set({
-                    multiAccountIherbState: {
-                        isMultiAccountIherb: true,
-                        iherbAccountsQueue,
-                        currentIherbAccount
-                    }
-                });
-                await new Promise(r => setTimeout(r, 5000));
-                await switchToNextIherbAccount();
-            } else {
-                console.log(`🚫 iHerb account ${email} skipped (failures: ${failures[email]}, reason: ${reason})`);
-                sendTelegramMessage(`🚫 iHerb аккаунт ${email.split('@')[0]} пропущен (${reason})`);
-                await recordIherbSkipReason(email, 'switch_failed');
-                await chrome.storage.local.remove(['iherbSwitchInProgress', 'iherbSwitchStartedAt', 'pendingIherbSwitch']);
-                if (iherbAccountsQueue.length > 0) {
-                    await switchToNextIherbAccount();
-                } else {
-                    await finalizeIherbStage();
-                }
+            if (reason === 'captcha') {
+                await abortIherbStageDueToCaptcha(email, request.runId);
+                return;
             }
+            await handleIherbSwitchFailure(email, reason, request.runId);
         })();
         return true;
     } else if (request.action === "solveCaptcha") {
@@ -1207,55 +2179,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 sendResponse({ ok: false, reason: err?.message || String(err) });
             });
         return true; // async
-    } else if (request.action === "solveIherbPressHold") {
-        // PerimeterX "Press & Hold" на iHerb /orders. Content-script задетектил
-        // челлендж и делегировал сюда (там chrome.debugger может сгенерить
-        // isTrusted:true mouse-события). Решаем, при успехе перезагружаем /orders
-        // для свежего парса; после PRESS_HOLD_MAX_ATTEMPTS — пропускаем стадию iHerb.
-        (async () => {
-            try {
-                const stored = await chrome.storage.local.get(['iherbParserTabId', 'iherbPressHoldAttempts']);
-                const tabId = sender.tab?.id || stored.iherbParserTabId;
-                if (!tabId) { sendResponse({ solved: false, reason: 'no_tab' }); return; }
-
-                const attempts = (stored.iherbPressHoldAttempts || 0) + 1;
-                await chrome.storage.local.set({ iherbPressHoldAttempts: attempts });
-
-                if (attempts > PRESS_HOLD_MAX_ATTEMPTS) {
-                    console.warn(`🧩 [P&H] max attempts (${PRESS_HOLD_MAX_ATTEMPTS}) — skip iHerb stage`);
-                    await chrome.storage.local.remove(['iherbPressHoldAttempts']);
-                    sendResponse({ solved: false, reason: 'max_attempts' });
-                    if (isMultiAccountIherb) await abortIherbStageDueToCaptcha(currentIherbAccount || 'unknown');
-                    return;
-                }
-
-                const r = await solveIherbPressHold(tabId);
-                if (r.solved) {
-                    console.log('🧩 [P&H] solved ✅ — re-navigating /orders for fresh parse');
-                    await chrome.storage.local.remove(['iherbPressHoldAttempts', 'iherbOrdersReloadDone']);
-                    // iherbSwitchInProgress остаётся true → IIFE content-script снова
-                    // авто-парсит после reload. Ставим свежий маркер для watchdog.
-                    await chrome.storage.local.set({ iherbParseStartedAt: Date.now() });
-                    await new Promise(res => setTimeout(res, 1200 + Math.random() * 800));
-                    await chrome.tabs.update(tabId, { url: 'https://secure.iherb.com/myaccount/orders', active: true });
-                    sendResponse({ solved: true });
-                } else {
-                    console.warn(`🧩 [P&H] not solved (${r.reason}) attempt ${attempts}/${PRESS_HOLD_MAX_ATTEMPTS}`);
-                    sendResponse({ solved: false, reason: r.reason });
-                    if (attempts >= PRESS_HOLD_MAX_ATTEMPTS) {
-                        await chrome.storage.local.remove(['iherbPressHoldAttempts']);
-                        if (isMultiAccountIherb) await abortIherbStageDueToCaptcha(currentIherbAccount || 'unknown');
-                    } else {
-                        // ещё попытка: reload → content-script снова задетектит P&H
-                        await new Promise(res => setTimeout(res, 2000));
-                        await chrome.tabs.update(tabId, { url: 'https://secure.iherb.com/myaccount/orders', active: true });
-                    }
-                }
-            } catch (e) {
-                console.error('🧩 [P&H] handler error:', e?.message || e);
-                sendResponse({ solved: false, reason: String(e?.message || e) });
-            }
-        })();
+    } else if (request.action === "iherbPressHoldDetected") {
+        handleIherbPressHoldDetected(request, sender)
+            .then(sendResponse)
+            .catch(error => sendResponse({
+                blocked: false,
+                reason: String(error?.message || error)
+            }));
         return true; // async
     } else if (request.action === "parsingProgress") {
         // Handle parsingProgress from content scripts (convert to progress format)
@@ -1266,25 +2196,134 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             current: progressData.current,
             total: progressData.total,
             status: progressData.status,
-            found: progressData.found
+            found: progressData.found,
+            runId: progressData.runId,
+            account: progressData.account,
+            attemptId: progressData.attemptId
         };
 
-        // Process it as progress message
-        chrome.runtime.sendMessage(progressMsg, () => {
-            // Handle progress internally
-            if (progressMsg.action === "progress") {
-                handleProgressMessage(progressMsg);
-            }
+        // Process exactly once. Re-broadcasting this message made this same
+        // listener receive `progress`, then the callback called the handler a
+        // second time. A Done event could therefore switch/finalize one account
+        // twice before its content script had committed orderData.
+        handleProgressMessage(progressMsg, sender).catch(error => {
+            console.warn('parsingProgress handling failed:', error?.message || error);
         });
     } else if (request.action === "progress") {
-        if (String(request.store || '').toLowerCase() === 'amazon') rememberAmazonParserTab(sender);
-        handleProgressMessage(request);
+        handleProgressMessage(request, sender);
     } else if (request.action === "multiAccountLog") {
         // Forwarded from content-switch-account.js / content-amazon.js —
         // persistent step-log of Amazon multi-account flow for diagnostics.
-        rememberAmazonParserTab(sender);
         logMultiAccountStep(request.step, { ...(request.detail || {}), tabId: sender?.tab?.id || null });
         sendResponse({status: "logged"});
+    } else if (request.action === "getParserContext") {
+        (async () => {
+            const store = String(request.store || '').toLowerCase();
+            if (!['iherb', 'ebay'].includes(store)) {
+                sendResponse({ active: false, owned: false });
+                return;
+            }
+            const state = await chrome.storage.local.get([
+                'pipelineRun', 'pipelineStage', 'multiAccountIherbState',
+                'iherbParserTabId', 'ebayParserTabId', 'iherbStageFinalizing',
+                'iherbHumanChallenge', 'iherbParseAttemptId', 'iherbTimeoutAttempt'
+            ]);
+            const active = ['starting', 'running'].includes(state.pipelineRun?.status)
+                && state.pipelineStage?.active === true
+                && state.pipelineStage?.runId === state.pipelineRun?.id
+                && state.pipelineStage?.stages?.[state.pipelineStage?.currentIndex] === store;
+            const finalizingIherbAccount = store === 'iherb'
+                && pipelineGenerationMatches(
+                    state.iherbStageFinalizing,
+                    pipelineGenerationFromStage(state.pipelineStage)
+                )
+                ? state.iherbStageFinalizing?.account
+                : null;
+            const isIherbFinalizing = !!finalizingIherbAccount;
+            const purpose = String(request.purpose || 'parse').toLowerCase();
+            const account = store === 'iherb'
+                ? (isIherbFinalizing
+                    ? (purpose === 'login' ? finalizingIherbAccount : null)
+                    : state.multiAccountIherbState?.currentIherbAccount)
+                : state.pipelineRun?.expected?.ebay?.[0];
+            const timeoutBlocked = store === 'iherb'
+                && iherbTimeoutAttemptMatchesRuntime(state.iherbTimeoutAttempt, state);
+            const owned = active
+                && !!account
+                && !!sender?.tab?.id
+                && sender.tab.id === state[`${store}ParserTabId`]
+                && !timeoutBlocked;
+            const blocked = store === 'iherb'
+                && state.iherbHumanChallenge?.status === 'awaiting-human';
+            sendResponse({
+                active,
+                owned,
+                blocked,
+                runId: owned ? state.pipelineRun.id : null,
+                account: owned ? account : null,
+                tabId: owned ? sender.tab.id : null,
+                attemptId: owned && store === 'iherb' ? state.iherbParseAttemptId : null,
+                stageStartedAt: owned ? (state.pipelineStage.stageStartedAt || null) : null
+            });
+        })().catch(error => sendResponse({ active: false, owned: false, error: String(error?.message || error) }));
+        return true;
+    } else if (request.action === "commitIherbAttempt") {
+        handleIherbAttemptCommit(request, sender?.tab?.id || null)
+            .then(sendResponse)
+            .catch(error => sendResponse({
+                ok: false,
+                status: 'error',
+                reason: String(error?.message || error)
+            }));
+        return true;
+    } else if (request.action === "getAmazonParserContext") {
+        (async () => {
+            const state = await chrome.storage.local.get([
+                'amazonParserTabId', 'pipelineRun', 'pipelineStage', 'multiAccountState',
+                'amazonFinalReturn', 'pendingAccountSwitch', 'amazonStageFinalizing',
+                'accountSwitchStartedAt', 'amazonPaginationState', 'amazonTimeoutAttempt'
+            ]);
+            const parsingAccount = state.multiAccountState?.isMultiAccountParsing
+                ? state.multiAccountState.currentAmazonAccount
+                : null;
+            const generation = pipelineGenerationFromStage(state.pipelineStage);
+            const finalReturnAccount = pipelineGenerationMatches(
+                state.amazonStageFinalizing,
+                generation
+            ) ? state.amazonStageFinalizing?.account : null;
+            const timeoutBlocksCurrentAttempt = !!state.amazonTimeoutAttempt
+                && amazonWatchdogAttemptIdentityMatches(
+                    amazonWatchdogAttemptFromState(state),
+                    state.amazonTimeoutAttempt
+                );
+            const owned = !!sender?.tab?.id
+                && sender.tab.id === state.amazonParserTabId
+                && ['starting', 'running'].includes(state.pipelineRun?.status)
+                && state.pipelineStage?.active === true
+                && state.pipelineStage?.runId === state.pipelineRun?.id
+                && state.pipelineStage?.stages?.[state.pipelineStage?.currentIndex] === 'amazon'
+                && !!(parsingAccount || finalReturnAccount)
+                && !timeoutBlocksCurrentAttempt;
+            sendResponse({
+                owned,
+                tabId: owned ? sender.tab.id : null,
+                runId: owned ? state.pipelineRun.id : null,
+                account: owned ? (parsingAccount || finalReturnAccount) : null,
+                stageStartedAt: owned ? (state.pipelineStage.stageStartedAt || null) : null,
+                accountSwitchStartedAt: owned ? (state.accountSwitchStartedAt || null) : null,
+                parseId: owned ? (state.amazonPaginationState?.parseId || null) : null
+            });
+        })().catch(error => sendResponse({ owned: false, error: String(error?.message || error) }));
+        return true;
+    } else if (request.action === "commitAmazonAttempt") {
+        handleAmazonAttemptCommit(request, sender?.tab?.id || null)
+            .then(sendResponse)
+            .catch(error => sendResponse({
+                ok: false,
+                status: 'error',
+                reason: String(error?.message || error)
+            }));
+        return true;
     } else if (request.action === "fetchEbayOrderTracking") {
         // Parser found no tracking in the list feed for this order — read it from the
         // order-detail page (cross-origin; only the background SW can, due to CORS).
@@ -1322,51 +2361,49 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             if (tgBotToken) startTelegramPolling();
         });
     } else if (request.action === "parserStarted") {
-        const startedAt = Date.now();
-        if (request.store === 'iHerb') {
-            const update = { iherbParseStartedAt: startedAt, iherbWatchdogRetried: false };
-            if (sender.tab?.id) update.iherbParserTabId = sender.tab.id;
-            chrome.storage.local.set(update);
-        } else if (request.store === 'Amazon') {
-            chrome.storage.local.set({ lastAmazonProgressAt: startedAt });
-        }
-        // Notify Telegram that parser actually started working
-        const storeEmoji = {
-            'eBay': '🛒',
-            'iHerb': '🌿',
-            'Amazon': '📦'
-        }[request.store] || '🔄';
-        console.log(`✅ ${request.store} parser started successfully`);
+        (async () => {
+            const signal = await validateParserSignal(request, sender);
+            if (!signal) {
+                console.warn('⏭ Ignoring parserStarted from a stale tab/run/account');
+                return;
+            }
+            const startedAt = Date.now();
+            if (signal.store === 'iherb') {
+                await chrome.storage.local.set({ iherbParseStartedAt: startedAt, iherbWatchdogRetried: false });
+            } else if (signal.store === 'amazon') {
+                await chrome.storage.local.set({ lastAmazonProgressAt: startedAt });
+            }
+            console.log(`✅ ${request.store} parser started successfully`);
+        })().catch(error => console.warn('parserStarted gate failed:', error?.message || error));
+        return true;
     } else if (request.action === "parseError") {
-        // Handle parsing errors (e.g., Service unavailable after retries)
-        const storeKey = request.store?.toLowerCase();
-        const errorMsg = request.error || 'Unknown error';
-
-        if (storeKey === 'iherb') {
-            chrome.storage.local.remove(['iherbParseStartedAt', 'iherbWatchdogRetried']);
-        } else if (storeKey === 'amazon') {
-            chrome.storage.local.remove(['lastAmazonProgressAt']);
-        }
-
-        console.log(`❌ [BACKGROUND] Parse error from ${request.store}: ${errorMsg}`);
-        sendTelegramMessage(`❌ ${request.store}: Ошибка парсинга - ${errorMsg}`);
-
-        // Mark store as completed (with error) so the chain continues
-        if (storeKey && storeKey in storesCompleted) {
-            storesCompleted[storeKey] = true;
-            saveParsingState();
-
-            // Update progress state to show error
-            cachedProgressState[storeKey] = {
+        (async () => {
+            const signal = await validateParserSignal(request, sender);
+            if (!signal) {
+                console.warn('⏭ Ignoring parseError from a stale tab/run/account');
+                return;
+            }
+            const errorMsg = request.error || 'Unknown error';
+            if (signal.store === 'iherb') {
+                await chrome.storage.local.remove(['iherbParseStartedAt', 'iherbWatchdogRetried']);
+            } else if (signal.store === 'amazon') {
+                await chrome.storage.local.remove(['lastAmazonProgressAt']);
+            }
+            console.log(`❌ [BACKGROUND] Parse error from ${request.store}: ${errorMsg}`);
+            sendTelegramMessage(`❌ ${request.store}: Ошибка парсинга - ${errorMsg}`).catch(() => {});
+            await handleProgressMessage({
+                action: 'progress',
+                store: request.store,
                 current: 0,
                 total: 0,
                 status: 'Error',
-                found: 0
-            };
-            chrome.storage.local.set({ progressState: cachedProgressState });
-
-            checkAllStoresCompleted();
-        }
+                found: 0,
+                runId: signal.runId,
+                account: signal.account,
+                attemptId: signal.attemptId
+            }, sender);
+        })().catch(error => console.warn('parseError gate failed:', error?.message || error));
+        return true;
     }
     return true; // Keep channel open for async responses
 });
@@ -1432,29 +2469,221 @@ async function solveRecaptchaVia2Captcha(sitekey, pageurl, timeoutMs = 60000) {
 // чтобы watchdog/ретраи не воскресили зависшую стадию. НЕ делаем
 // finalReturnToIherbPrimary в pipeline-режиме — повторный логин снова упрётся в
 // captcha и снова сожжёт 60с. Следующим магазинам логин-состояние iHerb не нужно.
-async function abortIherbStageDueToCaptcha(email) {
+async function abortIherbStageDueToCaptcha(email, runId, expectedGeneration = null) {
     const who = (email || '').split('@')[0] || 'аккаунт';
     console.warn(`🧩 [iHerb] captcha unsolved for ${email} — skipping iHerb stage, moving to next shop`);
     sendTelegramMessage(`🧩 iHerb: captcha не пройдена (${who}). Пропускаю iHerb, перехожу к следующему магазину.`).catch(() => {});
 
-    await recordIherbSkipReason(email, 'captcha');
-    iherbAccountsQueue = [];
-    await chrome.storage.local.remove([
-        'iherbSwitchInProgress', 'iherbSwitchStartedAt', 'pendingIherbSwitch'
+    const initial = await chrome.storage.local.get([
+        'pipelineRun', 'pipelineStage', 'multiAccountIherbState'
     ]);
+    const generation = expectedGeneration || pipelineGenerationFromStage(initial.pipelineStage);
+    if (initial.pipelineRun?.id !== runId
+        || !initial.pipelineStage?.active
+        || !pipelineGenerationMatches(initial.pipelineStage, generation)
+        || initial.pipelineStage.stages?.[initial.pipelineStage.currentIndex] !== 'iherb'
+        || normalizeAccountEmail(initial.multiAccountIherbState?.currentIherbAccount)
+            !== normalizeAccountEmail(email)) return false;
+
+    await recordIherbSkipReason(email, 'captcha', runId);
+    const gate = await chrome.storage.local.get([
+        'pipelineRun', 'pipelineStage', 'multiAccountIherbState'
+    ]);
+    if (gate.pipelineRun?.id !== runId
+        || !gate.pipelineStage?.active
+        || !pipelineGenerationMatches(gate.pipelineStage, generation)
+        || normalizeAccountEmail(gate.multiAccountIherbState?.currentIherbAccount)
+            !== normalizeAccountEmail(email)) return false;
+    iherbAccountsQueue = [];
+    await chrome.storage.local.set({
+        iherbSwitchInProgress: null,
+        iherbSwitchStartedAt: null,
+        pendingIherbSwitch: null,
+        iherbSwitchDispatch: null,
+        multiAccountIherbState: {
+            ...(gate.multiAccountIherbState || {}),
+            isMultiAccountIherb: true,
+            iherbAccountsQueue: [],
+            currentIherbAccount: email
+        }
+    });
 
     // Всегда закрываем стадию через единый chokepoint: он гарантированно вернёт
     // сессию на primary (оператор хочет always-return, даже после captcha),
     // построит roster + алерт по пропущенным и сам двинет pipeline дальше.
     // fromCaptcha=true отключает retry-проход (captcha по IP — повтор бессмыслен).
-    await finalizeIherbStage(undefined, { fromCaptcha: true }).catch(e =>
+    await finalizeIherbStage(undefined, {
+        fromCaptcha: true,
+        expectedGeneration: generation
+    }).catch(e =>
         console.warn('finalizeIherbStage after captcha-abort failed:', e?.message || e));
+    return true;
 }
 
 // Switch to next Amazon account for multi-account parsing
-async function switchToNextAmazonAccount() {
+const parserOperationFlights = new Map();
+
+function pipelineOperationKey(generation, ...parts) {
+    return JSON.stringify([
+        generation?.runId || null,
+        generation?.startedAt || null,
+        generation?.currentIndex ?? null,
+        generation?.stageStartedAt || null,
+        ...parts
+    ]);
+}
+
+function runParserOperationSingleFlight(slot, key, work) {
+    const existing = parserOperationFlights.get(slot);
+    if (existing) {
+        if (existing.key === key) return existing.promise;
+        // Different account/generation operations must not share a browser tab.
+        // Let the current owner finish, then let the new caller re-enter and
+        // prove that it still owns the stage before doing any side effect.
+        return existing.promise
+            .catch(() => false)
+            .then(() => runParserOperationSingleFlight(slot, key, work));
+    }
+    const record = { key, promise: null };
+    record.promise = Promise.resolve().then(work);
+    parserOperationFlights.set(slot, record);
+    const clear = () => {
+        if (parserOperationFlights.get(slot) === record) parserOperationFlights.delete(slot);
+    };
+    record.promise.then(clear, clear);
+    return record.promise;
+}
+
+function getAmazonSwitchAccountUrl() {
+    return 'https://www.amazon.com/ap/signin?openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.amazon.com%2F%3Fref_%3Dnav_youraccount_switchacct&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.assoc_handle=usflex&openid.mode=checkid_setup&marketPlaceId=ATVPDKIKX0DER&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&switch_account=picker&ignoreAuthState=1&_encoding=UTF8';
+}
+
+function dispatchCurrentAmazonAccountSwitch(email, expectedGeneration, kind = 'account-switch') {
+    const key = pipelineOperationKey(
+        expectedGeneration,
+        normalizeAccountEmail(email),
+        kind
+    );
+    return runParserOperationSingleFlight('amazon-account-dispatch', key, () =>
+        dispatchCurrentAmazonAccountSwitchOnce(email, expectedGeneration, kind));
+}
+
+async function dispatchCurrentAmazonAccountSwitchOnce(email, expectedGeneration, kind = 'account-switch') {
+    const readDispatchState = () => chrome.storage.local.get([
+        'pipelineRun', 'pipelineStage', 'multiAccountState', 'pendingAccountSwitch',
+        'amazonParserTabId', 'amazonStageFinalizing', 'amazonSwitchDispatch'
+    ]);
+    const ownsDispatch = state => {
+        const regularOwned = kind === 'account-switch'
+            && normalizeAccountEmail(state.multiAccountState?.currentAmazonAccount)
+                === normalizeAccountEmail(email);
+        const finalOwned = kind === 'final-return'
+            && pipelineGenerationMatches(state.amazonStageFinalizing, expectedGeneration)
+            && normalizeAccountEmail(state.amazonStageFinalizing?.account)
+                === normalizeAccountEmail(email);
+        return !!expectedGeneration
+            && state.pipelineStage?.active === true
+            && pipelineGenerationMatches(state.pipelineStage, expectedGeneration)
+            && state.pipelineStage.stages?.[state.pipelineStage.currentIndex] === 'amazon'
+            && state.pipelineRun?.id === expectedGeneration.runId
+            && state.pendingAccountSwitch?.runId === expectedGeneration.runId
+            && normalizeAccountEmail(state.pendingAccountSwitch?.email)
+                === normalizeAccountEmail(email)
+            && (regularOwned || finalOwned);
+    };
+    const state = await readDispatchState();
+    if (!ownsDispatch(state)) {
+        console.warn('⏭ Refusing stale Amazon account dispatch');
+        return false;
+    }
+
+    let parserTab = await getAmazonParserTab(state.amazonParserTabId);
+    // getAmazonParserTab/tabs.create are awaited browser calls. The pipeline may
+    // advance while either one is pending, so ownership must be reread before
+    // every following storage or navigation side effect.
+    let afterTab = await readDispatchState();
+    if (!ownsDispatch(afterTab)) {
+        console.warn('⏭ Amazon generation changed while resolving parser tab');
+        return false;
+    }
+    let createdParserTab = false;
+    if (!parserTab) {
+        parserTab = await chrome.tabs.create({ url: 'about:blank', active: false });
+        if (!parserTab?.id) throw new Error('failed to create owned Amazon parser tab');
+        createdParserTab = true;
+        afterTab = await readDispatchState();
+        if (!ownsDispatch(afterTab)) {
+            try { await chrome.tabs.remove(parserTab.id); } catch (_) {}
+            console.warn('⏭ Amazon generation changed while creating parser tab');
+            return false;
+        }
+    }
+    await chrome.storage.local.set({
+        amazonParserTabId: parserTab.id,
+        amazonSwitchDispatch: {
+            ...expectedGeneration,
+            account: email,
+            tabId: parserTab.id,
+            kind,
+            phase: 'prepared',
+            preparedAt: Date.now()
+        }
+    });
+    const beforeNavigation = await readDispatchState();
+    const prepared = beforeNavigation.amazonSwitchDispatch;
+    if (!ownsDispatch(beforeNavigation)
+        || !pipelineGenerationMatches(prepared, expectedGeneration)
+        || normalizeAccountEmail(prepared?.account) !== normalizeAccountEmail(email)
+        || prepared?.tabId !== parserTab.id
+        || prepared?.kind !== kind
+        || prepared?.phase !== 'prepared') {
+        if (createdParserTab && !ownsDispatch(beforeNavigation)) {
+            try { await chrome.tabs.remove(parserTab.id); } catch (_) {}
+        }
+        console.warn('⏭ Amazon generation changed before account navigation');
+        return false;
+    }
+    await chrome.tabs.update(parserTab.id, {
+        url: getAmazonSwitchAccountUrl(),
+        active: true
+    });
+
+    const fresh = await readDispatchState();
+    if (!ownsDispatch(fresh)
+        || fresh.amazonParserTabId !== parserTab.id
+        || !pipelineGenerationMatches(fresh.amazonSwitchDispatch, expectedGeneration)
+        || normalizeAccountEmail(fresh.amazonSwitchDispatch?.account)
+            !== normalizeAccountEmail(email)
+        || fresh.amazonSwitchDispatch?.tabId !== parserTab.id
+        || fresh.amazonSwitchDispatch?.kind !== kind
+        || fresh.amazonSwitchDispatch?.phase !== 'prepared') {
+        console.warn('⏭ Amazon dispatch completed after pipeline generation changed');
+        return false;
+    }
+    await chrome.storage.local.set({
+        amazonSwitchDispatch: {
+            ...expectedGeneration,
+            account: email,
+            tabId: parserTab.id,
+            kind,
+            phase: 'dispatched',
+            dispatchedAt: Date.now()
+        }
+    });
+    return true;
+}
+
+async function switchToNextAmazonAccount(expectedGeneration = null) {
     // Restore state from storage in case Service Worker restarted
-    const stored = await chrome.storage.local.get(['multiAccountState']);
+    const stored = await chrome.storage.local.get(['multiAccountState', 'pipelineRun', 'pipelineStage']);
+    const generation = expectedGeneration || pipelineGenerationFromStage(stored.pipelineStage);
+    if (!stored.pipelineStage?.active
+        || !pipelineGenerationMatches(stored.pipelineStage, generation)
+        || stored.pipelineStage.stages?.[stored.pipelineStage.currentIndex] !== 'amazon'
+        || stored.pipelineRun?.id !== generation?.runId) {
+        console.warn('⏭ Refusing stale Amazon queue mutation');
+        return false;
+    }
     if (stored.multiAccountState) {
         isMultiAccountParsing = stored.multiAccountState.isMultiAccountParsing;
         amazonAccountsQueue = stored.multiAccountState.amazonAccountsQueue || [];
@@ -1466,95 +2695,106 @@ async function switchToNextAmazonAccount() {
     // штатное завершение и timeout-переход: ни одна карточка текущего кабинета
     // не переносится под следующий login.
     if (currentAmazonAccount) {
-        await waitForScreenshotsDrained({ maxWaitMs: null });
+        if (!await waitForScreenshotsDrained()) {
+            return stopPipelineForScreenshotDrain(
+                'Amazon account screenshots blocked',
+                generation
+            );
+        }
+    }
+
+    const afterDrain = (await chrome.storage.local.get(['pipelineStage'])).pipelineStage;
+    if (!afterDrain?.active || !pipelineGenerationMatches(afterDrain, generation)) {
+        console.warn('⏭ Amazon queue changed generation during screenshot drain');
+        return false;
     }
     
-    if (amazonAccountsQueue.length === 0) {
+    const prepared = await withAmazonAttemptMutation(async () => {
+        const fresh = await chrome.storage.local.get([
+            'pipelineRun', 'pipelineStage', 'multiAccountState'
+        ]);
+        if (!fresh.pipelineStage?.active
+            || !pipelineGenerationMatches(fresh.pipelineStage, generation)
+            || fresh.pipelineStage.stages?.[fresh.pipelineStage.currentIndex] !== 'amazon'
+            || fresh.pipelineRun?.id !== generation?.runId) {
+            return { status: 'stale' };
+        }
+        const multi = fresh.multiAccountState;
+        const current = normalizeAccountEmail(multi?.currentAmazonAccount);
+        if (current && !pipelineRunAccountIsTerminal(fresh.pipelineRun, 'amazon', current)) {
+            // A duplicate completion/timeout caller arrived after this function
+            // already prepared the next cabinet. Never shift that queue twice.
+            return { status: 'already-prepared' };
+        }
+        const queue = Array.isArray(multi?.amazonAccountsQueue)
+            ? [...multi.amazonAccountsQueue]
+            : [];
+        if (queue.length === 0) {
+            await chrome.storage.local.set({
+                lastAmazonProgressAt: null,
+                accountSwitchStartedAt: null,
+                skipGuardAt: null,
+                amazonNavigationGraceUntil: null,
+                amazonNavigationRecovery: null,
+                amazonParsingIncomplete: null
+            });
+            return { status: 'finalize' };
+        }
+
+        const nextEmail = queue.shift();
+        const startedAt = Date.now();
+        await chrome.storage.local.set({
+            pendingAccountSwitch: { email: nextEmail, runId: fresh.pipelineRun.id },
+            amazonSwitchDispatch: {
+                ...generation,
+                account: nextEmail,
+                tabId: null,
+                kind: 'account-switch',
+                phase: 'prepared',
+                preparedAt: startedAt
+            },
+            amazonPaginationState: null,
+            amazonParsingComplete: null,
+            amazonNavigationGraceUntil: null,
+            amazonNavigationRecovery: null,
+            amazonParsingIncomplete: null,
+            amazonTimeoutAttempt: null,
+            accountSwitchStartedAt: startedAt,
+            lastAmazonProgressAt: startedAt,
+            multiAccountState: {
+                isMultiAccountParsing: true,
+                amazonAccountsQueue: queue,
+                currentAmazonAccount: nextEmail
+            }
+        });
+        return { status: 'prepared', nextEmail, queue };
+    });
+
+    if (prepared.status === 'stale' || prepared.status === 'already-prepared') return false;
+    if (prepared.status === 'finalize') {
         console.log('📋 No more Amazon accounts to parse');
         await logMultiAccountStep('multi-account:complete', {});
         isMultiAccountParsing = false;
         currentAmazonAccount = null;
-
-        // Clear state
-        await chrome.storage.local.remove([
-            'multiAccountState', 'lastAmazonProgressAt', 'accountSwitchStartedAt',
-            'skipGuardAt', 'amazonNavigationGraceUntil'
-        ]);
-
-        // Build per-account Telegram summary from parseReport.stores
         try {
             const amazonEntries = Object.entries(parseReport.stores || {})
-                .filter(([k]) => k.startsWith('amazon_'));
-            let summary;
-            if (amazonEntries.length === 0) {
-                summary = '✅ Amazon мульти-прогон завершён:\n  (ни один аккаунт не дал результата)';
-            } else {
-                const lines = amazonEntries.map(([k, v]) => {
-                    const name = k.replace('amazon_', '');
-                    return `  ${v.status || '•'} ${name}: ${v.found ?? 0}`;
-                });
-                summary = `✅ Amazon мульти-прогон завершён:\n${lines.join('\n')}`;
-            }
-            console.log(summary);
-        } catch (e) {
-            console.warn('amazon summary build failed:', e?.message || e);
+                .filter(([key]) => key.startsWith('amazon_'));
+            const lines = amazonEntries.map(([key, value]) =>
+                `  ${value.status || '•'} ${key.replace('amazon_', '')}: ${value.found ?? 0}`);
+            console.log(lines.length
+                ? `✅ Amazon мульти-прогон завершён:\n${lines.join('\n')}`
+                : '✅ Amazon мульти-прогон завершён:\n  (ни один аккаунт не дал результата)');
+        } catch (error) {
+            console.warn('amazon summary build failed:', error?.message || error);
         }
-
-        // Финальный возврат на основной аккаунт (ipochtoy) — без парсинга
-        finalReturnToPrimaryAmazon().catch(e => console.warn('finalReturn failed:', e));
-
-        setParserLock('amazon', false);
-
-        storesCompleted.amazon = true;
-        checkAllStoresCompleted();
-        return;
+        return beginAmazonStageFinalization(generation);
     }
-    
-    const nextEmail = amazonAccountsQueue.shift();
-    currentAmazonAccount = nextEmail;
 
-    console.log(`🔄 Switching to Amazon account: ${nextEmail}`);
-    console.log(`🔄 Switching to account: ${nextEmail.split('@')[0]}`);
-    await logMultiAccountStep('switchToNextAmazonAccount:start', { account: nextEmail });
-
-    // Save pending switch and updated state, clear completion flag and old pagination
-    await chrome.storage.local.set({
-        pendingAccountSwitch: { email: nextEmail },
-        amazonParsingComplete: null,
-        amazonPaginationState: null,
-        amazonNavigationGraceUntil: null,
-        accountSwitchStartedAt: Date.now(),
-        lastAmazonProgressAt: Date.now(),
-        multiAccountState: {
-            isMultiAccountParsing: true,
-            amazonAccountsQueue: amazonAccountsQueue,
-            currentAmazonAccount: nextEmail
-        }
-    });
-
-    // Reuse only the parser-owned tab (or a unique order-history tab). Never
-    // hijack an arbitrary Amazon checkout/product page from the shared Chrome.
-    const parserState = await chrome.storage.local.get(['amazonParserTabId']);
-    const parserTab = await getAmazonParserTab(parserState.amazonParserTabId);
-
-    const switchUrl = 'https://www.amazon.com/ap/signin?openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.amazon.com%2F%3Fref_%3Dnav_youraccount_switchacct&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.assoc_handle=usflex&openid.mode=checkid_setup&marketPlaceId=ATVPDKIKX0DER&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&switch_account=picker&ignoreAuthState=1&_encoding=UTF8';
-
-    if (parserTab?.id) {
-        // Navigate existing parser tab to switch-account page
-        await logMultiAccountStep('switchToNextAmazonAccount:redirect', { account: nextEmail, tabId: parserTab.id, url: switchUrl.slice(0, 80) });
-        await chrome.storage.local.set({ amazonParserTabId: parserTab.id });
-        await chrome.tabs.update(parserTab.id, {
-            url: switchUrl,
-            active: true
-        });
-    } else {
-        // Create new tab
-        await logMultiAccountStep('switchToNextAmazonAccount:new-tab', { account: nextEmail, url: switchUrl.slice(0, 80) });
-        const tab = await chrome.tabs.create({
-            url: switchUrl
-        });
-        if (tab?.id) await chrome.storage.local.set({ amazonParserTabId: tab.id });
-    }
+    amazonAccountsQueue = prepared.queue;
+    currentAmazonAccount = prepared.nextEmail;
+    console.log(`🔄 Switching to Amazon account: ${prepared.nextEmail}`);
+    await logMultiAccountStep('switchToNextAmazonAccount:start', { account: prepared.nextEmail });
+    return dispatchCurrentAmazonAccountSwitch(prepared.nextEmail, generation, 'account-switch');
 }
 
 // === iHerb multi-account ===
@@ -1576,7 +2816,40 @@ const IHERB_HOVER_HOLD_MS    = 2000;
 // multi-account shop drains its own queue internally; pipeline only triggers
 // the NEXT shop after the previous one (including return) finishes.
 
+let sequentialPipelineStartInFlight = null;
+let pipelineAdvanceInFlight = null;
+
 async function startSequentialPipeline() {
+  if (sequentialPipelineStartInFlight) return sequentialPipelineStartInFlight;
+  sequentialPipelineStartInFlight = startSequentialPipelineOnce();
+  try {
+    return await sequentialPipelineStartInFlight;
+  } finally {
+    sequentialPipelineStartInFlight = null;
+  }
+}
+
+async function startSequentialPipelineOnce() {
+  const existing = await chrome.storage.local.get([
+    'pipelineStage', 'screenshotQueueBlocked', 'trackScreenshotQueue', 'pipelineRun'
+  ]);
+  if (existing.pipelineStage?.active) {
+    console.warn('⏸ Sequential pipeline start refused: already active');
+    return { started: false, reason: 'pipeline-already-active' };
+  }
+  const retainedQueue = Array.isArray(existing.trackScreenshotQueue)
+    ? existing.trackScreenshotQueue
+    : [];
+  if (existing.screenshotQueueBlocked && retainedQueue.length > 0) {
+    console.warn('⏸ Sequential pipeline start refused: account-bound screenshot queue is blocked');
+    return { started: false, reason: 'screenshot-queue-blocked' };
+  }
+  if (existing.screenshotQueueBlocked && retainedQueue.length === 0) {
+    await chrome.storage.local.remove(['screenshotQueueBlocked']);
+  }
+  if (!existing.pipelineRun?.id || existing.pipelineRun.status !== 'starting') {
+    return { started: false, reason: 'pipeline-run-not-initialized' };
+  }
   // Reset the legacy parallel-parse completion tracker and flip the flag that
   // gates handleProgressMessage's completion branch — otherwise eBay's
   // "Done ✅" will be ignored and we never advance from ebay → amazon.
@@ -1594,53 +2867,90 @@ async function startSequentialPipeline() {
     'iherbOrdersReloadDone',
     'pendingIherbSwitch',
     'multiAccountIherbState',
+    'iherbSwitchDispatch',
+    'iherbStageFinalizing',
+    'iherbFinalReturnConfirmed',
     'iherbParsedAccounts',
     'iherbRetryPassDone',
     'iherbSkipReasons',
     'screenshotStageBudget',
     'pendingAccountSwitch',
     'amazonFinalReturn',
+    'amazonSwitchDispatch',
+    'amazonStageFinalizing',
+    'amazonFinalReturnConfirmed',
     'accountSwitchFailures',
     'amazonPaginationState',
     'amazonNavigationGraceUntil',
+    'amazonNavigationRecovery',
+    'amazonParsingIncomplete',
+    'amazonTimeoutAttempt',
+    'ebayStageDispatch',
     // Списки отменённых заказов — обнуляем на старте прогона, чтобы отчёт показывал
     // только отменённые ЭТОГО прогона (notifiedCancelledOrderIds НЕ трогаем — это
     // память «о чём уже сообщили оператору», должна пережить прогон).
     'iherbCancelledOrders',
     'ebayCancelledOrders',
-    'amazonCancelledOrders'
+    'amazonCancelledOrders',
+    'amazonOrders',
+    'ebayOrders',
+    'iherbOrders'
   ]);
+  const startedAt = Date.now();
+  const stageStartedAt = startedAt;
+  const runningRun = {
+    ...existing.pipelineRun,
+    status: 'running',
+    startedAt,
+    finishedAt: null
+  };
   await chrome.storage.local.set({
-    pipelineStage: { active: true, stages: PIPELINE_STAGES, currentIndex: 0, startedAt: Date.now() }
+    orderData: {},
+    pipelineRun: runningRun,
+    pipelineStage: {
+      active: true,
+      runId: existing.pipelineRun.id,
+      stages: PIPELINE_STAGES,
+      currentIndex: 0,
+      startedAt,
+      stageStartedAt,
+      stageName: 'iherb'
+    },
+    screenshotStageBudget: {
+      stageName: 'iherb',
+      stageStartedAt,
+      accruedMs: 0,
+      activeSince: null
+    },
+    parsingState: { isParsingAllStores: true, storesCompleted },
+    lastDailyAutoParseTriggeredAt: startedAt,
+    lastDailyAutoParseStartedAt: startedAt,
+    lastDailyAutoParseStatus: 'running'
   });
   console.log('🚀 Sequential pipeline started: iHerb → eBay → Amazon');
-  await runPipelineStage('iherb');
+  await runPipelineStage('iherb', existing.pipelineRun.id);
+  return { started: true, startedAt };
 }
 
-async function runPipelineStage(stageName) {
+async function runPipelineStage(stageName, expectedRunId = null) {
   console.log(`🎬 runPipelineStage: ${stageName}`);
+  if (expectedRunId) {
+    const gate = await chrome.storage.local.get(['pipelineStage', 'pipelineRun']);
+    if (gate.pipelineRun?.id !== expectedRunId
+        || gate.pipelineStage?.runId !== expectedRunId
+        || gate.pipelineStage?.stages?.[gate.pipelineStage.currentIndex] !== stageName) {
+      console.warn(`⏭ Refusing stale stage start: ${stageName}`);
+      return false;
+    }
+  }
   // Stamp when THIS stage started, so handlePipelineWatchdog can force-advance a stage
   // that hangs. eBay had no safety-net; a hung eBay froze the whole nightly run and the
   // Google Sheets upload with it (blackout from 2026-06-15).
   if (stageName !== 'done') {
-    try {
-      const st = await chrome.storage.local.get(['pipelineStage']);
-      if (st.pipelineStage) {
-        const stageStartedAt = Date.now();
-        await chrome.storage.local.set({
-          pipelineStage: { ...st.pipelineStage, stageStartedAt, stageName },
-          // Счётчик живёт ровно одну pipeline-стадию. Время реальной рассылки
-          // кадров не должно съедать лимит парсинга, но старый счётчик от
-          // предыдущей стадии/прогона тоже не должен продлевать новый этап.
-          screenshotStageBudget: {
-            stageName,
-            stageStartedAt,
-            accruedMs: 0,
-            activeSince: null
-          }
-        });
-      }
-    } catch (_) {}
+    const st = await chrome.storage.local.get(['pipelineStage']);
+    if (!st.pipelineStage?.stageStartedAt || st.pipelineStage.stageName !== stageName) {
+      throw new Error(`pipeline stage ${stageName} was not atomically prepared`);
+    }
   }
   if (stageName === 'iherb') {
     return startMultiAccountIherbParsing();
@@ -1652,18 +2962,48 @@ async function runPipelineStage(stageName) {
     return startMultiAccountAmazonParsing();
   }
   if (stageName === 'done') {
-    isParsingAllStores = false;
-    // Honest terminal status — was previously stuck at 'started' forever, so "как прошёл
-    // ночной парс" always looked in-progress even when the run had long finished/frozen.
-    await chrome.storage.local.set({
-      pipelineStage: { active: false, stages: PIPELINE_STAGES, currentIndex: PIPELINE_STAGES.length - 1, startedAt: null, stageStartedAt: null },
-      screenshotStageBudget: null,
-      lastDailyAutoParseStatus: 'completed',
-      lastDailyAutoParseFinishedAt: Date.now()
-    });
-    console.log('✅ Sequential pipeline done');
-    return;
+    const current = await chrome.storage.local.get(['pipelineRun']);
+    const finalRun = current.pipelineRun?.id === expectedRunId
+        && ['completed', 'degraded'].includes(current.pipelineRun.status)
+      ? current.pipelineRun
+      : await finalizePipelineRun(expectedRunId);
+    if (!finalRun) return false;
+    return finishTerminalPipelineState(finalRun);
   }
+}
+
+async function finishTerminalPipelineState(finalRun) {
+    if (!finalRun?.id || !['completed', 'degraded'].includes(finalRun.status)) return false;
+    const state = await chrome.storage.local.get(['pipelineStage']);
+    const stage = state.pipelineStage;
+    if (stage?.runId !== finalRun.id
+        || stage.stages?.[stage.currentIndex] !== 'done') {
+      console.warn('⏭ Refusing terminal commit for a different pipeline generation');
+      return false;
+    }
+    isParsingAllStores = false;
+    // Legacy in-memory completion flags are not durable across a Manifest V3
+    // worker restart. Reaching the generation-fenced terminal stage is the
+    // durable proof that every shop stage has ended (successfully or degraded),
+    // so reconstruct and persist the upload trigger from that proof.
+    storesCompleted = { ebay: true, iherb: true, amazon: true };
+    const finalStatus = finalRun.status === 'completed' ? 'completed' : 'degraded';
+    await chrome.storage.local.set({
+      pipelineStage: {
+        ...stage,
+        active: false,
+        runId: finalRun.id,
+        stageName: 'done',
+        stageStartedAt: null
+      },
+      parsingState: { isParsingAllStores: false, storesCompleted },
+      screenshotStageBudget: null,
+      lastDailyAutoParseStatus: finalStatus,
+      lastDailyAutoParseFinishedAt: finalRun?.finishedAt || Date.now()
+    });
+    console.log(`${finalStatus === 'completed' ? '✅' : '⚠️'} Sequential pipeline ${finalStatus}`);
+    await checkAllStoresCompleted();
+    return true;
 }
 
 // Blocks until the screenshot queue is fully drained AND processing is idle.
@@ -1673,36 +3013,39 @@ async function runPipelineStage(stageName) {
 // helper polls until both flags are clear, kicking off a drain itself if the
 // queue has items but nobody is running.
 async function waitForScreenshotsDrained(options = {}) {
-  const maxWaitMs = typeof options === 'number'
+  const requestedMaxWaitMs = typeof options === 'number'
     ? options
     : (Object.prototype.hasOwnProperty.call(options || {}, 'maxWaitMs')
         ? options.maxWaitMs
-        : 10 * 60 * 1000);
+        : SCREENSHOT_DRAIN_MAX_WAIT_MS);
+  // `null` used to mean infinity. A CAPTCHA or storage failure then held the
+  // whole nightly pipeline forever. Every drain now has a real terminal bound.
+  const maxWaitMs = Number.isFinite(requestedMaxWaitMs) && requestedMaxWaitMs >= 0
+    ? requestedMaxWaitMs
+    : SCREENSHOT_DRAIN_MAX_WAIT_MS;
   const start = Date.now();
+  await screenshotQueueReady;
   // SW мог уснуть между queueTrackScreenshot и этим вызовом — in-memory очередь
   // тогда пуста, а в storage скрины ещё ждут. Без restore цикл ниже не стартует
   // и аккаунт переключится с недоснятыми скринами. Подтягиваем недостающие.
   while (true) {
     try {
-      const settings = await chrome.storage.local.get(['screenshotsEnabled', 'trackScreenshotQueue']);
+      const settings = await chrome.storage.local.get([
+        'screenshotsEnabled', 'trackScreenshotQueue', 'screenshotQueueBlocked'
+      ]);
       screenshotsEnabled = settings.screenshotsEnabled || false;
       const storedQ = settings.trackScreenshotQueue || [];
+      if (settings.screenshotQueueBlocked) {
+        console.warn('⏸ Screenshot queue is quarantined:', settings.screenshotQueueBlocked);
+        return false;
+      }
       if (!screenshotsEnabled
           && !isProcessingScreenshots
           && (!Array.isArray(storedQ) || storedQ.length === 0)
           && trackScreenshotQueue.length === 0) {
         return true;
       }
-      if (Array.isArray(storedQ) && storedQ.length > trackScreenshotQueue.length) {
-        const seen = new Set(trackScreenshotQueue.map(x => `${x.accountName || ''}|${x.orderId || ''}|${x.trackNumber || ''}`));
-        for (const item of storedQ) {
-          const key = `${item.accountName || ''}|${item.orderId || ''}|${item.trackNumber || ''}`;
-          if (!seen.has(key)) {
-            trackScreenshotQueue.push(item);
-            seen.add(key);
-          }
-        }
-      }
+      mergePersistedScreenshotQueue(storedQ);
       break;
     } catch (e) {
       if (Number.isFinite(maxWaitMs) && Date.now() - start > maxWaitMs) {
@@ -1713,10 +3056,12 @@ async function waitForScreenshotsDrained(options = {}) {
     }
   }
   while (trackScreenshotQueue.length > 0 || isProcessingScreenshots) {
-    if (Number.isFinite(maxWaitMs) && Date.now() - start > maxWaitMs) {
+    if (Date.now() - start > maxWaitMs) {
       console.warn('⏰ waitForScreenshotsDrained: timed out with queue still pending');
       return false;
     }
+    const blocked = await chrome.storage.local.get(['screenshotQueueBlocked']);
+    if (blocked.screenshotQueueBlocked) return false;
     if (!isProcessingScreenshots && trackScreenshotQueue.length > 0) {
       processScreenshotQueue().catch(() => {});
     }
@@ -1732,18 +3077,105 @@ async function waitForScreenshotsDrained(options = {}) {
   if (trackScreenshotQueue.length > 0 || isProcessingScreenshots || finalStored.length > 0) {
     // Новая карточка могла прийти между проверкой while и финальным commit.
     return waitForScreenshotsDrained({
-      maxWaitMs: Number.isFinite(maxWaitMs)
-        ? Math.max(0, maxWaitMs - (Date.now() - start))
-        : null
+      maxWaitMs: Math.max(0, maxWaitMs - (Date.now() - start))
     });
   }
   return true;
 }
 
-async function advancePipelineStage() {
+function pipelineGenerationFromStage(stage) {
+  if (!stage) return null;
+  return {
+    runId: stage.runId,
+    startedAt: stage.startedAt,
+    currentIndex: stage.currentIndex,
+    stageStartedAt: stage.stageStartedAt || null
+  };
+}
+
+function pipelineGenerationMatches(stage, generation) {
+  if (!generation) return true;
+  return !!stage
+    && stage.runId === generation.runId
+    && stage.startedAt === generation.startedAt
+    && stage.currentIndex === generation.currentIndex
+    && (stage.stageStartedAt || null) === (generation.stageStartedAt || null);
+}
+
+function finalReturnConfirmationMatches(confirmation, finalizing) {
+  return !!confirmation
+    && !!finalizing
+    && confirmation.runId === finalizing.runId
+    && normalizeAccountEmail(confirmation.account)
+      === normalizeAccountEmail(finalizing.account)
+    && (!finalizing.tabId || confirmation.tabId === finalizing.tabId)
+    && Number.isFinite(confirmation.confirmedAt);
+}
+
+async function stopPipelineForScreenshotDrain(reason = 'screenshot queue did not drain', expectedGeneration = null) {
+  const state = await chrome.storage.local.get(['pipelineStage', 'screenshotQueueBlocked']);
+  const p = state.pipelineStage;
+  if (!p?.active || !pipelineGenerationMatches(p, expectedGeneration)) {
+    console.warn('⏭ Refusing stale screenshot-drain stop');
+    return false;
+  }
+  const stage = p?.stages?.[p.currentIndex] || p?.stageName || 'unknown';
+  const detail = state.screenshotQueueBlocked || { reason, at: Date.now() };
+  isParsingAllStores = false;
+  if (stage === 'amazon') stopCompletionWatchdog();
+  if (stage === 'amazon' || stage === 'iherb' || stage === 'ebay') setParserLock(stage, false);
+  await chrome.storage.local.set({
+    pipelineStage: p ? { ...p, active: false, blockedAt: Date.now(), blockedReason: reason } : null,
+    parsingState: { isParsingAllStores: false, storesCompleted },
+    lastDailyAutoParseStatus: 'blocked-screenshots',
+    lastDailyAutoParseFinishedAt: Date.now(),
+    lastDailyAutoParseError: String(reason).slice(0, 300),
+    screenshotQueueBlocked: detail
+  });
+  await updatePipelineRun(run => run.id === p.runId ? ({
+      ...run,
+      status: 'blocked',
+      finishedAt: Date.now(),
+      failures: [...(run.failures || []), { shop: stage, account: '', reason, at: Date.now() }]
+  }) : null);
+  sendTelegramMessage(
+    `❌ Ночной обход остановлен на ${stage}: очередь кадров не завершилась. Очередь сохранена, кабинет не переключаю.`
+  ).catch(() => {});
+  return false;
+}
+
+async function advancePipelineStage(expectedGeneration = null) {
+  if (expectedGeneration) {
+    const gate = await chrome.storage.local.get(['pipelineStage']);
+    if (!gate.pipelineStage?.active
+        || !pipelineGenerationMatches(gate.pipelineStage, expectedGeneration)) {
+      console.warn('⏭ Refusing stale pipeline advance');
+      return false;
+    }
+  }
+  if (pipelineAdvanceInFlight) return pipelineAdvanceInFlight;
+  pipelineAdvanceInFlight = advancePipelineStageOnce(expectedGeneration);
+  try {
+    return await pipelineAdvanceInFlight;
+  } finally {
+    pipelineAdvanceInFlight = null;
+  }
+}
+
+async function advancePipelineStageOnce(expectedGeneration = null) {
   const r = await chrome.storage.local.get(['pipelineStage']);
   const p = r.pipelineStage;
   if (!p || !p.active) return;
+  if (expectedGeneration && !pipelineGenerationMatches(p, expectedGeneration)) {
+    console.warn('⏭ Refusing stale pipeline advance generation');
+    return false;
+  }
+  const generation = {
+    runId: p.runId,
+    startedAt: p.startedAt,
+    currentIndex: p.currentIndex,
+    stageStartedAt: p.stageStartedAt || null
+  };
 
   // DRAIN screenshot queue BEFORE starting next stage.
   // chrome.tabs.captureVisibleTab(windowId) captures whatever tab is currently active
@@ -1758,37 +3190,126 @@ async function advancePipelineStage() {
   // Вызываем даже при пустой in-memory очереди: после MV3 restart persisted
   // карточки могут ещё не успеть восстановиться callback'ом и иначе stage сменится.
   const drained = await waitForScreenshotsDrained();
+  const freshState = await chrome.storage.local.get(['pipelineStage']);
+  const fresh = freshState.pipelineStage;
+  const sameGeneration = !!fresh?.active
+    && fresh.runId === generation.runId
+    && fresh.startedAt === generation.startedAt
+    && fresh.currentIndex === generation.currentIndex
+    && (fresh.stageStartedAt || null) === generation.stageStartedAt;
+  if (!sameGeneration) {
+    console.warn('⏭ Pipeline advance ignored: stage generation changed during screenshot drain');
+    return false;
+  }
   if (!drained) {
     console.warn('⏸  Pipeline: screenshot queue is not drained; refusing to change stage');
-    return;
+    return stopPipelineForScreenshotDrain('stage screenshots blocked', generation);
   }
   if (screenshotsEnabled) console.log('▶  Pipeline: screenshot queue drained, advancing');
 
-  const nextIndex = p.currentIndex + 1;
-  if (nextIndex >= p.stages.length) {
-    await chrome.storage.local.set({ pipelineStage: { ...p, active: false, currentIndex: p.stages.length - 1 } });
+  const nextIndex = fresh.currentIndex + 1;
+  if (nextIndex >= fresh.stages.length) {
+    await chrome.storage.local.set({ pipelineStage: { ...fresh, active: false, currentIndex: fresh.stages.length - 1 } });
     return;
   }
-  const nextStage = p.stages[nextIndex];
-  await chrome.storage.local.set({ pipelineStage: { ...p, currentIndex: nextIndex } });
-  await runPipelineStage(nextStage);
+  const nextStage = fresh.stages[nextIndex];
+  const nextStageStartedAt = Date.now();
+  await chrome.storage.local.set({
+    pipelineStage: {
+      ...fresh,
+      currentIndex: nextIndex,
+      stageStartedAt: nextStageStartedAt,
+      stageName: nextStage
+    },
+    screenshotStageBudget: nextStage === 'done' ? null : {
+      stageName: nextStage,
+      stageStartedAt: nextStageStartedAt,
+      accruedMs: 0,
+      activeSince: null
+    },
+    iherbSwitchDispatch: null,
+    iherbStageFinalizing: null,
+    iherbFinalReturnConfirmed: null,
+    pendingIherbSwitch: null,
+    iherbFinalReturn: null,
+    iherbSwitchInProgress: null,
+    iherbSwitchStartedAt: null,
+    iherbParseAttemptId: null,
+    iherbTimeoutAttempt: null,
+    iherbParsingComplete: null,
+    amazonSwitchDispatch: null,
+    amazonStageFinalizing: null,
+    amazonFinalReturnConfirmed: null,
+    pendingAccountSwitch: null,
+    amazonFinalReturn: null,
+    accountSwitchInProgress: null,
+    switchedToEmail: null,
+    accountSwitchStartedAt: null,
+    ebayStageDispatch: null
+  });
+  await runPipelineStage(nextStage, fresh.runId);
+  return true;
 }
 
-async function startEbayStageForPipeline() {
+async function getEbayParserTab(tabId) {
+  if (!tabId) return null;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab?.url === 'about:blank') return tab;
+    const url = new URL(tab?.url || '');
+    if (/(^|\.)ebay\.com$/i.test(url.hostname)
+        && /\/mye\/myebay\/purchase/i.test(url.pathname)) return tab;
+  } catch (_) {}
+  return null;
+}
+
+async function startEbayStageForPipeline(expectedGeneration = null) {
+  const prepared = await chrome.storage.local.get([
+    'pipelineRun', 'pipelineStage', 'ebayParserTabId'
+  ]);
+  const generation = expectedGeneration || pipelineGenerationFromStage(prepared.pipelineStage);
+  if (!prepared.pipelineStage?.active
+      || !pipelineGenerationMatches(prepared.pipelineStage, generation)
+      || prepared.pipelineRun?.id !== generation?.runId
+      || prepared.pipelineStage.stages?.[prepared.pipelineStage.currentIndex] !== 'ebay') {
+    console.warn('⏭ Refusing stale eBay stage dispatch');
+    return false;
+  }
   // content-ebay.js checkAutoParse требует autoParsePending='ebay' + свежий
   // autoParseTimestamp (<120s). Без этого он молча скипнет парсинг.
   await chrome.storage.local.set({
     autoParsePending: 'ebay',
     autoParseTimestamp: Date.now(),
-    ebay_should_autoparse: true
+    ebay_should_autoparse: true,
+    ebayStageDispatch: null
   });
   const url = 'https://www.ebay.com/mye/myebay/purchase';
-  const tabs = await chrome.tabs.query({ url: 'https://www.ebay.com/mye/myebay/purchase*' });
-  if (tabs.length > 0) {
-    await chrome.tabs.update(tabs[0].id, { url, active: true });
-  } else {
-    await chrome.tabs.create({ url });
+  let tab = await getEbayParserTab(prepared.ebayParserTabId);
+  if (!tab) {
+    // Establish ownership before navigation so a content script can never load
+    // in an unowned tab and consume the global auto-parse intent.
+    tab = await chrome.tabs.create({ url: 'about:blank', active: false });
+    if (!tab?.id) throw new Error('failed to create owned eBay parser tab');
+    await chrome.storage.local.set({ ebayParserTabId: tab.id });
   }
+  await chrome.tabs.update(tab.id, { url, active: true });
+
+  const fresh = await chrome.storage.local.get(['pipelineStage', 'ebayParserTabId']);
+  if (!fresh.pipelineStage?.active
+      || !pipelineGenerationMatches(fresh.pipelineStage, generation)
+      || fresh.ebayParserTabId !== tab.id) {
+    console.warn('⏭ eBay dispatch completed after pipeline generation changed');
+    return false;
+  }
+  await chrome.storage.local.set({
+    ebayStageDispatch: {
+      ...generation,
+      tabId: tab.id,
+      phase: 'dispatched',
+      dispatchedAt: Date.now()
+    }
+  });
+  return true;
 }
 
 async function startMultiAccountIherbParsing() {
@@ -1811,7 +3332,13 @@ async function startMultiAccountIherbParsing() {
             iherbSkipReasons: {}
         },
         iherbFinalReturn: null,
+        iherbFinalReturnConfirmed: null,
+        iherbStageFinalizing: null,
+        iherbSwitchDispatch: null,
         pendingIherbSwitch: null,
+        iherbParseAttemptId: null,
+        iherbTimeoutAttempt: null,
+        iherbParsingComplete: null,
         // Per-run учёт аккаунтов: кто реально отпарсился / был ли retry-проход /
         // причины пропуска. Стартуем прогон с чистого листа.
         iherbParsedAccounts: [],
@@ -1830,87 +3357,224 @@ async function startMultiAccountIherbParsing() {
     sendTelegramMessage(`🌿 iHerb мульти-аккаунт: ${cfg.iherb.map(a => a.email.split('@')[0]).join(', ')}`).catch(() => {});
 
     // Находим существующий iherb-таб или создаём один. НЕ закрываем чужие табы.
-    const tabId = await ensureIherbParserTab();
+    const existingTab = await chrome.storage.local.get(['iherbParserTabId']);
+    const tabId = await ensureValidIherbParserTab(existingTab.iherbParserTabId);
     await chrome.storage.local.set({ iherbParserTabId: tabId });
 
     await switchToNextIherbAccount();
 }
 
-async function switchToNextIherbAccount() {
+function dispatchCurrentIherbAccountSwitch(email, expectedGeneration) {
+    const key = pipelineOperationKey(expectedGeneration, normalizeAccountEmail(email));
+    return runParserOperationSingleFlight('iherb-account-dispatch', key, () =>
+        dispatchCurrentIherbAccountSwitchOnce(email, expectedGeneration));
+}
+
+async function dispatchCurrentIherbAccountSwitchOnce(email, expectedGeneration) {
+    const readDispatchState = () => chrome.storage.local.get([
+        'pipelineRun', 'pipelineStage', 'multiAccountIherbState',
+        'pendingIherbSwitch', 'iherbParserTabId', 'iherbSwitchDispatch'
+    ]);
+    const ownsDispatch = state => !!expectedGeneration
+        && state.pipelineStage?.active === true
+        && pipelineGenerationMatches(state.pipelineStage, expectedGeneration)
+        && state.pipelineStage.stages?.[state.pipelineStage.currentIndex] === 'iherb'
+        && state.pipelineRun?.id === expectedGeneration.runId
+        && state.pendingIherbSwitch?.runId === expectedGeneration.runId
+        && normalizeAccountEmail(state.pendingIherbSwitch?.email) === normalizeAccountEmail(email)
+        && normalizeAccountEmail(state.multiAccountIherbState?.currentIherbAccount)
+            === normalizeAccountEmail(email);
+    const state = await readDispatchState();
+    if (!ownsDispatch(state)) {
+        console.warn('⏭ Refusing stale iHerb account dispatch');
+        return false;
+    }
+
+    const tabId = await ensureValidIherbParserTab(state.iherbParserTabId);
+    const afterTab = await readDispatchState();
+    if (!ownsDispatch(afterTab)) {
+        console.warn('⏭ iHerb generation changed while resolving parser tab');
+        return false;
+    }
+    await chrome.storage.local.set({
+        iherbParserTabId: tabId,
+        iherbSwitchDispatch: {
+            ...expectedGeneration,
+            account: email,
+            tabId,
+            phase: 'prepared',
+            preparedAt: Date.now()
+        }
+    });
+    const beforeNavigation = await readDispatchState();
+    if (!ownsDispatch(beforeNavigation)
+        || !pipelineGenerationMatches(beforeNavigation.iherbSwitchDispatch, expectedGeneration)
+        || normalizeAccountEmail(beforeNavigation.iherbSwitchDispatch?.account)
+            !== normalizeAccountEmail(email)
+        || beforeNavigation.iherbSwitchDispatch?.tabId !== tabId
+        || beforeNavigation.iherbSwitchDispatch?.phase !== 'prepared') {
+        console.warn('⏭ iHerb generation changed before account navigation');
+        return false;
+    }
+
+    try {
+        await iherbUiSignOutAndNavigateToLogin(tabId);
+    } catch (error) {
+        console.error('❌ iHerb UI sign-out flow failed:', error);
+        await handleIherbSwitchFailure(
+            email,
+            'ui_signout_failed',
+            expectedGeneration.runId
+        );
+        return false;
+    }
+
+    const fresh = await readDispatchState();
+    if (!ownsDispatch(fresh)
+        || !pipelineGenerationMatches(fresh.iherbSwitchDispatch, expectedGeneration)
+        || normalizeAccountEmail(fresh.iherbSwitchDispatch?.account)
+            !== normalizeAccountEmail(email)
+        || fresh.iherbSwitchDispatch?.tabId !== tabId
+        || fresh.iherbSwitchDispatch?.phase !== 'prepared') {
+        console.warn('⏭ iHerb dispatch completed after pipeline generation changed');
+        return false;
+    }
+    await chrome.storage.local.set({
+        iherbSwitchDispatch: {
+            ...expectedGeneration,
+            account: email,
+            tabId,
+            phase: 'dispatched',
+            dispatchedAt: Date.now()
+        }
+    });
+    return true;
+}
+
+let iherbAccountTransitionChain = Promise.resolve();
+
+function switchToNextIherbAccount(expectedGeneration = null) {
+    const task = iherbAccountTransitionChain
+        .catch(() => {})
+        .then(() => switchToNextIherbAccountOnce(expectedGeneration));
+    iherbAccountTransitionChain = task.catch(() => {});
+    return task;
+}
+
+async function switchToNextIherbAccountOnce(expectedGeneration = null) {
     // Restore state (SW restart)
-    const stored = await chrome.storage.local.get(['multiAccountIherbState', 'iherbParserTabId']);
+    const stored = await chrome.storage.local.get([
+        'multiAccountIherbState', 'iherbParserTabId', 'pipelineRun', 'pipelineStage'
+    ]);
+    const generation = expectedGeneration || pipelineGenerationFromStage(stored.pipelineStage);
+    if (!stored.pipelineStage?.active
+        || !pipelineGenerationMatches(stored.pipelineStage, generation)
+        || stored.pipelineStage.stages?.[stored.pipelineStage.currentIndex] !== 'iherb'
+        || stored.pipelineRun?.id !== generation?.runId) {
+        console.warn('⏭ Refusing stale iHerb queue mutation');
+        return false;
+    }
     if (stored.multiAccountIherbState) {
         isMultiAccountIherb = stored.multiAccountIherbState.isMultiAccountIherb;
         iherbAccountsQueue  = stored.multiAccountIherbState.iherbAccountsQueue || [];
         currentIherbAccount = stored.multiAccountIherbState.currentIherbAccount;
     }
+    if (currentIherbAccount
+        && !pipelineRunAccountIsTerminal(
+            stored.pipelineRun,
+            'iherb',
+            currentIherbAccount
+        )) {
+        console.warn('⏭ Refusing duplicate iHerb queue shift: current account is not terminal');
+        return false;
+    }
 
     // Единый safety gate для ВСЕХ путей (обычный Done, watchdog, login retry):
     // карточки текущего iHerb-кабинета нельзя открывать после смены аккаунта.
     if (currentIherbAccount) {
-        await waitForScreenshotsDrained({ maxWaitMs: null });
+        if (!await waitForScreenshotsDrained()) {
+            return stopPipelineForScreenshotDrain(
+                'iHerb account screenshots blocked',
+                generation
+            );
+        }
     }
 
-    if (iherbAccountsQueue.length === 0) {
+    const prepared = await withIherbAttemptMutation(async () => {
+        const fresh = await chrome.storage.local.get([
+            'pipelineRun', 'pipelineStage', 'multiAccountIherbState', 'iherbParserTabId'
+        ]);
+        if (!fresh.pipelineStage?.active
+            || !pipelineGenerationMatches(fresh.pipelineStage, generation)
+            || fresh.pipelineStage.stages?.[fresh.pipelineStage.currentIndex] !== 'iherb'
+            || fresh.pipelineRun?.id !== generation?.runId) {
+            return { status: 'stale' };
+        }
+        const multi = fresh.multiAccountIherbState;
+        const current = normalizeAccountEmail(multi?.currentIherbAccount);
+        if (current && !pipelineRunAccountIsTerminal(fresh.pipelineRun, 'iherb', current)) {
+            return { status: 'already-prepared' };
+        }
+        const queue = Array.isArray(multi?.iherbAccountsQueue)
+            ? [...multi.iherbAccountsQueue]
+            : [];
+        if (queue.length === 0) return { status: 'finalize' };
+
+        const next = queue.shift();
+        const startedAt = Date.now();
+        const parseAttemptId = `${fresh.pipelineRun.id}:${normalizeAccountEmail(next.email)}:${startedAt}:${Math.random().toString(36).slice(2, 8)}`;
+        await chrome.storage.local.set({
+            pendingIherbSwitch: { email: next.email, password: next.password, runId: fresh.pipelineRun.id },
+            iherbSwitchInProgress: true,
+            // The previous account's outcome and timeout cannot survive into the
+            // new cabinet. This transition shares the exact-attempt arbiter with
+            // content commits, so an acknowledged old Done can never land after
+            // the new owner is installed.
+            iherbParseStartedAt: null,
+            iherbWatchdogRetried: null,
+            iherbParseAttemptId: parseAttemptId,
+            iherbTimeoutAttempt: null,
+            iherbParsingComplete: null,
+            iherbPressHoldAttempts: null,
+            iherbOrdersReloadDone: null,
+            iherbSignInRetries: null,
+            iherbSwitchStartedAt: startedAt,
+            iherbFinalReturn: null,
+            iherbSwitchDispatch: {
+                ...generation,
+                account: next.email,
+                tabId: fresh.iherbParserTabId || null,
+                phase: 'prepared',
+                preparedAt: startedAt
+            },
+            multiAccountIherbState: {
+                isMultiAccountIherb: true,
+                iherbAccountsQueue: queue,
+                currentIherbAccount: next.email
+            }
+        });
+        return { status: 'prepared', next, queue };
+    });
+
+    if (prepared.status === 'stale' || prepared.status === 'already-prepared') {
+        console.warn('⏭ iHerb queue changed while preparing the next cabinet');
+        return false;
+    }
+    if (prepared.status === 'finalize') {
         console.log('📋 No more iHerb accounts — finalize');
-        return finalizeIherbStage();
+        return finalizeIherbStage(undefined, { expectedGeneration: generation });
     }
 
-    const next = iherbAccountsQueue.shift();
+    const next = prepared.next;
+    iherbAccountsQueue = prepared.queue;
     currentIherbAccount = next.email;
 
     console.log(`🔄 Switching to iHerb account: ${next.email}`);
 
-    await chrome.storage.local.set({
-        pendingIherbSwitch: { email: next.email, password: next.password },
-        iherbSwitchInProgress: true,
-        // Отметка времени старта переключения iHerb. Нужна watchdog'у чтобы понять
-        // что переключение зависло (login-страница не загрузилась / cs-скрипт не
-        // отработал / SW заснул посреди sign-out). Без неё watchdog видел только
-        // iherbParseStartedAt, который выставляется ПОСЛЕ успешного логина — стак
-        // на самом switch'е не детектился. Отдельное от accountSwitchStartedAt
-        // (то поле — для Amazon multi-account, не пересекаем).
-        iherbSwitchStartedAt: Date.now(),
-        iherbFinalReturn: null,
-        multiAccountIherbState: {
-            isMultiAccountIherb: true,
-            iherbAccountsQueue,
-            currentIherbAccount: next.email
-        }
-    });
-
-    const tabId = await ensureValidIherbParserTab(stored.iherbParserTabId);
-    await chrome.storage.local.set({ iherbParserTabId: tabId });
-
-    // Fast path ТОЛЬКО для первого аккаунта в очереди (primary): если оператор
-    // уже залогинен на iHerb, пропускаем dropdown-dance и сразу идём на /orders.
-    // multiAccountIherbState.currentIherbAccount уже выставлен в next.email, так
-    // что content-iherb.js размтит все позиции на правильный account_name.
-    // Для secondary-аккаунта (pochtoy) мы ВСЕГДА обязаны делать sign-out dance,
-    // потому что оператор сейчас залогинен как primary, не как secondary.
-    const cfg = await loadAccountsConfig();
-    const primary = getPrimary(cfg.iherb);
-    const isPrimaryAttempt = next.email === primary.email;
-    const alreadyLoggedIn = isPrimaryAttempt && await iherbIsLoggedIn(tabId);
-    if (alreadyLoggedIn) {
-        console.log(`✅ Already logged in — skipping sign-out dance, parsing as ${next.email}`);
-        await chrome.storage.local.remove(['pendingIherbSwitch']);
-        // iherbSwitchInProgress=true уже выставлен выше — content-iherb.js auto-parse.
-        // iherb watchdog: marker для проверки залипания cs (Extension context invalidated и т.п.)
-        await chrome.storage.local.set({ iherbParseStartedAt: Date.now(), iherbWatchdogRetried: false });
-        await chrome.tabs.update(tabId, { url: 'https://secure.iherb.com/myaccount/orders', active: true });
-        return;
-    }
-
-    try {
-        await iherbUiSignOutAndNavigateToLogin(tabId);
-        // После этого content-iherb-login.js на checkout.iherb.com/auth/ui/account/login
-        // прочитает pendingIherbSwitch и залогинит нужный аккаунт.
-    } catch (e) {
-        console.error('❌ iHerb UI sign-out flow failed:', e);
-        console.warn(`⚠️ iHerb UI sign-out упал для ${next.email.split('@')[0]}: ${e.message || e}`);
-        await handleIherbSwitchFailure(next.email, 'ui_signout_failed');
-    }
+    // Never infer primary identity from "someone is logged in".  The browser
+    // may have been left on either secondary account.  Exact sign-out + login
+    // is required for every cabinet, including the first/primary one.
+    return dispatchCurrentIherbAccountSwitch(next.email, generation);
 }
 
 // Проверяет что на iHerb кто-то залогинен (logoff link присутствует в DOM).
@@ -1937,8 +3601,26 @@ async function iherbIsLoggedIn(tabId) {
 // Общий обработчик сбоев iHerb-свитча (retry или skip).
 // Вызывается из catch-а UI sign-out flow и из message listener (iherbSwitchFailed
 // от content-iherb-login.js).
-async function handleIherbSwitchFailure(email, reason) {
-    const failData = await chrome.storage.local.get(['iherbSwitchFailures']);
+async function handleIherbSwitchFailure(email, reason, requestedRunId = null) {
+    const failData = await chrome.storage.local.get([
+        'iherbSwitchFailures', 'pipelineRun', 'pipelineStage', 'multiAccountIherbState'
+    ]);
+    const runId = requestedRunId || failData.pipelineRun?.id || null;
+    const generation = pipelineGenerationFromStage(failData.pipelineStage);
+    if (!runId
+        || failData.pipelineRun?.id !== runId
+        || !['starting', 'running'].includes(failData.pipelineRun?.status)
+        || failData.pipelineStage?.runId !== runId
+        || failData.pipelineStage?.stages?.[failData.pipelineStage?.currentIndex] !== 'iherb'
+        || normalizeAccountEmail(failData.multiAccountIherbState?.currentIherbAccount) !== normalizeAccountEmail(email)) {
+        console.warn('⏭ Ignoring stale iHerb switch failure');
+        return false;
+    }
+    if (failData.multiAccountIherbState) {
+        isMultiAccountIherb = failData.multiAccountIherbState.isMultiAccountIherb;
+        iherbAccountsQueue = failData.multiAccountIherbState.iherbAccountsQueue || [];
+        currentIherbAccount = failData.multiAccountIherbState.currentIherbAccount;
+    }
     const failures = failData.iherbSwitchFailures || {};
     failures[email] = (failures[email] || 0) + 1;
     await chrome.storage.local.set({ iherbSwitchFailures: failures });
@@ -1947,46 +3629,358 @@ async function handleIherbSwitchFailure(email, reason) {
     if (failures[email] < MAX_IH_ATTEMPTS && reason !== 'captcha') {
         console.log(`🔁 Retry iHerb switch for ${email} (attempt ${failures[email] + 1}/${MAX_IH_ATTEMPTS})`);
         const cfg = await loadAccountsConfig();
+        const retryGate = await chrome.storage.local.get([
+            'pipelineRun', 'pipelineStage', 'multiAccountIherbState'
+        ]);
+        if (retryGate.pipelineRun?.id !== runId
+            || !retryGate.pipelineStage?.active
+            || !pipelineGenerationMatches(retryGate.pipelineStage, generation)
+            || retryGate.pipelineStage.stages?.[retryGate.pipelineStage.currentIndex] !== 'iherb'
+            || normalizeAccountEmail(retryGate.multiAccountIherbState?.currentIherbAccount)
+                !== normalizeAccountEmail(email)) return false;
         const creds = cfg.iherb.find(a => a.email === email);
         if (creds) iherbAccountsQueue.unshift(creds);
+        currentIherbAccount = null;
         await chrome.storage.local.set({
             multiAccountIherbState: {
                 isMultiAccountIherb: true,
                 iherbAccountsQueue,
-                currentIherbAccount
+                currentIherbAccount: null
             }
         });
         await new Promise(r => setTimeout(r, 5000));
-        await switchToNextIherbAccount();
+        await switchToNextIherbAccount(generation);
     } else {
         console.log(`🚫 iHerb ${email} skipped (failures=${failures[email]}, reason=${reason})`);
         sendTelegramMessage(`🚫 iHerb ${email.split('@')[0]} пропущен (${reason})`).catch(() => {});
-        await recordIherbSkipReason(email, 'switch_failed');
+        await recordIherbSkipReason(email, 'switch_failed', runId);
+        const skipGate = await chrome.storage.local.get([
+            'pipelineRun', 'pipelineStage', 'multiAccountIherbState'
+        ]);
+        if (skipGate.pipelineRun?.id !== runId
+            || !skipGate.pipelineStage?.active
+            || !pipelineGenerationMatches(skipGate.pipelineStage, generation)
+            || skipGate.pipelineStage.stages?.[skipGate.pipelineStage.currentIndex] !== 'iherb'
+            || normalizeAccountEmail(skipGate.multiAccountIherbState?.currentIherbAccount)
+                !== normalizeAccountEmail(email)) return false;
         await chrome.storage.local.remove(['iherbSwitchInProgress', 'iherbSwitchStartedAt', 'pendingIherbSwitch']);
-        if (iherbAccountsQueue.length > 0) await switchToNextIherbAccount();
-        else await finalizeIherbStage();
+        if (iherbAccountsQueue.length > 0) await switchToNextIherbAccount(generation);
+        else await finalizeIherbStage(undefined, { expectedGeneration: generation });
     }
+    return true;
+}
+
+let iherbAttemptMutationChain = Promise.resolve();
+
+function withIherbAttemptMutation(work) {
+    const task = iherbAttemptMutationChain
+        .catch(() => {})
+        .then(work);
+    iherbAttemptMutationChain = task.catch(() => {});
+    return task;
+}
+
+function iherbAttemptRefFromState(state) {
+    return {
+        runId: state?.pipelineRun?.id || null,
+        stageStartedAt: state?.pipelineStage?.stageStartedAt || null,
+        account: normalizeAccountEmail(state?.multiAccountIherbState?.currentIherbAccount),
+        parserTabId: state?.iherbParserTabId || null,
+        attemptId: state?.iherbParseAttemptId || null
+    };
+}
+
+function iherbAttemptIdentityMatches(left, right) {
+    return !!left?.runId
+        && !!left?.attemptId
+        && left.runId === right?.runId
+        && left.stageStartedAt === right?.stageStartedAt
+        && normalizeAccountEmail(left.account) === normalizeAccountEmail(right?.account)
+        && left.parserTabId === right?.parserTabId
+        && left.attemptId === right?.attemptId;
+}
+
+function iherbAttemptMatchesRuntime(attempt, state, senderTabId = null) {
+    const current = iherbAttemptRefFromState(state);
+    return !!attempt?.runId
+        && !!attempt?.account
+        && !!attempt?.parserTabId
+        && !!attempt?.attemptId
+        && (senderTabId == null || senderTabId === attempt.parserTabId)
+        && state?.pipelineStage?.active === true
+        && state.pipelineStage.runId === attempt.runId
+        && state.pipelineStage.stages?.[state.pipelineStage.currentIndex] === 'iherb'
+        && ['starting', 'running'].includes(state?.pipelineRun?.status)
+        && state.pipelineRun.id === attempt.runId
+        && !pipelineGenerationMatches(
+            state.iherbStageFinalizing,
+            pipelineGenerationFromStage(state.pipelineStage)
+        )
+        && iherbAttemptIdentityMatches(current, attempt);
+}
+
+function iherbTimeoutAttemptMatchesRuntime(marker, state) {
+    return !!marker
+        && iherbAttemptMatchesRuntime(marker, state)
+        && iherbAttemptIdentityMatches(marker, iherbAttemptRefFromState(state));
+}
+
+async function handleIherbAttemptCommit(request, senderTabId) {
+    return withIherbAttemptMutation(async () => {
+        const attempt = {
+            runId: request.attempt?.runId || null,
+            stageStartedAt: request.attempt?.stageStartedAt || null,
+            account: normalizeAccountEmail(request.attempt?.account),
+            parserTabId: request.attempt?.parserTabId || null,
+            attemptId: request.attempt?.attemptId || null
+        };
+        const state = await chrome.storage.local.get([
+            'pipelineRun', 'pipelineStage', 'multiAccountIherbState',
+            'iherbParserTabId', 'iherbParseAttemptId', 'iherbTimeoutAttempt',
+            'iherbStageFinalizing', 'orderData', 'iherbCancelledOrders'
+        ]);
+        if (!iherbAttemptMatchesRuntime(attempt, state, senderTabId)) {
+            return { ok: false, status: 'stale', reason: 'run-account-attempt-changed' };
+        }
+        if (iherbTimeoutAttemptMatchesRuntime(state.iherbTimeoutAttempt, state)) {
+            return { ok: false, status: 'stale', reason: 'timeout-won' };
+        }
+        const incomingOrders = (Array.isArray(request.orders) ? request.orders : []).map(order => ({
+            ...structuredClone(order),
+            parser_run_id: attempt.runId,
+            parser_account: attempt.account,
+            observed_at: new Date().toISOString()
+        }));
+        if (!incomingOrders.length) {
+            return { ok: false, status: 'invalid', reason: 'empty-iherb-result' };
+        }
+        const orderData = state.orderData && typeof state.orderData === 'object'
+            ? structuredClone(state.orderData)
+            : {};
+        const existingOrders = Array.isArray(orderData.iHerb?.orders)
+            ? orderData.iHerb.orders
+            : [];
+        const byKey = new Map();
+        for (const order of existingOrders) {
+            byKey.set(`${order?.order_id || ''}_${order?.product_name || ''}`, order);
+        }
+        let addedCount = 0;
+        let updatedCount = 0;
+        for (const order of incomingOrders) {
+            const key = `${order?.order_id || ''}_${order?.product_name || ''}`;
+            if (byKey.has(key)) updatedCount++;
+            else addedCount++;
+            byKey.set(key, order);
+        }
+        const mergedOrders = [...byKey.values()];
+        const uniqueOrderIds = new Set(mergedOrders.map(order => order?.order_id).filter(Boolean));
+        orderData.iHerb = {
+            orders: mergedOrders,
+            lastParsed: new Date().toISOString(),
+            uniqueOrdersCount: uniqueOrderIds.size,
+            totalProductsCount: mergedOrders.length
+        };
+
+        const cancelledSeen = new Set();
+        const cancelledOrders = [
+            ...(Array.isArray(state.iherbCancelledOrders) ? state.iherbCancelledOrders : []),
+            ...(Array.isArray(request.cancelledOrders) ? request.cancelledOrders : [])
+        ].map(item => structuredClone(item)).filter(order => {
+            const key = order?.order_id;
+            if (!key || cancelledSeen.has(key)) return false;
+            cancelledSeen.add(key);
+            return true;
+        });
+        const completion = {
+            ...attempt,
+            timestamp: Date.now(),
+            found: Number(request.found) || incomingOrders.length
+        };
+        await chrome.storage.local.set({
+            orderData,
+            iherbOrders: incomingOrders,
+            iherbLastUpdate: Date.now(),
+            iherbCancelledOrders: cancelledOrders,
+            iherbCancelledUpdatedAt: Date.now(),
+            iherbParsingComplete: completion
+        });
+        return {
+            ok: true,
+            status: 'committed',
+            addedCount,
+            updatedCount,
+            totalCount: mergedOrders.length,
+            uniqueOrdersCount: uniqueOrderIds.size
+        };
+    });
+}
+
+async function commitIherbTimeoutOutcome(attempt, reason = 'parse_timeout') {
+    return withIherbAttemptMutation(() => withPipelineRunWrite(async () => {
+        const state = await chrome.storage.local.get([
+            'pipelineRun', 'pipelineStage', 'multiAccountIherbState',
+            'iherbParserTabId', 'iherbParseAttemptId', 'iherbTimeoutAttempt',
+            'iherbParsingComplete', 'iherbStageFinalizing',
+            'iherbParsedAccounts', 'iherbSkipReasons'
+        ]);
+        if (!iherbAttemptMatchesRuntime(attempt, state)) return { status: 'stale' };
+        if (iherbAttemptIdentityMatches(state.iherbParsingComplete, attempt)) {
+            return { status: 'completion-won' };
+        }
+        const nextRun = applyPipelineAccountResult(
+            state.pipelineRun,
+            'iherb',
+            attempt.account,
+            { runId: attempt.runId, ok: false, reason }
+        );
+        if (!nextRun) return { status: 'stale' };
+        const marker = {
+            ...attempt,
+            phase: 'failed',
+            reason,
+            resolvedAt: Date.now()
+        };
+        const parsed = (Array.isArray(state.iherbParsedAccounts)
+            ? state.iherbParsedAccounts
+            : []).filter(item => normalizeAccountEmail(item) !== attempt.account);
+        const skipReasons = state.iherbSkipReasons && typeof state.iherbSkipReasons === 'object'
+            ? { ...state.iherbSkipReasons, [attempt.account]: reason }
+            : { [attempt.account]: reason };
+        await chrome.storage.local.set({
+            pipelineRun: nextRun,
+            iherbTimeoutAttempt: marker,
+            iherbParsedAccounts: parsed,
+            iherbSkipReasons: skipReasons,
+            iherbParseStartedAt: null,
+            iherbWatchdogRetried: null
+        });
+        return {
+            status: 'failed',
+            marker,
+            multiAccountIherbState: state.multiAccountIherbState,
+            pipelineStage: state.pipelineStage
+        };
+    }));
+}
+
+async function consumeIherbCompletionMarker(expectedGeneration) {
+    const claimed = await withIherbAttemptMutation(() => withPipelineRunWrite(async () => {
+        const state = await chrome.storage.local.get([
+            'pipelineRun', 'pipelineStage', 'multiAccountIherbState',
+            'iherbParserTabId', 'iherbParseAttemptId', 'iherbTimeoutAttempt',
+            'iherbParsingComplete', 'iherbStageFinalizing',
+            'iherbParsedAccounts', 'iherbSkipReasons'
+        ]);
+        const marker = state.iherbParsingComplete;
+        if (!marker
+            || !pipelineGenerationMatches(state.pipelineStage, expectedGeneration)
+            || !iherbAttemptMatchesRuntime(marker, state)) {
+            return { claimed: false };
+        }
+        const parsed = Array.isArray(state.iherbParsedAccounts)
+            ? [...state.iherbParsedAccounts]
+            : [];
+        if (!parsed.some(item => normalizeAccountEmail(item) === marker.account)) {
+            parsed.push(marker.account);
+        }
+        const skipReasons = state.iherbSkipReasons && typeof state.iherbSkipReasons === 'object'
+            ? { ...state.iherbSkipReasons }
+            : {};
+        delete skipReasons[marker.account];
+        const nextRun = applyPipelineAccountResult(
+            state.pipelineRun,
+            'iherb',
+            marker.account,
+            { runId: marker.runId, ok: true, found: marker.found || 0 }
+        );
+        if (!nextRun) return { claimed: false };
+        await chrome.storage.local.set({
+            pipelineRun: nextRun,
+            iherbParsedAccounts: parsed,
+            iherbSkipReasons: skipReasons,
+            iherbParsingComplete: null,
+            iherbTimeoutAttempt: null,
+            iherbParseStartedAt: null,
+            iherbWatchdogRetried: null
+        });
+        return {
+            claimed: true,
+            marker,
+            multiAccountIherbState: state.multiAccountIherbState,
+            pipelineStage: state.pipelineStage
+        };
+    }));
+    if (!claimed.claimed) return false;
+
+    isMultiAccountIherb = !!claimed.multiAccountIherbState?.isMultiAccountIherb;
+    iherbAccountsQueue = claimed.multiAccountIherbState?.iherbAccountsQueue || [];
+    currentIherbAccount = claimed.multiAccountIherbState?.currentIherbAccount || null;
+    parseReport.stores[`iherb_${String(currentIherbAccount || '').split('@')[0]}`] = {
+        found: claimed.marker.found || 0,
+        status: '✅'
+    };
+    if (!await waitForScreenshotsDrained()) {
+        return stopPipelineForScreenshotDrain(
+            'iHerb account screenshots blocked',
+            expectedGeneration
+        );
+    }
+    const gate = (await chrome.storage.local.get(['pipelineStage'])).pipelineStage;
+    if (!gate?.active || !pipelineGenerationMatches(gate, expectedGeneration)) return false;
+    if (isMultiAccountIherb && iherbAccountsQueue.length > 0) {
+        return switchToNextIherbAccount(expectedGeneration);
+    }
+    if (isMultiAccountIherb) {
+        return finalizeIherbStage(undefined, { expectedGeneration });
+    }
+    return true;
 }
 
 // ─── Per-run iHerb account accounting helpers ──────────────────────────────
 // Записывает аккаунт, который РЕАЛЬНО отпарсился (дал parseReport-запись) в этом
 // прогоне. Dedupe. Персист top-level — chrome.storage.local переживает рестарт SW.
-async function recordIherbParsedAccount(email) {
-    if (!email) return [];
-    const r = await chrome.storage.local.get(['iherbParsedAccounts']);
+async function recordIherbParsedAccount(email, runId, attemptId) {
+    if (!email || !runId || !attemptId) return [];
+    const r = await chrome.storage.local.get([
+        'iherbParsedAccounts', 'pipelineRun', 'pipelineStage', 'multiAccountIherbState',
+        'iherbParserTabId', 'iherbParseAttemptId', 'iherbTimeoutAttempt',
+        'iherbStageFinalizing'
+    ]);
+    if (r.pipelineRun?.id !== runId
+        || !['starting', 'running'].includes(r.pipelineRun?.status)
+        || r.pipelineStage?.runId !== runId
+        || r.pipelineStage?.stages?.[r.pipelineStage?.currentIndex] !== 'iherb'
+        || normalizeAccountEmail(r.multiAccountIherbState?.currentIherbAccount) !== normalizeAccountEmail(email)
+        || r.iherbParseAttemptId !== attemptId
+        || iherbTimeoutAttemptMatchesRuntime(r.iherbTimeoutAttempt, r)) {
+        console.warn('⏭ Refusing stale iHerb success accounting');
+        return Array.isArray(r.iherbParsedAccounts) ? r.iherbParsedAccounts : [];
+    }
     const arr = Array.isArray(r.iherbParsedAccounts) ? r.iherbParsedAccounts : [];
     if (!arr.includes(email)) arr.push(email);
     await chrome.storage.local.set({ iherbParsedAccounts: arr });
+    await markPipelineAccountResult('iherb', email, { runId, ok: true });
     return arr;
 }
 
 // Записывает причину, по которой аккаунт НЕ отпарсился: 'captcha' | 'switch_failed'.
-async function recordIherbSkipReason(email, reason) {
-    if (!email) return {};
-    const r = await chrome.storage.local.get(['iherbSkipReasons']);
+async function recordIherbSkipReason(email, reason, runId) {
+    if (!email || !runId) return {};
+    const r = await chrome.storage.local.get([
+        'iherbSkipReasons', 'pipelineRun', 'pipelineStage', 'multiAccountIherbState'
+    ]);
+    if (r.pipelineRun?.id !== runId
+        || !['starting', 'running'].includes(r.pipelineRun?.status)
+        || r.pipelineStage?.runId !== runId
+        || r.pipelineStage?.stages?.[r.pipelineStage?.currentIndex] !== 'iherb'
+        || normalizeAccountEmail(r.multiAccountIherbState?.currentIherbAccount) !== normalizeAccountEmail(email)) {
+        console.warn('⏭ Refusing stale iHerb failure accounting');
+        return (r.iherbSkipReasons && typeof r.iherbSkipReasons === 'object') ? r.iherbSkipReasons : {};
+    }
     const map = (r.iherbSkipReasons && typeof r.iherbSkipReasons === 'object') ? r.iherbSkipReasons : {};
     map[email] = reason;
     await chrome.storage.local.set({ iherbSkipReasons: map });
+    await markPipelineAccountResult('iherb', email, { runId, ok: false, reason });
     return map;
 }
 
@@ -2002,10 +3996,26 @@ async function recordIherbSkipReason(email, reason) {
 //      roster + алерт оператору если кого-то недосчитались + advance pipeline.
 // Идемпотентна: если storesCompleted.iherb уже true — no-op (защита от двойного
 // завершения из watchdog / handleProgressMessage / captcha-abort).
-async function finalizeIherbStage(tabId, { fromCaptcha = false } = {}) {
+async function finalizeIherbStage(tabId, { fromCaptcha = false, expectedGeneration = null } = {}) {
     if (storesCompleted && storesCompleted.iherb === true) {
         console.log('[finalizeIherb] stage already completed — no-op');
         return { retrying: false };
+    }
+
+    const generationState = await chrome.storage.local.get([
+        'pipelineStage', 'multiAccountIherbState'
+    ]);
+    const generation = expectedGeneration || pipelineGenerationFromStage(generationState.pipelineStage);
+    if (!generationState.pipelineStage?.active
+        || !pipelineGenerationMatches(generationState.pipelineStage, generation)
+        || generationState.pipelineStage.stages?.[generationState.pipelineStage.currentIndex] !== 'iherb') {
+        console.warn('⏭ Refusing stale iHerb finalization entry');
+        return { retrying: false, stale: true };
+    }
+    if (generationState.multiAccountIherbState) {
+        isMultiAccountIherb = generationState.multiAccountIherbState.isMultiAccountIherb;
+        iherbAccountsQueue = generationState.multiAccountIherbState.iherbAccountsQueue || [];
+        currentIherbAccount = generationState.multiAccountIherbState.currentIherbAccount;
     }
 
     // finalize вызывается не только из обычного Done, но и из watchdog/captcha
@@ -2013,7 +4023,9 @@ async function finalizeIherbStage(tabId, { fromCaptcha = false } = {}) {
     // кабинет, пока карточки текущего аккаунта реально не записаны и очередь
     // не закреплена persisted [].
     if (currentIherbAccount) {
-        await waitForScreenshotsDrained({ maxWaitMs: null });
+        if (!await waitForScreenshotsDrained()) {
+            return stopPipelineForScreenshotDrain('iHerb final screenshots blocked', generation);
+        }
     }
 
     const cfg = await loadAccountsConfig();
@@ -2029,6 +4041,14 @@ async function finalizeIherbStage(tabId, { fromCaptcha = false } = {}) {
     const missing = allEmails.filter(e => !parsed.has(e));
     // captcha привязана к IP — повторять бессмысленно, следующий аккаунт упрётся в неё же.
     const retriable = missing.filter(e => skipReasons[e] !== 'captcha');
+
+    const beforeDecision = (await chrome.storage.local.get(['pipelineStage'])).pipelineStage;
+    if (!beforeDecision?.active
+        || !pipelineGenerationMatches(beforeDecision, generation)
+        || beforeDecision.stages?.[beforeDecision.currentIndex] !== 'iherb') {
+        console.warn('⏭ Refusing stale iHerb retry/final-return side effects');
+        return { retrying: false, stale: true };
+    }
 
     // ── ОДИН ограниченный retry-проход по недопарсенным (не captcha) аккаунтам ──
     if (!fromCaptcha && retriable.length > 0 && !retryPassDone) {
@@ -2061,13 +4081,35 @@ async function finalizeIherbStage(tabId, { fromCaptcha = false } = {}) {
         console.log(`♻️ iHerb: повтор для пропущенных аккаунтов: ${names}`);
         sendTelegramMessage(`♻️ iHerb: повтор для пропущенных аккаунтов: ${names}`).catch(() => {});
 
-        await switchToNextIherbAccount(tabId);
+        await switchToNextIherbAccount(generation);
         return { retrying: true };
     }
 
     // ── Реальное завершение стадии ──
+    const beforeFinalReturn = (await chrome.storage.local.get(['pipelineStage'])).pipelineStage;
+    if (generation && (!beforeFinalReturn?.active
+        || !pipelineGenerationMatches(beforeFinalReturn, generation)
+        || beforeFinalReturn.stages?.[beforeFinalReturn.currentIndex] !== 'iherb')) {
+        console.warn('⏭ Refusing stale iHerb finalization');
+        return { retrying: false, stale: true };
+    }
+
     isMultiAccountIherb = false;
-    await finalReturnToIherbPrimary(tabId);
+    const primary = getPrimary(cfg.iherb);
+    const ownedTab = (await chrome.storage.local.get(['iherbParserTabId'])).iherbParserTabId || null;
+    const finalizing = {
+        ...generation,
+        shop: 'iherb',
+        account: primary.email,
+        tabId: ownedTab,
+        returnStatus: 'prepared',
+        attempts: 0,
+        preparedAt: Date.now()
+    };
+    await chrome.storage.local.set({
+        iherbStageFinalizing: finalizing,
+        iherbFinalReturnConfirmed: null
+    });
 
     parseReport.iherbRoster = { parsed: [...parsed], missing, total: allEmails.length };
 
@@ -2081,60 +4123,120 @@ async function finalizeIherbStage(tabId, { fromCaptcha = false } = {}) {
         const lines = missing.map(e => `${e.split('@')[0]} (${reasonRu(e)})`).join(', ');
         console.log(`⚠️ iHerb: отпарсилось ${parsed.size} из ${allEmails.length} аккаунтов. Пропущены: ${lines}`);
     }
-
-    setParserLock('iherb', false);
-    storesCompleted.iherb = true;
-    setTimeout(() => uploadToSheets(), 1500);
-    // Pipeline advance (идемпотентный guard по текущей стадии — как в старой :908 ветке).
-    chrome.storage.local.get(['pipelineStage']).then(r => {
-        const p = r.pipelineStage;
-        if (p && p.active && p.stages[p.currentIndex] === 'iherb') {
-            advancePipelineStage().catch(() => {});
-        }
-    });
-    checkAllStoresCompleted();
+    await resumeIherbStageFinalization(finalizing, generation);
     return { retrying: false };
 }
 
-async function finalReturnToIherbPrimary() {
+async function resumeIherbStageFinalization(finalizing, expectedGeneration) {
+    let state = await chrome.storage.local.get([
+        'pipelineStage', 'iherbStageFinalizing', 'iherbFinalReturnConfirmed'
+    ]);
+    let marker = state.iherbStageFinalizing || finalizing;
+    if (!state.pipelineStage?.active
+        || !pipelineGenerationMatches(state.pipelineStage, expectedGeneration)
+        || !pipelineGenerationMatches(marker, expectedGeneration)
+        || marker.shop !== 'iherb') {
+        console.warn('⏭ Refusing stale iHerb final-return recovery');
+        return false;
+    }
+
+    let status = marker.returnStatus;
+    if (status === 'prepared') {
+        if (finalReturnConfirmationMatches(state.iherbFinalReturnConfirmed, marker)) {
+            status = 'confirmed';
+        } else {
+            const returned = await finalReturnToIherbPrimary(marker.tabId, expectedGeneration);
+            state = await chrome.storage.local.get([
+                'pipelineStage', 'iherbStageFinalizing', 'iherbFinalReturnConfirmed'
+            ]);
+            marker = state.iherbStageFinalizing || marker;
+            if (!state.pipelineStage?.active
+                || !pipelineGenerationMatches(state.pipelineStage, expectedGeneration)) {
+                return false;
+            }
+            status = returned
+                && finalReturnConfirmationMatches(state.iherbFinalReturnConfirmed, marker)
+                ? 'confirmed'
+                : 'failed';
+        }
+        marker = { ...marker, returnStatus: status, resolvedAt: Date.now() };
+        await chrome.storage.local.set({ iherbStageFinalizing: marker });
+    }
+
+    const fresh = (await chrome.storage.local.get(['pipelineStage'])).pipelineStage;
+    if (!fresh?.active
+        || !pipelineGenerationMatches(fresh, expectedGeneration)
+        || fresh.stages?.[fresh.currentIndex] !== 'iherb') return false;
+
+    if (status === 'failed') {
+        await markPipelineAccountResult('iherb', marker.account, {
+            runId: expectedGeneration.runId,
+            ok: false,
+            reason: marker.reason || 'final-primary-return-failed'
+        });
+    }
+    const beforeAdvance = (await chrome.storage.local.get(['pipelineStage'])).pipelineStage;
+    if (!beforeAdvance?.active
+        || !pipelineGenerationMatches(beforeAdvance, expectedGeneration)) return false;
+    setParserLock('iherb', false);
+    storesCompleted.iherb = true;
+    await chrome.storage.local.set({ parsingState: { isParsingAllStores, storesCompleted } });
+    const advanced = await advancePipelineStage(expectedGeneration);
+    checkAllStoresCompleted();
+    return advanced;
+}
+
+function finalReturnToIherbPrimary(_tabId, expectedGeneration = null) {
+    const key = pipelineOperationKey(expectedGeneration, 'primary');
+    return runParserOperationSingleFlight('iherb-final-return', key, () =>
+        finalReturnToIherbPrimaryOnce(_tabId, expectedGeneration));
+}
+
+async function finalReturnToIherbPrimaryOnce(_tabId, expectedGeneration = null) {
     const cfg = await loadAccountsConfig();
     const primary = getPrimary(cfg.iherb);
     console.log(`🏁 iHerb final return to ${primary.email}`);
 
-    const stored = await chrome.storage.local.get(['iherbParserTabId', 'multiAccountIherbState']);
-    const lastKnownAccount = currentIherbAccount || stored.multiAccountIherbState?.currentIherbAccount || null;
+    const readReturnState = () => chrome.storage.local.get([
+        'iherbParserTabId', 'pipelineRun', 'pipelineStage', 'iherbStageFinalizing',
+        'pendingIherbSwitch', 'iherbSwitchDispatch'
+    ]);
+    const ownsReturn = state => !!expectedGeneration
+        && state.pipelineStage?.active === true
+        && pipelineGenerationMatches(state.pipelineStage, expectedGeneration)
+        && state.pipelineStage.stages?.[state.pipelineStage.currentIndex] === 'iherb'
+        && state.pipelineRun?.id === expectedGeneration.runId
+        && pipelineGenerationMatches(state.iherbStageFinalizing, expectedGeneration)
+        && normalizeAccountEmail(state.iherbStageFinalizing?.account)
+            === normalizeAccountEmail(primary.email);
+    const preparedReturnMatches = (state, tabId) => ownsReturn(state)
+        && state.iherbParserTabId === tabId
+        && state.pendingIherbSwitch?.runId === expectedGeneration.runId
+        && normalizeAccountEmail(state.pendingIherbSwitch?.email)
+            === normalizeAccountEmail(primary.email)
+        && pipelineGenerationMatches(state.iherbSwitchDispatch, expectedGeneration)
+        && normalizeAccountEmail(state.iherbSwitchDispatch?.account)
+            === normalizeAccountEmail(primary.email)
+        && state.iherbSwitchDispatch?.tabId === tabId
+        && state.iherbSwitchDispatch?.kind === 'final-return'
+        && state.iherbSwitchDispatch?.phase === 'prepared';
 
-    await chrome.storage.local.set({
-        pendingIherbSwitch: { email: primary.email, password: primary.password },
-        iherbFinalReturn: true,
-        multiAccountIherbState: null
-    });
-    await chrome.storage.local.remove(['iherbSwitchInProgress', 'iherbSwitchStartedAt']);
-
-    const tabId = await ensureValidIherbParserTab(stored.iherbParserTabId);
-    await chrome.storage.local.set({ iherbParserTabId: tabId });
-
-    // iherbIsLoggedIn() only proves "some account is logged in"; it cannot
-    // identify which email. Skip re-login only when our own state says the last
-    // parsed account was already primary AND this run didn't parse any secondary
-    // (if it did, some secondary is almost certainly the account currently logged
-    // in — trusting iherbIsLoggedIn() would leave the session on the wrong email).
-    // Correctness over saving one login: when in doubt, do the full return.
-    const parsedData = await chrome.storage.local.get(['iherbParsedAccounts']);
-    const parsedAccts = Array.isArray(parsedData.iherbParsedAccounts) ? parsedData.iherbParsedAccounts : [];
-    const anySecondaryParsed = parsedAccts.some(e => e !== primary.email);
-    const alreadyOnPrimary = lastKnownAccount === primary.email
-        && !anySecondaryParsed
-        && await iherbIsLoggedIn(tabId);
-    if (alreadyOnPrimary) {
-        console.log(`✅ Already on primary ${primary.email} — final return no-op`);
-        await chrome.storage.local.remove(['pendingIherbSwitch', 'iherbFinalReturn', 'iherbSwitchInProgress', 'iherbSwitchStartedAt']);
-        await chrome.tabs.update(tabId, { url: 'https://www.iherb.com/', active: false });
-        // Advance faster — нет 45s login wait. Guarded: если handleProgressMessage
-        // уже advanced (типичный happy path), мы здесь ничего не делаем.
-        setTimeout(() => guardedAdvanceFromIherb('fast-path').catch(() => {}), 3000);
-        return;
+    let returnState = await readReturnState();
+    if (!ownsReturn(returnState)) {
+        console.warn('⏭ Missing exact iHerb finalization marker');
+        return false;
     }
+
+    const tabId = await ensureValidIherbParserTab(returnState.iherbParserTabId);
+    returnState = await readReturnState();
+    if (!ownsReturn(returnState)) {
+        console.warn('⏭ iHerb generation changed while resolving final-return tab');
+        return false;
+    }
+    await chrome.storage.local.set({
+        iherbParserTabId: tabId,
+        iherbStageFinalizing: { ...returnState.iherbStageFinalizing, tabId }
+    });
 
     // Возврат на primary критичен: иначе следующий прогон стартует с чужого
     // аккаунта. Пробуем sign-out+login ДВАЖДЫ; если оба раза упало — громкий
@@ -2142,9 +4244,64 @@ async function finalReturnToIherbPrimary() {
     let returned = false;
     for (let attempt = 1; attempt <= 2 && !returned; attempt++) {
         try {
+            returnState = await readReturnState();
+            if (!ownsReturn(returnState) || returnState.iherbParserTabId !== tabId) {
+                console.warn('⏭ iHerb final return lost generation before preparation');
+                return false;
+            }
+            await chrome.storage.local.set({
+                pendingIherbSwitch: {
+                    email: primary.email,
+                    password: primary.password,
+                    runId: expectedGeneration.runId
+                },
+                iherbFinalReturn: true,
+                iherbFinalReturnConfirmed: null,
+                multiAccountIherbState: null,
+                iherbSwitchDispatch: {
+                    ...expectedGeneration,
+                    account: primary.email,
+                    tabId,
+                    phase: 'prepared',
+                    kind: 'final-return',
+                    preparedAt: Date.now()
+                },
+                iherbStageFinalizing: {
+                    ...returnState.iherbStageFinalizing,
+                    tabId,
+                    attempts: attempt,
+                    returnStatus: 'prepared'
+                }
+            });
+            returnState = await readReturnState();
+            if (!preparedReturnMatches(returnState, tabId)) {
+                console.warn('⏭ iHerb final return lost generation before sign-out cleanup');
+                return false;
+            }
+            await chrome.storage.local.remove(['iherbSwitchInProgress', 'iherbSwitchStartedAt']);
+            returnState = await readReturnState();
+            if (!preparedReturnMatches(returnState, tabId)) {
+                console.warn('⏭ iHerb final return lost generation before navigation');
+                return false;
+            }
             await iherbUiSignOutAndNavigateToLogin(tabId);
-            returned = true;
+            returnState = await readReturnState();
+            if (!preparedReturnMatches(returnState, tabId)) return false;
+            await chrome.storage.local.set({
+                iherbSwitchDispatch: {
+                    ...expectedGeneration,
+                    account: primary.email,
+                    tabId,
+                    phase: 'dispatched',
+                    kind: 'final-return',
+                    dispatchedAt: Date.now()
+                }
+            });
+            returned = await waitForIherbFinalReturnCompletion(expectedGeneration, 60_000);
+            if (!returned) throw new Error('primary_login_not_confirmed');
         } catch (e) {
+            returnState = await readReturnState();
+            if (!ownsReturn(returnState)) return false;
             console.error(`❌ iHerb final return attempt ${attempt}/2 failed:`, e);
             if (attempt >= 2) {
                 sendTelegramMessage(`⚠️ iHerb: не смог вернуться на основной аккаунт photopochtoy — проверь вручную`).catch(() => {});
@@ -2153,33 +4310,35 @@ async function finalReturnToIherbPrimary() {
             }
         }
     }
-
-    // Pipeline advance: safety net через ~45с (sign-out + login + orders page).
-    // Основной advance делает handleProgressMessage СРАЗУ после iherb done,
-    // но если cs script завалился ДО progress=done (Extension context invalidated,
-    // login упал и т.д.) — этот setTimeout всё ещё двинет pipeline. Guard внутри
-    // проверяет что мы всё ещё на iherb-стадии, чтобы не пропустить ebay.
-    setTimeout(() => guardedAdvanceFromIherb('safety-net').catch(() => {}), 45000);
+    return returned;
 }
 
-// Идемпотентный advance: проверяет что pipeline активен И мы всё ещё на iherb-стадии.
-// Защищает от двойного срабатывания (handleProgressMessage + setTimeout fallback).
-async function guardedAdvanceFromIherb(source) {
-    const r = await chrome.storage.local.get(['pipelineStage']);
-    const p = r.pipelineStage;
-    if (p && p.active && p.stages[p.currentIndex] === 'iherb') {
-        console.log(`[pipeline] advance from iherb (source=${source})`);
-        await advancePipelineStage();
-    } else {
-        console.log(`[pipeline] guardedAdvanceFromIherb skip (source=${source}, stage=${p?.stages?.[p?.currentIndex]}, active=${p?.active})`);
+async function waitForIherbFinalReturnCompletion(expectedGeneration, maxWaitMs) {
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+        const state = await chrome.storage.local.get([
+            'pipelineStage', 'iherbStageFinalizing', 'iherbFinalReturnConfirmed'
+        ]);
+        if (expectedGeneration && (!state.pipelineStage?.active
+            || !pipelineGenerationMatches(state.pipelineStage, expectedGeneration))) {
+            return false;
+        }
+        if (pipelineGenerationMatches(state.iherbStageFinalizing, expectedGeneration)
+            && finalReturnConfirmationMatches(
+                state.iherbFinalReturnConfirmed,
+                state.iherbStageFinalizing
+            )) {
+            return true;
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000));
     }
+    return false;
 }
 
 // ─── Shared: ensure we have exactly one iHerb parser tab ───────────────────
 async function ensureIherbParserTab() {
-    // Prefer existing tab (we don't close anyone else's work).
-    const tabs = await chrome.tabs.query({ url: 'https://*.iherb.com/*' });
-    if (tabs.length > 0) return tabs[0].id;
+    // Lost ownership cannot be reconstructed from a URL: an existing iHerb tab
+    // may belong to the operator or another task. Create one parser-owned tab.
     const t = await chrome.tabs.create({ url: 'https://www.iherb.com/', active: false });
     await waitForTabComplete(t.id, 20000);
     return t.id;
@@ -2337,111 +4496,6 @@ async function hoverAndFind(tabId, trigger, evalExpr, maxAttempts = 3) {
     return null;
 }
 
-// ─── PerimeterX "Press & Hold" (HUMAN challenge) detector + solver ─────────
-// iHerb иногда подменяет /myaccount/orders блок-страницей PerimeterX
-// "Press & Hold to confirm you are a human". Это ПОВЕДЕНЧЕСКИЙ челлендж: надо
-// зажать кнопку ~11с, PerimeterX анализирует сенсорику мыши (микродвижения,
-// тайминги). JS-клик (isTrusted:false) он отсекает мгновенно — поэтому жмём
-// через chrome.debugger Input.dispatchMouseEvent (isTrusted:true, как настоящая
-// физическая мышь) + держим с микро-джиттером. После успеха PerimeterX сам
-// редиректит на реальную страницу заказов.
-const PRESS_HOLD_MAX_ATTEMPTS = 3; // circuit-breaker против бесконечного цикла
-
-// Лёгкая детекция БЕЗ debugger-attach — читаем текст страницы через chrome.scripting.
-async function detectIherbPressHold(tabId) {
-    try {
-        const [res] = await chrome.scripting.executeScript({
-            target: { tabId },
-            func: () => {
-                const txt = (document.body?.innerText || '').toLowerCase();
-                const isPH = /press\s*&?\s*hold/.test(txt) &&
-                    (/confirm you are a human/.test(txt) || /reference id/.test(txt));
-                return { isPH, vw: window.innerWidth, vh: window.innerHeight };
-            }
-        });
-        return res?.result || { isPH: false };
-    } catch (e) {
-        console.warn('🧩 [P&H] detect failed:', e?.message || e);
-        return { isPH: false };
-    }
-}
-
-// Пытается найти живой rect кнопки "Press & Hold". Может лежать в обычном DOM
-// (тогда найдём), либо в iframe #px-captcha (тогда null → fallback на пропорции).
-async function findPressHoldButton(tabId) {
-    try {
-        const [res] = await chrome.scripting.executeScript({
-            target: { tabId },
-            func: () => {
-                const cand = [...document.querySelectorAll('button, [role="button"], #px-captcha, div, p')]
-                    .filter(el => {
-                        const t = (el.innerText || el.textContent || '').toLowerCase();
-                        if (!/press\s*&?\s*hold/.test(t)) return false;
-                        const r = el.getBoundingClientRect();
-                        return r.width > 40 && r.height > 20 && r.width < 600 && r.height < 200;
-                    })
-                    .sort((a, b) => a.getBoundingClientRect().width - b.getBoundingClientRect().width);
-                const el = cand[0];
-                if (!el) return null;
-                const r = el.getBoundingClientRect();
-                return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-            }
-        });
-        return res?.result || null;
-    } catch (_) { return null; }
-}
-
-// Проходит один Press & Hold. Возвращает { solved, reason }.
-async function solveIherbPressHold(tabId) {
-    const det = await detectIherbPressHold(tabId);
-    if (!det.isPH) return { solved: true, reason: 'no_press_hold' }; // нечего решать
-
-    const vw = det.vw || 1000, vh = det.vh || 800;
-    const btn = await findPressHoldButton(tabId);
-    // Fallback: PerimeterX-кнопка центрирована по X, ~0.57 высоты (проверено вживую).
-    const BX = Math.round(btn?.x ?? vw / 2);
-    const BY = Math.round(btn?.y ?? vh * 0.57);
-    console.log(`🧩 [P&H] solving at (${BX},${BY}) viewport ${vw}x${vh} rect=${btn ? 'found' : 'proportional'}`);
-    console.log('🧩 iHerb Press & Hold — решаю сам (human-hold)…');
-
-    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-    const jit = () => (Math.random() * 5 - 2.5); // ±2.5px дрожание руки
-
-    await dbgAttach(tabId);
-    try {
-        // approach: подводим мышь несколькими шагами (не телепорт к кнопке)
-        for (let i = 6; i >= 1; i--) {
-            await dbgSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: BX - i * 14, y: BY + i * 6 });
-            await sleep(50 + Math.random() * 60);
-        }
-        await dbgSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: BX, y: BY });
-        await sleep(150 + Math.random() * 150);
-
-        // press
-        await dbgSend(tabId, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: BX, y: BY, button: 'left', buttons: 1, clickCount: 1 });
-
-        // hold ~11-13с с микро-джиттером (человек не держит кнопку идеально ровно)
-        const holdMs = 11000 + Math.random() * 2000;
-        const start = Date.now();
-        while (Date.now() - start < holdMs) {
-            await sleep(350 + Math.random() * 300);
-            await dbgSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: BX + jit(), y: BY + jit(), button: 'left', buttons: 1 });
-        }
-
-        // release
-        await dbgSend(tabId, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: BX + jit(), y: BY + jit(), button: 'left', buttons: 1, clickCount: 1 });
-    } catch (e) {
-        console.warn('🧩 [P&H] mouse sequence error:', e?.message || e);
-    } finally {
-        await dbgDetach(tabId); // отпускаем debugger — иначе баннер мешает редиректу PerimeterX
-    }
-
-    // PerimeterX валидирует сенсорику и редиректит ~5с
-    await sleep(5000);
-    const after = await detectIherbPressHold(tabId);
-    return { solved: !after.isPH, reason: after.isPH ? 'still_present' : 'solved' };
-}
-
 // ─── Sign-out flow: direct URL redirect (no chrome.debugger) ──
 // Раньше использовался chrome.debugger.attach + hover + click через Input.dispatchMouseEvent.
 // Это падало с "Cannot access a chrome-extension:// URL of different extension" когда
@@ -2490,32 +4544,189 @@ async function iherbUiSignOutAndNavigateToLogin(tabId) {
 // Финальный return — открывает switch_account=picker для primary Amazon-аккаунта
 // (из accountsConfig) и выставляет флаг amazonFinalReturn, чтобы content-скрипты
 // знали: кликать аккаунт, но НЕ запускать парсинг и НЕ редиректить на orders.
-async function finalReturnToPrimaryAmazon() {
+async function beginAmazonStageFinalization(expectedGeneration) {
+    const state = await chrome.storage.local.get([
+        'pipelineRun', 'pipelineStage', 'amazonParserTabId', 'multiAccountState'
+    ]);
+    if (!state.pipelineStage?.active
+        || !pipelineGenerationMatches(state.pipelineStage, expectedGeneration)
+        || state.pipelineStage.stages?.[state.pipelineStage.currentIndex] !== 'amazon'
+        || state.pipelineRun?.id !== expectedGeneration?.runId) {
+        console.warn('⏭ Refusing stale Amazon finalization entry');
+        return false;
+    }
+    if (state.multiAccountState?.currentAmazonAccount
+        && !await waitForScreenshotsDrained()) {
+        return stopPipelineForScreenshotDrain(
+            'Amazon final screenshots blocked',
+            expectedGeneration
+        );
+    }
+    const afterDrain = (await chrome.storage.local.get(['pipelineStage'])).pipelineStage;
+    if (!afterDrain?.active
+        || !pipelineGenerationMatches(afterDrain, expectedGeneration)
+        || afterDrain.stages?.[afterDrain.currentIndex] !== 'amazon') return false;
+    const cfg = await loadAccountsConfig();
+    const primary = getPrimary(cfg.amazon);
+    const beforePrepare = (await chrome.storage.local.get(['pipelineStage'])).pipelineStage;
+    if (!beforePrepare?.active
+        || !pipelineGenerationMatches(beforePrepare, expectedGeneration)
+        || beforePrepare.stages?.[beforePrepare.currentIndex] !== 'amazon') return false;
+    const marker = {
+        ...expectedGeneration,
+        shop: 'amazon',
+        account: primary.email,
+        tabId: state.amazonParserTabId || null,
+        returnStatus: 'prepared',
+        attempts: 0,
+        preparedAt: Date.now()
+    };
+    await chrome.storage.local.set({
+        multiAccountState: null,
+        amazonStageFinalizing: marker,
+        amazonFinalReturnConfirmed: null
+    });
+    return resumeAmazonStageFinalization(marker, expectedGeneration);
+}
+
+async function resumeAmazonStageFinalization(finalizing, expectedGeneration) {
+    let state = await chrome.storage.local.get([
+        'pipelineStage', 'amazonStageFinalizing', 'amazonFinalReturnConfirmed'
+    ]);
+    let marker = state.amazonStageFinalizing || finalizing;
+    if (!state.pipelineStage?.active
+        || !pipelineGenerationMatches(state.pipelineStage, expectedGeneration)
+        || !pipelineGenerationMatches(marker, expectedGeneration)
+        || marker.shop !== 'amazon') {
+        console.warn('⏭ Refusing stale Amazon final-return recovery');
+        return false;
+    }
+
+    let status = marker.returnStatus;
+    if (status === 'prepared') {
+        if (finalReturnConfirmationMatches(state.amazonFinalReturnConfirmed, marker)) {
+            status = 'confirmed';
+        } else {
+            const returned = await finalReturnToPrimaryAmazon(expectedGeneration);
+            state = await chrome.storage.local.get([
+                'pipelineStage', 'amazonStageFinalizing', 'amazonFinalReturnConfirmed'
+            ]);
+            marker = state.amazonStageFinalizing || marker;
+            if (!state.pipelineStage?.active
+                || !pipelineGenerationMatches(state.pipelineStage, expectedGeneration)) return false;
+            status = returned
+                && finalReturnConfirmationMatches(state.amazonFinalReturnConfirmed, marker)
+                ? 'confirmed'
+                : 'failed';
+        }
+        marker = { ...marker, returnStatus: status, resolvedAt: Date.now() };
+        await chrome.storage.local.set({ amazonStageFinalizing: marker });
+    }
+
+    const fresh = (await chrome.storage.local.get(['pipelineStage'])).pipelineStage;
+    if (!fresh?.active
+        || !pipelineGenerationMatches(fresh, expectedGeneration)
+        || fresh.stages?.[fresh.currentIndex] !== 'amazon') return false;
+    if (status === 'failed') {
+        await markPipelineAccountResult('amazon', marker.account, {
+            runId: expectedGeneration.runId,
+            ok: false,
+            reason: marker.reason || 'final-primary-return-failed'
+        });
+    }
+    const beforeAdvance = (await chrome.storage.local.get(['pipelineStage'])).pipelineStage;
+    if (!beforeAdvance?.active
+        || !pipelineGenerationMatches(beforeAdvance, expectedGeneration)) return false;
+    setParserLock('amazon', false);
+    storesCompleted.amazon = true;
+    stopCompletionWatchdog();
+    await chrome.storage.local.set({ parsingState: { isParsingAllStores, storesCompleted } });
+    const advanced = await advancePipelineStage(expectedGeneration);
+    checkAllStoresCompleted();
+    return advanced;
+}
+
+function finalReturnToPrimaryAmazon(expectedGeneration = null) {
+    const key = pipelineOperationKey(expectedGeneration, 'primary');
+    return runParserOperationSingleFlight('amazon-final-return', key, () =>
+        finalReturnToPrimaryAmazonOnce(expectedGeneration));
+}
+
+async function finalReturnToPrimaryAmazonOnce(expectedGeneration = null) {
     const cfg = await loadAccountsConfig();
     const primary = getPrimary(cfg.amazon);
     console.log(`🏁 Amazon final return to ${primary.email}`);
 
+    const runState = await chrome.storage.local.get([
+        'pipelineRun', 'pipelineStage', 'amazonStageFinalizing'
+    ]);
+    const generation = expectedGeneration || pipelineGenerationFromStage(runState.pipelineStage);
+    if (!generation || generation.runId !== runState.pipelineRun?.id) {
+        console.warn('⏭ Refusing stale Amazon final return');
+        return false;
+    }
+    if (!pipelineGenerationMatches(runState.amazonStageFinalizing, generation)
+        || normalizeAccountEmail(runState.amazonStageFinalizing?.account)
+            !== normalizeAccountEmail(primary.email)) {
+        console.warn('⏭ Missing exact Amazon finalization marker');
+        return false;
+    }
     await chrome.storage.local.set({
-        pendingAccountSwitch: { email: primary.email },
+        pendingAccountSwitch: { email: primary.email, runId: runState.pipelineRun?.id || null },
         amazonFinalReturn: true,
+        amazonFinalReturnConfirmed: null,
+        amazonSwitchDispatch: {
+            ...generation,
+            account: primary.email,
+            tabId: runState.amazonStageFinalizing.tabId || null,
+            kind: 'final-return',
+            phase: 'prepared',
+            preparedAt: Date.now()
+        },
+        amazonStageFinalizing: {
+            ...runState.amazonStageFinalizing,
+            attempts: (Number(runState.amazonStageFinalizing.attempts) || 0) + 1,
+            returnStatus: 'prepared'
+        },
         accountSwitchStartedAt: Date.now(),
         amazonParsingComplete: null
     });
     await chrome.storage.local.remove(['amazonPaginationState']);
 
-    const switchUrl = 'https://www.amazon.com/ap/signin?openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.amazon.com%2F%3Fref_%3Dnav_youraccount_switchacct&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.assoc_handle=usflex&openid.mode=checkid_setup&marketPlaceId=ATVPDKIKX0DER&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&switch_account=picker&ignoreAuthState=1&_encoding=UTF8';
-
-    const parserState = await chrome.storage.local.get(['amazonParserTabId']);
-    const parserTab = await getAmazonParserTab(parserState.amazonParserTabId);
-    if (parserTab?.id) {
-        await chrome.tabs.update(parserTab.id, { url: switchUrl, active: true });
-    } else {
-        const tab = await chrome.tabs.create({ url: switchUrl });
-        if (tab?.id) await chrome.storage.local.set({ amazonParserTabId: tab.id });
+    if (!await dispatchCurrentAmazonAccountSwitch(primary.email, generation, 'final-return')) {
+        return false;
     }
+    const parserState = await chrome.storage.local.get(['amazonParserTabId', 'amazonStageFinalizing']);
+    await chrome.storage.local.set({
+        amazonStageFinalizing: {
+            ...parserState.amazonStageFinalizing,
+            tabId: parserState.amazonParserTabId || null
+        }
+    });
 
-    // Pipeline advance: after ~45s give picker → landing page time to finish.
-    setTimeout(() => advancePipelineStage().catch(() => {}), 45000);
+    return waitForAmazonFinalReturnCompletion(generation, 60_000);
+}
+
+async function waitForAmazonFinalReturnCompletion(expectedGeneration, maxWaitMs) {
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+        const state = await chrome.storage.local.get([
+            'pipelineStage', 'amazonStageFinalizing', 'amazonFinalReturnConfirmed'
+        ]);
+        if (!state.pipelineStage?.active
+            || !pipelineGenerationMatches(state.pipelineStage, expectedGeneration)) {
+            return false;
+        }
+        if (pipelineGenerationMatches(state.amazonStageFinalizing, expectedGeneration)
+            && finalReturnConfirmationMatches(
+                state.amazonFinalReturnConfirmed,
+                state.amazonStageFinalizing
+            )) {
+            return true;
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    return false;
 }
 
 // Initialize multi-account Amazon parsing
@@ -2535,8 +4746,13 @@ async function startMultiAccountAmazonParsing() {
             amazonParsingComplete: null,
             amazonPaginationState: null,
             amazonNavigationGraceUntil: null,
+            amazonNavigationRecovery: null,
+            amazonParsingIncomplete: null,
             accountSwitchStartedAt: null,
             accountSwitchFailures: {},
+            amazonSwitchDispatch: null,
+            amazonStageFinalizing: null,
+            amazonFinalReturnConfirmed: null,
             multiAccountState: {
                 isMultiAccountParsing: true,
                 amazonAccountsQueue: amazonAccountsQueue,
@@ -2554,7 +4770,7 @@ async function startMultiAccountAmazonParsing() {
 
     // Start watchdog timer to check for completion flag
     startCompletionWatchdog();
-    
+
     // Start with first account switch
     await switchToNextAmazonAccount();
 }
@@ -2564,20 +4780,27 @@ const WATCHDOG_ALARM_NAME = 'amazonCompletionWatchdog';
 const AMAZON_NAVIGATION_MAX_RETRIES = 2;
 const AMAZON_NAVIGATION_RETRY_GAP_MS = 60_000;
 const AMAZON_NAVIGATION_GRACE_MS = 5 * 60_000;
+let amazonNavigationRetryInFlight = null;
 const SCREENSHOT_RESUME_ALARM = 'screenshotResume';
 chrome.alarms.create(SCREENSHOT_RESUME_ALARM, { delayInMinutes: 1, periodInMinutes: 1 });
 
-function getAmazonNavigationRetryDecision({ paginationState, timedOut, now = Date.now() }) {
+function getAmazonNavigationRetryDecision({ paginationState, recovery, timedOut, now = Date.now() }) {
     const navigation = paginationState?.navigation;
     if (!timedOut || !navigation) return { retry: false, reason: 'no-open-navigation' };
+    if (!navigation.navId) return { retry: false, reason: 'missing-navigation-id' };
     if (navigation.targetPage !== paginationState.currentPage) {
         return { retry: false, reason: 'page-generation-mismatch' };
     }
-    const retryCount = Math.max(0, Number(navigation.retryCount) || 0);
+    const sameRecovery = recovery?.navId === navigation.navId
+        && recovery?.parseId === paginationState.parseId
+        && recovery?.runId === paginationState.runId
+        && normalizeAccountEmail(recovery?.account) === normalizeAccountEmail(paginationState.account)
+        && recovery?.parserTabId === paginationState.parserTabId;
+    const retryCount = sameRecovery ? Math.max(0, Number(recovery.retryCount) || 0) : 0;
     if (retryCount >= AMAZON_NAVIGATION_MAX_RETRIES) {
         return { retry: false, reason: 'retry-limit' };
     }
-    if (navigation.lastRetryAt && now - navigation.lastRetryAt < AMAZON_NAVIGATION_RETRY_GAP_MS) {
+    if (sameRecovery && recovery.lastRetryAt && now - recovery.lastRetryAt < AMAZON_NAVIGATION_RETRY_GAP_MS) {
         return { retry: false, reason: 'retry-gap' };
     }
     try {
@@ -2592,9 +4815,24 @@ function getAmazonNavigationRetryDecision({ paginationState, timedOut, now = Dat
     return {
         retry: true,
         retryCount: retryCount + 1,
+        navId: navigation.navId,
         targetPage: navigation.targetPage,
         targetUrl: navigation.targetUrl
     };
+}
+
+function amazonPaginationOwnershipMatches(paginationState, runtimeState) {
+    const stage = runtimeState?.pipelineStage;
+    return !!paginationState?.parseId
+        && !!paginationState?.runId
+        && paginationState.runId === runtimeState?.pipelineRun?.id
+        && ['starting', 'running'].includes(runtimeState?.pipelineRun?.status)
+        && stage?.active === true
+        && stage.runId === paginationState.runId
+        && stage.stages?.[stage.currentIndex] === 'amazon'
+        && normalizeAccountEmail(paginationState.account)
+            === normalizeAccountEmail(runtimeState?.multiAccountState?.currentAmazonAccount)
+        && paginationState.parserTabId === runtimeState?.amazonParserTabId;
 }
 
 function isAmazonHardCapExpired({ totalElapsed, hardCapMs, now = Date.now(), graceUntil }) {
@@ -2611,25 +4849,503 @@ async function getAmazonParserTab(tabId) {
             if (/(^|\.)amazon\.com$/i.test(url.hostname) && parserPath) return tab;
         } catch (_) {}
     }
-    // Never fall back to an arbitrary Amazon tab: that was the old bug which
-    // photographed whichever checkout/product tab happened to be visible.
-    const tabs = await chrome.tabs.query({
-        url: [
-            'https://www.amazon.com/gp/your-account/order-history*',
-            'https://www.amazon.com/gp/css/order-history*',
-            'https://www.amazon.com/your-orders*'
-        ]
+    // Lost ownership cannot be reconstructed from a URL. Even one matching
+    // order-history tab may belong to the operator or another session.
+    return null;
+}
+
+function amazonWatchdogAttemptFromState(state) {
+    return {
+        runId: state?.pipelineRun?.id || null,
+        stageStartedAt: state?.pipelineStage?.stageStartedAt || null,
+        account: normalizeAccountEmail(state?.multiAccountState?.currentAmazonAccount),
+        parserTabId: state?.amazonParserTabId || null,
+        accountSwitchStartedAt: state?.accountSwitchStartedAt || null,
+        parseId: state?.amazonPaginationState?.parseId || null
+    };
+}
+
+function amazonWatchdogAttemptIdentityMatches(left, right) {
+    return !!left?.runId
+        && !!right?.runId
+        && left.runId === right.runId
+        && left.stageStartedAt === right.stageStartedAt
+        && left.account === normalizeAccountEmail(right.account)
+        && left.parserTabId === right.parserTabId
+        && left.accountSwitchStartedAt === right.accountSwitchStartedAt
+        && left.parseId === right.parseId;
+}
+
+function amazonWatchdogAttemptMatches(state, attempt) {
+    const current = amazonWatchdogAttemptFromState(state);
+    return !!attempt?.runId
+        && !!attempt?.account
+        && state?.pipelineStage?.active === true
+        && state.pipelineStage.runId === attempt.runId
+        && state.pipelineStage.stages?.[state.pipelineStage.currentIndex] === 'amazon'
+        && amazonWatchdogAttemptIdentityMatches(current, attempt);
+}
+
+async function clearAmazonTimeoutAttempt(expectedAttempt) {
+    const current = await chrome.storage.local.get(['amazonTimeoutAttempt']);
+    if (amazonWatchdogAttemptIdentityMatches(current.amazonTimeoutAttempt, expectedAttempt)) {
+        await chrome.storage.local.set({ amazonTimeoutAttempt: null });
+    }
+}
+
+function amazonCompletionMatchesAttempt(state, attempt) {
+    const marker = state?.amazonParsingComplete;
+    return amazonWatchdogAttemptMatches(state, attempt)
+        && !!marker?.timestamp
+        && marker.runId === attempt.runId
+        && normalizeAccountEmail(marker.account) === attempt.account
+        && marker.parserTabId === attempt.parserTabId
+        && (!attempt.parseId || marker.parseId === attempt.parseId);
+}
+
+let amazonAttemptMutationChain = Promise.resolve();
+
+function withAmazonAttemptMutation(work) {
+    const task = amazonAttemptMutationChain
+        .catch(() => {})
+        .then(work);
+    amazonAttemptMutationChain = task.catch(() => {});
+    return task;
+}
+
+function amazonAttemptRefFromPayload(value) {
+    return {
+        runId: value?.runId || null,
+        stageStartedAt: value?.stageStartedAt || null,
+        account: normalizeAccountEmail(value?.account),
+        parserTabId: value?.parserTabId || null,
+        accountSwitchStartedAt: value?.accountSwitchStartedAt || null,
+        parseId: value?.parseId || null
+    };
+}
+
+function amazonAttemptRefMatchesRuntime(
+    attempt,
+    runtime,
+    senderTabId,
+    { allowResolvingCompletion = false } = {}
+) {
+    const stage = runtime?.pipelineStage;
+    const currentAccount = normalizeAccountEmail(runtime?.multiAccountState?.currentAmazonAccount);
+    if (!attempt?.runId || !attempt?.account || !attempt?.parserTabId || !attempt?.parseId) {
+        return { ok: false, reason: 'incomplete-attempt-reference' };
+    }
+    if (!Number.isFinite(Number(attempt.stageStartedAt))
+        || !Number.isFinite(Number(attempt.accountSwitchStartedAt))) {
+        return { ok: false, reason: 'missing-attempt-timestamps' };
+    }
+    if (senderTabId !== attempt.parserTabId
+        || runtime?.amazonParserTabId !== attempt.parserTabId) {
+        return { ok: false, reason: 'parser-tab-changed' };
+    }
+    if (!['starting', 'running'].includes(runtime?.pipelineRun?.status)
+        || runtime.pipelineRun.id !== attempt.runId
+        || stage?.active !== true
+        || stage.runId !== attempt.runId
+        || stage.stages?.[stage.currentIndex] !== 'amazon'
+        || (stage.stageStartedAt || null) !== attempt.stageStartedAt
+        || currentAccount !== attempt.account
+        || runtime?.accountSwitchStartedAt !== attempt.accountSwitchStartedAt) {
+        return { ok: false, reason: 'run-account-generation-changed' };
+    }
+    if (pipelineGenerationMatches(
+        runtime?.amazonStageFinalizing,
+        pipelineGenerationFromStage(stage)
+    )) {
+        return { ok: false, reason: 'amazon-stage-finalizing' };
+    }
+    const currentPagination = runtime?.amazonPaginationState;
+    if (currentPagination?.parseId && currentPagination.parseId !== attempt.parseId) {
+        return { ok: false, reason: 'parse-attempt-changed' };
+    }
+    const timeoutAttempt = runtime?.amazonTimeoutAttempt;
+    if (timeoutAttempt && amazonWatchdogAttemptIdentityMatches(timeoutAttempt, attempt)) {
+        if (allowResolvingCompletion && timeoutAttempt.phase === 'resolving') {
+            return { ok: true };
+        }
+        return {
+            ok: false,
+            reason: timeoutAttempt.phase === 'failed' ? 'timeout-won' : 'timeout-resolving'
+        };
+    }
+    return { ok: true };
+}
+
+function amazonPaginationPayloadMatchesAttempt(paginationState, attempt) {
+    return !!paginationState
+        && paginationState.parseId === attempt.parseId
+        && paginationState.runId === attempt.runId
+        && normalizeAccountEmail(paginationState.account) === attempt.account
+        && paginationState.parserTabId === attempt.parserTabId
+        && paginationState.stageStartedAt === attempt.stageStartedAt
+        && paginationState.accountSwitchStartedAt === attempt.accountSwitchStartedAt;
+}
+
+function isSafeAmazonOrdersUrl(rawUrl) {
+    try {
+        const url = new URL(rawUrl);
+        return /(^|\.)amazon\.com$/i.test(url.hostname)
+            && /(?:order-history|your-orders)/i.test(url.pathname);
+    } catch (_) {
+        return false;
+    }
+}
+
+async function handleAmazonAttemptCommit(request, senderTabId) {
+    return withAmazonAttemptMutation(async () => {
+        const attempt = amazonAttemptRefFromPayload(request.attempt);
+        const runtime = await chrome.storage.local.get([
+            'pipelineRun', 'pipelineStage', 'multiAccountState',
+            'amazonParserTabId', 'accountSwitchStartedAt', 'amazonPaginationState',
+            'amazonTimeoutAttempt', 'amazonStageFinalizing', 'orderData',
+            'amazonCancelledOrders'
+        ]);
+        const ownership = amazonAttemptRefMatchesRuntime(
+            attempt,
+            runtime,
+            senderTabId,
+            { allowResolvingCompletion: request.kind === 'complete' }
+        );
+        if (!ownership.ok) {
+            return { ok: false, status: 'stale', reason: ownership.reason };
+        }
+
+        const paginationState = request.paginationState
+            ? structuredClone(request.paginationState)
+            : null;
+        if (paginationState && !amazonPaginationPayloadMatchesAttempt(paginationState, attempt)) {
+            return { ok: false, status: 'invalid', reason: 'pagination-attempt-mismatch' };
+        }
+
+        if (request.kind === 'clear') {
+            await chrome.storage.local.set({
+                amazonPaginationState: null,
+                amazonNavigationRecovery: null,
+                amazonParsingIncomplete: null
+            });
+            return { ok: true, status: 'committed' };
+        }
+
+        if (request.kind === 'cursor' || request.kind === 'navigate') {
+            if (!paginationState) {
+                return { ok: false, status: 'invalid', reason: 'missing-pagination-state' };
+            }
+            const mutation = { amazonPaginationState: paginationState };
+            if (Array.isArray(request.amazonOrders)) {
+                mutation.amazonOrders = structuredClone(request.amazonOrders);
+            }
+            if (request.clearRecovery === true) {
+                mutation.amazonNavigationRecovery = null;
+                mutation.amazonParsingIncomplete = null;
+            }
+            if (request.kind === 'navigate') {
+                const targetUrl = String(request.targetUrl || '');
+                if (!isSafeAmazonOrdersUrl(targetUrl)
+                    || paginationState.navigation?.targetUrl !== targetUrl) {
+                    return { ok: false, status: 'invalid', reason: 'unsafe-navigation-target' };
+                }
+                await chrome.storage.local.set(mutation);
+                await chrome.tabs.update(senderTabId, { url: targetUrl, active: true });
+                return { ok: true, status: 'navigating', navId: paginationState.navigation?.navId || null };
+            }
+            await chrome.storage.local.set(mutation);
+            return { ok: true, status: 'committed' };
+        }
+
+        if (request.kind === 'incomplete') {
+            if (!paginationState || !request.incomplete) {
+                return { ok: false, status: 'invalid', reason: 'missing-incomplete-payload' };
+            }
+            const incomplete = {
+                ...structuredClone(request.incomplete),
+                parseId: attempt.parseId,
+                runId: attempt.runId,
+                account: attempt.account,
+                parserTabId: attempt.parserTabId
+            };
+            await chrome.storage.local.set({
+                amazonPaginationState: paginationState,
+                amazonParsingIncomplete: incomplete
+            });
+            return { ok: true, status: 'committed' };
+        }
+
+        if (request.kind !== 'complete') {
+            return { ok: false, status: 'invalid', reason: 'unknown-commit-kind' };
+        }
+        if (!paginationState
+            || !['configured-limit', 'explicit-end'].includes(request.reason)
+            || paginationState.navigation) {
+            return { ok: false, status: 'invalid', reason: 'invalid-completion-state' };
+        }
+
+        const observedAt = new Date().toISOString();
+        const incomingOrders = (Array.isArray(request.orders) ? request.orders : []).map(order => ({
+            ...structuredClone(order),
+            parser_run_id: attempt.runId,
+            parser_account: attempt.account,
+            observed_at: observedAt
+        }));
+        const orderData = runtime.orderData && typeof runtime.orderData === 'object'
+            ? structuredClone(runtime.orderData)
+            : {};
+        const existingOrders = Array.isArray(orderData.Amazon?.orders)
+            ? orderData.Amazon.orders
+            : [];
+        const seen = new Set();
+        const uniqueOrders = [...incomingOrders, ...existingOrders].filter(order => {
+            const key = `${order?.order_id || ''}_${order?.track_number || ''}_${order?.product_name || ''}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+        const uniqueOrderIds = new Set(uniqueOrders.map(order => order?.order_id).filter(Boolean));
+        orderData.Amazon = {
+            orders: uniqueOrders,
+            lastParsed: observedAt,
+            totalOrders: uniqueOrders.length,
+            totalProductsCount: uniqueOrders.length,
+            uniqueOrdersCount: uniqueOrderIds.size
+        };
+
+        const cancelledSeen = new Set();
+        const cancelledOrders = [
+            ...(Array.isArray(runtime.amazonCancelledOrders) ? runtime.amazonCancelledOrders : []),
+            ...(Array.isArray(request.cancelledOrders) ? request.cancelledOrders : [])
+        ].map(item => structuredClone(item)).filter(order => {
+            const key = order?.order_id;
+            if (!key || cancelledSeen.has(key)) return false;
+            cancelledSeen.add(key);
+            return true;
+        });
+        const completedState = {
+            ...paginationState,
+            allOrders: incomingOrders,
+            completedAt: Date.now(),
+            completionReason: request.reason
+        };
+        delete completedState.incomplete;
+        const completion = {
+            ...attempt,
+            timestamp: Date.now(),
+            found: incomingOrders.length,
+            lastCompletedPage: Math.max(0, Number(completedState.currentPage || 1) - 1),
+            totalPages: completedState.totalPages,
+            reason: request.reason
+        };
+        await chrome.storage.local.set({
+            orderData,
+            amazonOrders: incomingOrders,
+            amazonCancelledOrders: cancelledOrders,
+            amazonCancelledUpdatedAt: Date.now(),
+            amazonPaginationState: completedState,
+            amazonParsingComplete: completion,
+            amazonParsingIncomplete: null,
+            amazonTimeoutAttempt: null
+        });
+        return {
+            ok: true,
+            status: 'committed',
+            found: incomingOrders.length,
+            existingCount: existingOrders.length,
+            totalCount: uniqueOrders.length,
+            uniqueOrdersCount: uniqueOrderIds.size
+        };
     });
-    return tabs.length === 1 ? tabs[0] : null;
+}
+
+async function claimAmazonTimeoutAttempt(attempt) {
+    return withAmazonAttemptMutation(async () => {
+        const state = await chrome.storage.local.get([
+            'pipelineRun', 'pipelineStage', 'multiAccountState',
+            'amazonParserTabId', 'accountSwitchStartedAt', 'amazonPaginationState',
+            'amazonParsingComplete', 'amazonTimeoutAttempt'
+        ]);
+        if (amazonCompletionMatchesAttempt(state, attempt)) {
+            return { status: 'completion-won' };
+        }
+        if (!amazonWatchdogAttemptMatches(state, attempt)) {
+            return { status: 'stale' };
+        }
+        if (amazonWatchdogAttemptIdentityMatches(state.amazonTimeoutAttempt, attempt)) {
+            return { status: state.amazonTimeoutAttempt.phase || 'resolving' };
+        }
+        await chrome.storage.local.set({
+            skipGuardAt: Date.now(),
+            amazonTimeoutAttempt: {
+                ...attempt,
+                phase: 'resolving',
+                resolvingAt: Date.now()
+            }
+        });
+        return { status: 'claimed' };
+    });
+}
+
+async function finalizeAmazonTimeoutAttempt(attempt, reason, found = 0) {
+    return withAmazonAttemptMutation(() => withPipelineRunWrite(async () => {
+        const state = await chrome.storage.local.get([
+            'pipelineRun', 'pipelineStage', 'multiAccountState',
+            'amazonParserTabId', 'accountSwitchStartedAt', 'amazonPaginationState',
+            'amazonParsingComplete', 'amazonTimeoutAttempt'
+        ]);
+        if (amazonCompletionMatchesAttempt(state, attempt)) {
+            return { status: 'completion-won' };
+        }
+        if (!amazonWatchdogAttemptMatches(state, attempt)
+            || !amazonWatchdogAttemptIdentityMatches(state.amazonTimeoutAttempt, attempt)) {
+            return { status: 'stale' };
+        }
+
+        const nextRun = applyPipelineAccountResult(
+            state.pipelineRun,
+            'amazon',
+            attempt.account,
+            { runId: attempt.runId, ok: false, reason, found }
+        );
+        if (!nextRun) return { status: 'stale' };
+        const failedMarker = {
+            ...attempt,
+            phase: 'failed',
+            reason,
+            resolvedAt: Date.now()
+        };
+        await chrome.storage.local.set({
+            pipelineRun: nextRun,
+            amazonTimeoutAttempt: failedMarker,
+            accountSwitchStartedAt: null,
+            lastAmazonProgressAt: null,
+            amazonPaginationState: null,
+            amazonNavigationGraceUntil: null,
+            amazonNavigationRecovery: null,
+            amazonParsingIncomplete: null,
+            skipGuardAt: null
+        });
+        return {
+            status: 'failed',
+            marker: failedMarker,
+            multiAccountState: state.multiAccountState,
+            pipelineStage: state.pipelineStage
+        };
+    }));
+}
+
+async function consumeAmazonCompletionMarker(expectedGeneration) {
+    const claimed = await withAmazonAttemptMutation(() => withPipelineRunWrite(async () => {
+        const state = await chrome.storage.local.get([
+            'pipelineRun', 'pipelineStage', 'multiAccountState',
+            'amazonParserTabId', 'amazonParsingComplete', 'amazonTimeoutAttempt',
+            'accountSwitchStartedAt', 'amazonPaginationState', 'amazonStageFinalizing'
+        ]);
+        const marker = state.amazonParsingComplete;
+        const account = normalizeAccountEmail(state.multiAccountState?.currentAmazonAccount);
+        // A valid completion is allowed to heal an older timeout-failure marker
+        // after a service-worker restart. The normal commit path serializes both,
+        // but this makes the restart/migration state deterministic too.
+        const ownership = marker?.timestamp
+            ? amazonAttemptRefMatchesRuntime(
+                marker,
+                { ...state, amazonTimeoutAttempt: null },
+                marker.parserTabId
+            )
+            : { ok: false };
+        const valid = ownership.ok
+            && pipelineGenerationMatches(state.pipelineStage, expectedGeneration)
+            && normalizeAccountEmail(marker.account) === account
+            && (!state.amazonPaginationState?.parseId
+                || marker.parseId === state.amazonPaginationState.parseId);
+        if (!valid) return { claimed: false };
+
+        const nextRun = applyPipelineAccountResult(
+            state.pipelineRun,
+            'amazon',
+            account,
+            { runId: marker.runId, ok: true, found: marker.found || 0 }
+        );
+        if (!nextRun) return { claimed: false };
+        await chrome.storage.local.set({
+            pipelineRun: nextRun,
+            amazonParsingComplete: null,
+            amazonTimeoutAttempt: null,
+            accountSwitchStartedAt: null,
+            lastAmazonProgressAt: null,
+            amazonNavigationGraceUntil: null,
+            amazonNavigationRecovery: null,
+            amazonParsingIncomplete: null,
+            skipGuardAt: null
+        });
+        return {
+            claimed: true,
+            marker,
+            multiAccountState: state.multiAccountState,
+            pipelineStage: state.pipelineStage
+        };
+    }));
+    if (!claimed.claimed) return false;
+
+    isMultiAccountParsing = !!claimed.multiAccountState?.isMultiAccountParsing;
+    amazonAccountsQueue = claimed.multiAccountState?.amazonAccountsQueue || [];
+    currentAmazonAccount = claimed.multiAccountState?.currentAmazonAccount || null;
+    const accountName = String(currentAmazonAccount || 'current').split('@')[0];
+    parseReport.stores[`amazon_${accountName}`] = {
+        found: claimed.marker.found || 0,
+        status: '✅'
+    };
+
+    if (!await waitForScreenshotsDrained()) {
+        return stopPipelineForScreenshotDrain(
+            'Amazon completion screenshots blocked',
+            expectedGeneration
+        );
+    }
+    const gate = (await chrome.storage.local.get(['pipelineStage'])).pipelineStage;
+    if (!gate?.active
+        || !pipelineGenerationMatches(gate, expectedGeneration)
+        || gate.stages?.[gate.currentIndex] !== 'amazon') {
+        return false;
+    }
+    if (isMultiAccountParsing && amazonAccountsQueue.length > 0) {
+        return switchToNextAmazonAccount(expectedGeneration);
+    }
+    if (isMultiAccountParsing) {
+        isMultiAccountParsing = false;
+        currentAmazonAccount = null;
+        return beginAmazonStageFinalization(expectedGeneration);
+    }
+    return true;
 }
 
 async function retryAmazonPaginationNavigation(stored, now, timeoutReason) {
+    if (amazonNavigationRetryInFlight) return amazonNavigationRetryInFlight;
+    amazonNavigationRetryInFlight = retryAmazonPaginationNavigationOnce(stored, now, timeoutReason);
+    try {
+        return await amazonNavigationRetryInFlight;
+    } finally {
+        amazonNavigationRetryInFlight = null;
+    }
+}
+
+async function retryAmazonPaginationNavigationOnce(stored, now, timeoutReason) {
+    if (!amazonPaginationOwnershipMatches(stored.amazonPaginationState, stored)) {
+        return { status: 'stale', reason: 'pagination-ownership-changed' };
+    }
     const decision = getAmazonNavigationRetryDecision({
         paginationState: stored.amazonPaginationState,
+        recovery: stored.amazonNavigationRecovery,
         timedOut: true,
         now
     });
-    if (!decision.retry) return false;
+    if (!decision.retry) {
+        return {
+            status: decision.reason === 'retry-gap' ? 'waiting' : 'unrecoverable',
+            reason: decision.reason
+        };
+    }
 
     const tab = await getAmazonParserTab(stored.amazonParserTabId);
     if (!tab?.id) {
@@ -2638,23 +5354,44 @@ async function retryAmazonPaginationNavigation(stored, now, timeoutReason) {
             targetPage: decision.targetPage,
             timeoutReason
         });
-        return false;
+        return { status: 'unrecoverable', reason: 'exact-parser-tab-not-found' };
     }
 
-    const paginationState = {
-        ...stored.amazonPaginationState,
-        navigation: {
-            ...stored.amazonPaginationState.navigation,
-            retryCount: decision.retryCount,
-            lastRetryAt: now,
-            startedAt: now,
-            timeoutReason
-        }
-    };
-    // Commit the retry generation and mutex before navigation. This survives an
-    // MV3 worker restart and prevents the 3-second alarm from issuing duplicates.
+    // Re-read after tabs.get under the same arbiter used by content commits and
+    // account transitions. Cursor/recovery metadata and tabs.update are one
+    // ordered mutation, not a sequence of TOCTOU checks.
+    return withAmazonAttemptMutation(async () => {
+    const fresh = await chrome.storage.local.get([
+        'amazonPaginationState', 'amazonNavigationRecovery', 'amazonParserTabId',
+        'pipelineRun', 'pipelineStage', 'multiAccountState'
+    ]);
+    const freshDecision = getAmazonNavigationRetryDecision({
+        paginationState: fresh.amazonPaginationState,
+        recovery: fresh.amazonNavigationRecovery,
+        timedOut: true,
+        now
+    });
+    if (!amazonPaginationOwnershipMatches(fresh.amazonPaginationState, fresh)
+        || fresh.amazonPaginationState.parseId !== stored.amazonPaginationState.parseId
+        || !freshDecision.retry
+        || freshDecision.navId !== decision.navId
+        || fresh.amazonParserTabId !== tab.id) {
+        return { status: 'stale', reason: freshDecision.reason || 'navigation-generation-changed' };
+    }
+
+    // Persist only retry metadata; amazonPaginationState/allOrders stays owned
+    // by the content script and cannot be rolled back by a stale watchdog.
     await chrome.storage.local.set({
-        amazonPaginationState: paginationState,
+        amazonNavigationRecovery: {
+            navId: freshDecision.navId,
+            parseId: fresh.amazonPaginationState.parseId,
+            runId: fresh.amazonPaginationState.runId,
+            account: fresh.amazonPaginationState.account,
+            parserTabId: tab.id,
+            retryCount: freshDecision.retryCount,
+            lastRetryAt: now,
+            timeoutReason
+        },
         amazonParserTabId: tab.id,
         amazonNavigationGraceUntil: now + AMAZON_NAVIGATION_GRACE_MS,
         lastAmazonProgressAt: now,
@@ -2662,23 +5399,38 @@ async function retryAmazonPaginationNavigation(stored, now, timeoutReason) {
     });
     await logMultiAccountStep('navigation-retry:start', {
         tabId: tab.id,
-        targetPage: decision.targetPage,
-        retryCount: decision.retryCount,
+        targetPage: freshDecision.targetPage,
+        retryCount: freshDecision.retryCount,
         timeoutReason,
-        targetUrl: decision.targetUrl.slice(0, 200)
+        targetUrl: freshDecision.targetUrl.slice(0, 200)
     });
+
+    // Final generation check, immediately followed by the update call without
+    // another await. This closes the page-18-arrived-during-log race.
+    const guard = await chrome.storage.local.get([
+        'amazonPaginationState', 'amazonParserTabId',
+        'pipelineRun', 'pipelineStage', 'multiAccountState'
+    ]);
+    if (!amazonPaginationOwnershipMatches(guard.amazonPaginationState, guard)
+        || guard.amazonPaginationState?.parseId !== fresh.amazonPaginationState.parseId
+        || guard.amazonPaginationState?.navigation?.navId !== freshDecision.navId
+        || guard.amazonParserTabId !== tab.id) {
+        return { status: 'stale', reason: 'navigation-arrived-before-update' };
+    }
     try {
-        await chrome.tabs.update(tab.id, { url: decision.targetUrl });
-        return true;
+        const updatePromise = chrome.tabs.update(tab.id, { url: freshDecision.targetUrl });
+        await updatePromise;
+        return { status: 'retried', navId: freshDecision.navId, targetPage: freshDecision.targetPage };
     } catch (e) {
         await logMultiAccountStep('navigation-retry:failed', {
             tabId: tab.id,
-            targetPage: decision.targetPage,
-            retryCount: decision.retryCount,
+            targetPage: freshDecision.targetPage,
+            retryCount: freshDecision.retryCount,
             reason: String(e?.message || e)
         });
-        return false;
+        return { status: 'unrecoverable', reason: String(e?.message || e) };
     }
+    });
 }
 
 async function captureAmazonTabWithDebugger(tabId) {
@@ -2740,7 +5492,7 @@ const PIPELINE_STAGE_MAX_MS = {
 // 17→18.08). Эти минуты не являются зависанием парсера и не должны съедать
 // stage cap. Кредит всё равно ограничен: сломанная/вечная очередь не сможет
 // скрывать зависшую стадию бесконечно.
-const SCREENSHOT_STAGE_BUDGET_MAX_MS = 45 * 60_000;
+const SCREENSHOT_STAGE_BUDGET_MAX_MS = 6 * 60 * 60_000;
 chrome.alarms.create(PIPELINE_WATCHDOG_ALARM, { delayInMinutes: 1, periodInMinutes: 1 });
 
 function getScreenshotStageBudgetCreditMs({
@@ -2798,6 +5550,7 @@ async function handlePipelineWatchdog() {
   ]);
   const p = r.pipelineStage;
   if (!p || !p.active) return;
+  const generation = pipelineGenerationFromStage(p);
   const stage = p.stages[p.currentIndex];
   if (stage === 'done') return;
   // stageStartedAt is stamped in runPipelineStage; fall back to pipeline startedAt.
@@ -2816,6 +5569,8 @@ async function handlePipelineWatchdog() {
   if (r.screenshotStageBudget?.activeSince && !queueHasItems) {
     await closeStaleScreenshotStageBudget(p, r.screenshotStageBudget);
   }
+  const afterBudget = (await chrome.storage.local.get(['pipelineStage'])).pipelineStage;
+  if (!afterBudget?.active || !pipelineGenerationMatches(afterBudget, generation)) return;
   const elapsed = getEffectivePipelineStageElapsedMs({
     now,
     startedAt,
@@ -2825,21 +5580,79 @@ async function handlePipelineWatchdog() {
   if (elapsed < cap) return;
 
   console.warn(`[pipelineWatchdog] stage '${stage}' stuck ${Math.round(elapsed/1000)}s effective (${Math.round(rawElapsed/1000)}s wall, screenshot credit ${Math.round(screenshotCreditMs/1000)}s, cap ${Math.round(cap/1000)}s) — force-advancing so the run can still upload`);
+  const finalizationState = await chrome.storage.local.get([
+    'pipelineStage',
+    stage === 'iherb' ? 'iherbStageFinalizing' : 'amazonStageFinalizing',
+    stage === 'iherb' ? 'iherbFinalReturnConfirmed' : 'amazonFinalReturnConfirmed'
+  ]);
+  const finalizing = stage === 'iherb'
+    ? finalizationState.iherbStageFinalizing
+    : stage === 'amazon'
+      ? finalizationState.amazonStageFinalizing
+      : null;
+  const confirmation = stage === 'iherb'
+    ? finalizationState.iherbFinalReturnConfirmed
+    : stage === 'amazon'
+      ? finalizationState.amazonFinalReturnConfirmed
+      : null;
+  if (finalizing && pipelineGenerationMatches(finalizing, generation)) {
+    if (finalReturnConfirmationMatches(confirmation, finalizing)) {
+      if (stage === 'iherb') await resumeIherbStageFinalization(finalizing, generation);
+      else await resumeAmazonStageFinalization(finalizing, generation);
+      return;
+    }
+    const failedMarker = {
+      ...finalizing,
+      returnStatus: 'failed',
+      resolvedAt: Date.now(),
+      reason: 'final-primary-return-timeout'
+    };
+    await chrome.storage.local.set(stage === 'iherb'
+      ? { iherbStageFinalizing: failedMarker }
+      : { amazonStageFinalizing: failedMarker });
+    const finalizingGate = (await chrome.storage.local.get(['pipelineStage'])).pipelineStage;
+    if (!finalizingGate?.active
+        || !pipelineGenerationMatches(finalizingGate, generation)) return;
+    if (stage === 'iherb') await resumeIherbStageFinalization(failedMarker, generation);
+    else await resumeAmazonStageFinalization(failedMarker, generation);
+    return;
+  }
   // Mark the stuck store 'completed' so the final upload gate can pass without it.
   // It TIMED OUT (not succeeded) — its data just won't be fresh this run; the other
   // stores still upload. Mirrors the proven iHerb-watchdog pattern (storesCompleted +
   // checkAllStoresCompleted from alarm context).
   if (stage === 'ebay' || stage === 'iherb' || stage === 'amazon') {
-    if (typeof storesCompleted === 'object') storesCompleted[stage] = true;
-    setParserLock(stage, false);
+    const runState = await chrome.storage.local.get(['pipelineRun']);
+    if (runState.pipelineRun?.id !== generation?.runId
+        || !['starting', 'running'].includes(runState.pipelineRun?.status)) return;
+    const expected = runState.pipelineRun?.expected?.[stage] || [];
+    if (!await markPipelineStageTimeout(stage, expected, generation)) return;
+    const beforeSideEffects = (await chrome.storage.local.get(['pipelineStage'])).pipelineStage;
+    if (!beforeSideEffects?.active
+        || !pipelineGenerationMatches(beforeSideEffects, generation)) return;
     try { if (!parseReport.stores[stage]) parseReport.stores[stage] = { found: 0, status: '⏱' }; } catch (_) {}
   }
   sendTelegramMessage(`⏱ Парс: стадия «${stage}» зависла (${Math.round(elapsed/60000)} мин) — пропускаю, чтобы прогон дошёл до выгрузки в таблицу`).catch(() => {});
+  if (stage === 'iherb') {
+    await finalizeIherbStage(undefined, {
+      fromCaptcha: true,
+      expectedGeneration: generation
+    });
+    return;
+  }
+  if (stage === 'amazon') {
+    await beginAmazonStageFinalization(generation);
+    return;
+  }
+  if (typeof storesCompleted === 'object') storesCompleted[stage] = true;
+  setParserLock(stage, false);
   // Guard: only advance if we're still on the stuck stage (a late real 'Done ✅' may
   // have advanced it already — then this is a no-op via advancePipelineStage's checks).
   const cur = (await chrome.storage.local.get(['pipelineStage'])).pipelineStage;
-  if (cur && cur.active && cur.stages[cur.currentIndex] === stage) {
-    await advancePipelineStage();
+  if (cur && cur.active
+      && pipelineGenerationMatches(cur, generation)
+      && cur.stages[cur.currentIndex] === stage) {
+    await advancePipelineStage(generation);
   }
   if (typeof checkAllStoresCompleted === 'function') checkAllStoresCompleted();
 }
@@ -2854,11 +5667,88 @@ const SHEETS_UPLOAD_WATCHDOG_ALARM = 'sheetsUploadWatchdog';
 const SHEETS_UPLOAD_MAX_RETRIES = 12;
 chrome.alarms.create(SHEETS_UPLOAD_WATCHDOG_ALARM, { delayInMinutes: 2, periodInMinutes: 2 });
 
+// The durable pending marker lets an MV3 restart resume an upload, but it does
+// not serialize two callbacks inside the same service-worker lifetime. Keep a
+// separate lock around the actual read/dedupe/write transaction so the normal
+// completion timer and the alarm watchdog can never append the same run twice.
+let finalSheetsUploadInFlight = null;
+
+function getOrStartFinalSheetsUpload(runId, { source = 'unknown', beforeStart = null } = {}) {
+    if (!runId) throw new Error('missing final Sheets upload runId');
+    if (finalSheetsUploadInFlight) {
+        if (finalSheetsUploadInFlight.runId !== runId) {
+            throw new Error(`Sheets upload ${finalSheetsUploadInFlight.runId} is still active`);
+        }
+        return {
+            joined: true,
+            source: finalSheetsUploadInFlight.source,
+            promise: finalSheetsUploadInFlight.promise
+        };
+    }
+
+    const record = { runId, source, promise: null };
+    record.promise = (async () => {
+        const state = await chrome.storage.local.get([
+            'pipelineRun', 'pipelineStage', 'pendingSheetsUpload',
+            'lastSheetsUploadRunId', 'lastSheetsUploadOkAt'
+        ]);
+        const run = state.pipelineRun;
+        const stage = state.pipelineStage;
+        if (run?.id !== runId
+            || !['completed', 'degraded'].includes(run?.status)
+            || !Number.isFinite(run?.finishedAt)
+            || stage?.runId !== runId
+            || stage?.active !== false
+            || stage?.stages?.[stage.currentIndex] !== 'done') {
+            throw new Error('final Sheets upload does not own the terminal pipeline run');
+        }
+
+        if (state.lastSheetsUploadRunId === runId
+            && Number.isFinite(state.lastSheetsUploadOkAt)
+            && state.lastSheetsUploadOkAt >= run.finishedAt) {
+            if (state.pendingSheetsUpload?.runId === runId) {
+                await chrome.storage.local.set({
+                    pendingSheetsUpload: null,
+                    sheetsRetryCount: 0,
+                    sheetsRetryGaveUp: false
+                });
+            }
+            return { status: 'already-uploaded', runId };
+        }
+        if (state.pendingSheetsUpload?.runId !== runId) {
+            throw new Error('final Sheets upload has no matching durable pending marker');
+        }
+
+        // The watchdog increments its persistent retry counter only when it
+        // really owns a new attempt. A caller joining an existing timer never
+        // consumes another retry.
+        if (typeof beforeStart === 'function') await beforeStart();
+        await uploadToSheets(runId);
+        await uploadLogsToSheet();
+        await markSheetsUploadSuccess(runId);
+        return { status: 'uploaded', runId };
+    })();
+    finalSheetsUploadInFlight = record;
+    const clear = () => {
+        if (finalSheetsUploadInFlight === record) finalSheetsUploadInFlight = null;
+    };
+    record.promise.then(clear, clear);
+    return { joined: false, source, promise: record.promise };
+}
+
 // Единая точка фиксации «данные РЕАЛЬНО в таблице». Ставит честные ключи, гасит
 // маркер и сбрасывает счётчик ретраев. Вызывается и в штатном пути
 // (checkAllStoresCompleted), и в alarm-ретрае — честный флаг всегда один и тот же.
-async function markSheetsUploadSuccess() {
+async function markSheetsUploadSuccess(runId) {
+    if (!runId) throw new Error('missing Sheets upload runId');
     const now = Date.now();
+    const runState = await chrome.storage.local.get(['pipelineRun', 'pendingSheetsUpload']);
+    if (runState.pipelineRun?.id !== runId
+        || !['completed', 'degraded'].includes(runState.pipelineRun?.status)
+        || !Number.isFinite(runState.pipelineRun?.finishedAt)
+        || runState.pendingSheetsUpload?.runId !== runId) {
+        throw new Error('stale Sheets upload cannot stamp the current run');
+    }
     // Дата «зелёного» прогона по таймзоне склада (America/New_York), YYYY-MM-DD.
     let nyDate = '';
     try {
@@ -2866,13 +5756,17 @@ async function markSheetsUploadSuccess() {
     } catch (_) {
         nyDate = new Date().toISOString().split('T')[0];
     }
+    const successfulRunFields = runState.pipelineRun.status === 'completed' ? {
+        lastSuccessfulDailyRunAt: now,
+        lastSuccessfulDailyRunDate: nyDate
+    } : {};
     await chrome.storage.local.set({
         lastSheetsUploadOkAt: now,       // существующий ключ — читает внешний сторож
-        lastSuccessfulDailyRunAt: now,   // честный флаг «данные подтверждённо в таблице»
-        lastSuccessfulDailyRunDate: nyDate,
+        lastSheetsUploadRunId: runId,
         pendingSheetsUpload: null,
         sheetsRetryCount: 0,
-        sheetsRetryGaveUp: false
+        sheetsRetryGaveUp: false,
+        ...successfulRunFields
     });
 }
 
@@ -2922,23 +5816,27 @@ async function handleSheetsUploadWatchdog() {
 
     const s = await chrome.storage.local.get([
         'lastDailyAutoParseStatus', 'lastDailyAutoParseFinishedAt', 'lastSheetsUploadOkAt',
-        'pendingSheetsUpload', 'sheetsRetryCount', 'sheetsRetryGaveUp', 'pipelineStage'
+        'pendingSheetsUpload', 'sheetsRetryCount', 'sheetsRetryGaveUp', 'pipelineStage',
+        'pipelineRun', 'lastSheetsUploadRunId'
     ]);
 
     // Никаких гонок с активной выгрузкой: не трогаем при свежем прогоне или
     // не-completed статусе.
     if (s.pipelineStage?.active) return;
-    if (s.lastDailyAutoParseStatus !== 'completed') return;
+    if (!['completed', 'degraded'].includes(s.lastDailyAutoParseStatus)) return;
     if (!s.lastDailyAutoParseFinishedAt) return;
 
     const pending = s.pendingSheetsUpload;
     if (!pending) return;
-    // Маркер именно этого прогона (forSlot = слот 23:00). Стабилен весь 24ч-интервал,
-    // ретрай-окно (12×2мин ≈ 24 мин) внутри него — сравнение точное.
-    if (pending.forSlot !== getLastDailyRunSlot(new Date()).getTime()) return;
+    if (!pending.runId
+        || pending.runId !== s.pipelineRun?.id
+        || !['completed', 'degraded'].includes(s.pipelineRun?.status)
+        || s.pipelineStage?.runId !== pending.runId) return;
 
     // Уже залито (штатным путём или прошлым тиком) — гасим маркер, no-op дальше.
-    if (s.lastSheetsUploadOkAt && s.lastSheetsUploadOkAt >= s.lastDailyAutoParseFinishedAt) {
+    if (s.lastSheetsUploadRunId === pending.runId
+        && s.lastSheetsUploadOkAt
+        && s.lastSheetsUploadOkAt >= s.lastDailyAutoParseFinishedAt) {
         await chrome.storage.local.set({ pendingSheetsUpload: null, sheetsRetryCount: 0, sheetsRetryGaveUp: false });
         return;
     }
@@ -2952,12 +5850,18 @@ async function handleSheetsUploadWatchdog() {
         return; // no-op пока не появится новый pendingSheetsUpload
     }
 
-    // Инкремент ДО попытки — чтобы бесконечно висящий upload не крутил счётчик вечно.
-    await chrome.storage.local.set({ sheetsRetryCount: retryCount + 1 });
     try {
-        await uploadToSheets();
-        await uploadLogsToSheet();
-        await markSheetsUploadSuccess();
+        const upload = getOrStartFinalSheetsUpload(pending.runId, {
+            source: 'watchdog',
+            // Инкремент ДО собственной попытки — чтобы бесконечно висящий upload
+            // не крутил счётчик вечно. При join этот callback не запускается.
+            beforeStart: () => chrome.storage.local.set({ sheetsRetryCount: retryCount + 1 })
+        });
+        if (upload.joined) {
+            console.log(`⏳ sheetsUploadWatchdog: присоединился к ${upload.source}`);
+        }
+        await upload.promise;
+        if (upload.joined) return;
         console.log(`✅ sheetsUploadWatchdog: догнал выгрузку (попытка ${retryCount + 1})`);
     } catch (e) {
         console.error(`❌ sheetsUploadWatchdog: попытка ${retryCount + 1} провалилась:`, e?.message || e);
@@ -2981,12 +5885,59 @@ function stopCompletionWatchdog() {
 
 // iHerb watchdog handler — запускается раз в минуту.
 // Проверяет если cs auto-parse залип >4 минут — retry tab.update (one shot), потом fail.
-async function handleIherbWatchdog() {
-    const stored = await chrome.storage.local.get([
+function iherbWatchdogAttemptFromState(state) {
+    return {
+        generation: pipelineGenerationFromStage(state?.pipelineStage),
+        runId: state?.pipelineRun?.id || null,
+        stageStartedAt: state?.pipelineStage?.stageStartedAt || null,
+        account: normalizeAccountEmail(state?.multiAccountIherbState?.currentIherbAccount),
+        parserTabId: state?.iherbParserTabId || null,
+        parseStartedAt: state?.iherbParseStartedAt ?? null,
+        retried: state?.iherbWatchdogRetried ?? null,
+        switchStartedAt: state?.iherbSwitchStartedAt ?? null,
+        switchInProgress: state?.iherbSwitchInProgress === true,
+        pendingRunId: state?.pendingIherbSwitch?.runId || null,
+        pendingAccount: normalizeAccountEmail(state?.pendingIherbSwitch?.email)
+    };
+}
+
+function iherbWatchdogAttemptMatches(state, attempt) {
+    const current = iherbWatchdogAttemptFromState(state);
+    return !!attempt?.runId
+        && !!attempt?.account
+        && state?.pipelineStage?.active === true
+        && state.pipelineStage.stages?.[state.pipelineStage.currentIndex] === 'iherb'
+        && ['starting', 'running'].includes(state?.pipelineRun?.status)
+        && current.runId === attempt.runId
+        && pipelineGenerationMatches(state.pipelineStage, attempt.generation)
+        && current.account === attempt.account
+        && current.parserTabId === attempt.parserTabId
+        && current.attemptId === attempt.attemptId
+        && current.parseStartedAt === attempt.parseStartedAt
+        && current.retried === attempt.retried
+        && current.switchStartedAt === attempt.switchStartedAt
+        && current.switchInProgress === attempt.switchInProgress
+        && current.pendingRunId === attempt.pendingRunId
+        && current.pendingAccount === attempt.pendingAccount;
+}
+
+async function readIherbWatchdogState() {
+    return chrome.storage.local.get([
         'iherbParseStartedAt', 'iherbWatchdogRetried',
-        'iherbSwitchInProgress', 'iherbSwitchStartedAt',
-        'multiAccountIherbState', 'iherbParserTabId', 'pipelineStage'
+        'iherbParseAttemptId', 'iherbTimeoutAttempt', 'iherbParsingComplete',
+        'iherbSwitchInProgress', 'iherbSwitchStartedAt', 'pendingIherbSwitch',
+        'multiAccountIherbState', 'iherbParserTabId', 'pipelineRun', 'pipelineStage'
     ]);
+}
+
+async function handleIherbWatchdog() {
+    const stored = await readIherbWatchdogState();
+    const attempt = iherbWatchdogAttemptFromState(stored);
+    if (!iherbWatchdogAttemptMatches(stored, attempt)) return;
+    if (iherbAttemptIdentityMatches(stored.iherbParsingComplete, attempt)) {
+        await consumeIherbCompletionMarker(attempt.generation);
+        return;
+    }
 
     // Ветка A: переключение аккаунта застряло. Это случай когда мы выставили
     // iherbSwitchInProgress=true в switchToNextIherbAccount, но cs-парсер так
@@ -3001,21 +5952,17 @@ async function handleIherbWatchdog() {
         if (switchElapsed >= IHERB_SWITCH_TIMEOUT_MS) {
             const acc = stored.multiAccountIherbState?.currentIherbAccount || 'unknown';
             console.log(`[iherbWatchdog] switch deadlock: acc=${acc}, elapsed=${Math.round(switchElapsed/1000)}s`);
+            const fresh = await readIherbWatchdogState();
+            if (!iherbWatchdogAttemptMatches(fresh, attempt)) return;
             sendTelegramMessage(`🚫 iHerb (${acc.split('@')[0]}) переключение зависло ${Math.round(switchElapsed/60000)} мин — двигаю pipeline`).catch(()=>{});
 
-            // Снимаем флаги switch чтобы handleIherbSwitchFailure не споткнулся
-            // на повторе и сразу прошёл по retry/skip-логике.
-            await chrome.storage.local.remove([
-                'iherbSwitchInProgress', 'iherbSwitchStartedAt', 'pendingIherbSwitch'
-            ]);
-
             // Восстановим in-memory state на случай если SW рестартил между alarm-тиками.
-            if (stored.multiAccountIherbState) {
-                isMultiAccountIherb = stored.multiAccountIherbState.isMultiAccountIherb;
-                iherbAccountsQueue = stored.multiAccountIherbState.iherbAccountsQueue || [];
-                currentIherbAccount = stored.multiAccountIherbState.currentIherbAccount;
+            if (fresh.multiAccountIherbState) {
+                isMultiAccountIherb = fresh.multiAccountIherbState.isMultiAccountIherb;
+                iherbAccountsQueue = fresh.multiAccountIherbState.iherbAccountsQueue || [];
+                currentIherbAccount = fresh.multiAccountIherbState.currentIherbAccount;
             }
-            await handleIherbSwitchFailure(acc, 'switch_timeout').catch(e => {
+            await handleIherbSwitchFailure(acc, 'switch_timeout', attempt.runId).catch(e => {
                 console.warn('[iherbWatchdog] handleIherbSwitchFailure threw:', e?.message || e);
             });
         }
@@ -3046,13 +5993,50 @@ async function handleIherbWatchdog() {
 
     const heartbeatAge = heartbeat ? Date.now() - heartbeat.ts : null;
     console.log(`[iherbWatchdog] iHerb stuck: acc=${acc}, elapsed=${Math.round(elapsed/1000)}s, heartbeat=${JSON.stringify(heartbeat)}, hbAge=${heartbeatAge}`);
+    const afterHeartbeat = await readIherbWatchdogState();
+    if (!iherbWatchdogAttemptMatches(afterHeartbeat, attempt)) {
+        console.warn('⏭ iHerb watchdog attempt changed while reading heartbeat');
+        return;
+    }
 
     if (!stored.iherbWatchdogRetried) {
         // First retry: reload tab → cs снова auto-parse'нет.
-        await chrome.storage.local.set({ iherbWatchdogRetried: true, iherbParseStartedAt: Date.now() });
+        const retryStartedAt = Date.now();
+        const retryAttemptId = `${attempt.runId}:${attempt.account}:${retryStartedAt}:${Math.random().toString(36).slice(2, 8)}`;
+        const rotation = await withIherbAttemptMutation(async () => {
+            const fresh = await readIherbWatchdogState();
+            if (iherbAttemptIdentityMatches(fresh.iherbParsingComplete, attempt)) {
+                return { status: 'completion-won' };
+            }
+            if (!iherbWatchdogAttemptMatches(fresh, attempt)) return { status: 'stale' };
+            await chrome.storage.local.set({
+                iherbWatchdogRetried: true,
+                iherbParseStartedAt: retryStartedAt,
+                iherbParseAttemptId: retryAttemptId,
+                iherbTimeoutAttempt: null,
+                iherbParsingComplete: null
+            });
+            return { status: 'rotated' };
+        });
+        if (rotation.status === 'completion-won') {
+            await consumeIherbCompletionMarker(attempt.generation);
+            return;
+        }
+        if (rotation.status !== 'rotated') return;
         console.log(`⚠️ iHerb (${acc.split('@')[0]}) залип ${Math.round(elapsed/1000)}с, retry...`);
         if (tabId) {
             try {
+                const retryGate = await readIherbWatchdogState();
+                const retryOwned = retryGate.pipelineStage?.active === true
+                    && pipelineGenerationMatches(retryGate.pipelineStage, attempt.generation)
+                    && retryGate.pipelineStage.stages?.[retryGate.pipelineStage.currentIndex] === 'iherb'
+                    && retryGate.pipelineRun?.id === attempt.runId
+                    && normalizeAccountEmail(retryGate.multiAccountIherbState?.currentIherbAccount) === attempt.account
+                    && retryGate.iherbParserTabId === tabId
+                    && retryGate.iherbWatchdogRetried === true
+                    && retryGate.iherbParseStartedAt === retryStartedAt
+                    && retryGate.iherbParseAttemptId === retryAttemptId;
+                if (!retryOwned) return;
                 await chrome.tabs.update(tabId, { url: 'https://secure.iherb.com/myaccount/orders', active: true });
                 console.log('[iherbWatchdog] retry: tab.update sent');
             } catch (e) {
@@ -3065,22 +6049,31 @@ async function handleIherbWatchdog() {
     // Already retried — fail this account, move forward.
     console.log(`[iherbWatchdog] Already retried — failing iherb acc=${acc}, moving to next`);
     sendTelegramMessage(`🚫 iHerb (${acc.split('@')[0]}) не отвечает после retry — пропускаю`).catch(()=>{});
-    await chrome.storage.local.remove(['iherbParseStartedAt', 'iherbWatchdogRetried']);
+    // Timeout and a late content completion compete under one exact-attempt
+    // arbiter. The winner is durable before any queue mutation; a late Done can
+    // neither erase the failure nor shift the iHerb queue a second time.
+    const resolution = await commitIherbTimeoutOutcome(attempt, 'parse_timeout');
+    if (resolution.status === 'completion-won') {
+        await consumeIherbCompletionMarker(attempt.generation);
+        return;
+    }
+    if (resolution.status !== 'failed') return;
 
     // Restore in-memory state if SW restarted between alarm ticks
-    if (stored.multiAccountIherbState) {
-        isMultiAccountIherb = stored.multiAccountIherbState.isMultiAccountIherb;
-        iherbAccountsQueue = stored.multiAccountIherbState.iherbAccountsQueue || [];
-        currentIherbAccount = stored.multiAccountIherbState.currentIherbAccount;
+    if (resolution.multiAccountIherbState) {
+        isMultiAccountIherb = resolution.multiAccountIherbState.isMultiAccountIherb;
+        iherbAccountsQueue = resolution.multiAccountIherbState.iherbAccountsQueue || [];
+        currentIherbAccount = resolution.multiAccountIherbState.currentIherbAccount;
     }
     if (isMultiAccountIherb && iherbAccountsQueue.length > 0) {
-        await switchToNextIherbAccount();
+        await switchToNextIherbAccount(attempt.generation);
     } else if (isMultiAccountIherb) {
         // Очередь пуста, но стадия ещё не закрыта — закрываем через единый
         // chokepoint (возврат на primary + roster + алерт + advance pipeline).
         // Guard `isMultiAccountIherb` + внутренний storesCompleted-guard
         // finalizeIherbStage защищают от двойного завершения.
-        await finalizeIherbStage(tabId).catch(e => console.warn('finalizeIherbStage failed:', e?.message || e));
+        await finalizeIherbStage(tabId, { expectedGeneration: attempt.generation })
+            .catch(e => console.warn('finalizeIherbStage failed:', e?.message || e));
     }
 }
 
@@ -3095,6 +6088,25 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
         });
 
         await ensureDailyAlarm('daily-alarm-fired');
+
+        const now = new Date();
+        const expectedSlot = getLastDailyRunSlot(now).getTime();
+        const scheduledTime = Number(alarm.scheduledTime) || 0;
+        const slotDriftMs = Math.abs(scheduledTime - expectedSlot);
+        const fireAgeMs = now.getTime() - scheduledTime;
+        if (!scheduledTime
+            || slotDriftMs > DAILY_ALARM_DRIFT_TOLERANCE_MS
+            || fireAgeMs < -DAILY_ALARM_DRIFT_TOLERANCE_MS
+            || fireAgeMs > DAILY_MISSED_RUN_CATCHUP_MS) {
+            await addDailyDiagnostic('alarm-stale-skip', {
+                scheduledTime: scheduledTime || null,
+                expectedSlot,
+                slotDriftMs,
+                fireAgeMs
+            });
+            console.warn('⏸ Ignoring stale/wrong-slot daily alarm');
+            return;
+        }
 
         const settings = await chrome.storage.local.get(['dailyAutoParseEnabled']);
         if (settings.dailyAutoParseEnabled === false) {
@@ -3145,7 +6157,8 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     const stored = await chrome.storage.local.get([
         'amazonParsingComplete', 'multiAccountState', 'accountSwitchStartedAt',
         'lastAmazonProgressAt', 'skipGuardAt', 'amazonPaginationState',
-        'amazonNavigationGraceUntil', 'amazonParserTabId'
+        'amazonNavigationGraceUntil', 'amazonNavigationRecovery',
+        'amazonParsingIncomplete', 'amazonParserTabId', 'pipelineRun', 'pipelineStage'
     ]);
 
     // Skip-guard mutex: alarm fires every 3s, but skip-path takes 5-10s
@@ -3159,17 +6172,30 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
         return;
     }
 
+    const incompleteAccount = normalizeAccountEmail(stored.amazonParsingIncomplete?.account);
+    const activeAmazonAccount = normalizeAccountEmail(stored.multiAccountState?.currentAmazonAccount);
+    const matchingIncomplete = !!stored.amazonParsingIncomplete
+        && stored.amazonParsingIncomplete.runId === stored.pipelineRun?.id
+        && incompleteAccount
+        && incompleteAccount === activeAmazonAccount
+        && stored.amazonParsingIncomplete.parserTabId === stored.amazonParserTabId;
+    if (stored.amazonParsingIncomplete && !matchingIncomplete) {
+        await chrome.storage.local.set({ amazonParsingIncomplete: null });
+    }
+
     // TIMEOUT: progress-based (idle) + hard cap.
     // Old logic killed after 90s from switch-start — fatally short for accounts with
     // 20 pages (needs 5-7 min). New logic: kill if no parsing progress for 90s, or
     // if total time exceeds 20-minute hard cap (bumped from 10min after 2026-04-22
     // observation: ipochtoy finished 19 pages + started page 20 at exactly 600s).
-    if (!stored.amazonParsingComplete && stored.accountSwitchStartedAt && stored.multiAccountState) {
+    const activeAttempt = amazonWatchdogAttemptFromState(stored);
+    const hasMatchingCompletion = amazonCompletionMatchesAttempt(stored, activeAttempt);
+    if (!hasMatchingCompletion && stored.accountSwitchStartedAt && stored.multiAccountState) {
         const now = Date.now();
         const totalElapsed = now - stored.accountSwitchStartedAt;
         const sinceLastProgress = now - (stored.lastAmazonProgressAt || stored.accountSwitchStartedAt);
         const HARD_CAP_MS = 1_200_000; // 20 min absolute
-        const isIdleTimeout = sinceLastProgress > ACCOUNT_PARSE_TIMEOUT_MS;
+        const isIdleTimeout = matchingIncomplete || sinceLastProgress > ACCOUNT_PARSE_TIMEOUT_MS;
         const isHardCap = isAmazonHardCapExpired({
             totalElapsed,
             hardCapMs: HARD_CAP_MS,
@@ -3177,30 +6203,40 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             graceUntil: stored.amazonNavigationGraceUntil
         });
         if (isIdleTimeout || isHardCap) {
-            const timeoutReason = isHardCap ? 'hard-cap 20min' : 'no progress';
+            const timeoutReason = isHardCap
+                ? 'hard-cap 20min'
+                : (matchingIncomplete
+                    ? `incomplete: ${stored.amazonParsingIncomplete.reason || 'content error'}`
+                    : 'no progress');
             // A page transition is recoverable: state.currentPage already points
             // to the next page and all previous orders are durably saved. Retry
             // the exact URL before discarding the rest of this account.
-            if (await retryAmazonPaginationNavigation(stored, now, timeoutReason)) {
-                console.warn(`[amazonWatchdog] retried pending navigation to page ${stored.amazonPaginationState?.currentPage}`);
+            const recovery = await retryAmazonPaginationNavigation(stored, now, timeoutReason);
+            if (recovery.status === 'retried' || recovery.status === 'waiting' || recovery.status === 'stale') {
+                console.warn(`[amazonWatchdog] navigation recovery ${recovery.status} for page ${stored.amazonPaginationState?.currentPage}`);
                 return;
             }
 
-            // Set skip-guard IMMEDIATELY before any long awaits — this is the mutex
-            // that prevents concurrent alarm handlers from firing duplicate timeouts.
-            await chrome.storage.local.set({ skipGuardAt: Date.now() });
+            const timeoutAttempt = amazonWatchdogAttemptFromState(stored);
+            // Claim the exact attempt under the same serialized arbiter used by
+            // content cursor/final commits. Whichever enters first wins; there is
+            // no check→set window where both timeout and completion can succeed.
+            const timeoutClaim = await claimAmazonTimeoutAttempt(timeoutAttempt);
+            if (!['claimed', 'resolving'].includes(timeoutClaim.status)) {
+                console.warn(`⏭ Amazon timeout cancelled: ${timeoutClaim.status}`);
+                return;
+            }
 
             const failedEmail = stored.multiAccountState.currentAmazonAccount || 'unknown';
             const reason = timeoutReason;
             const idleSec = Math.round(sinceLastProgress / 1000);
             const totalSec = Math.round(totalElapsed / 1000);
-            console.log(`🚫 Account ${failedEmail} timed out (${reason}, idle=${idleSec}s, total=${totalSec}s), skipping`);
-            sendTelegramMessage(`🚫 Аккаунт ${failedEmail.split('@')[0]}: ${reason}, idle=${idleSec}с, total=${totalSec}с — пропускаю`);
 
             // Capture the exact parser tab through CDP. captureVisibleTab(windowId)
             // photographed whichever unrelated tab was active in that window and
             // made the old incident frame untrustworthy.
             let evidence = { tabId: null, tabUrl: null, tabTitle: null };
+            let evidencePhoto = '';
             try {
                 const tab = await getAmazonParserTab(stored.amazonParserTabId);
                 if (tab?.id) {
@@ -3212,16 +6248,34 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
                         page: stored.amazonPaginationState?.currentPage || null,
                         navigation: stored.amazonPaginationState?.navigation || null
                     };
-                    const b64 = await captureAmazonTabWithDebugger(tab.id);
-                    if (b64) {
-                        await sendTelegramPhoto(
-                            b64,
-                            `🚫 Amazon timeout: ${failedEmail.split('@')[0]}\n${reason}, idle=${idleSec}s total=${totalSec}s\nточный tab=${tab.id}`
-                        );
-                    }
+                    evidencePhoto = await captureAmazonTabWithDebugger(tab.id) || '';
                 }
             } catch (e) { console.warn('timeout-screenshot failed:', e?.message || e); }
 
+            const partialFound = (cachedProgressState.amazon && cachedProgressState.amazon.found) || 0;
+            const resolution = await finalizeAmazonTimeoutAttempt(
+                timeoutAttempt,
+                timeoutReason,
+                partialFound
+            );
+            if (resolution.status === 'completion-won') {
+                console.warn('⏭ Amazon timeout lost to a committed completion');
+                await consumeAmazonCompletionMarker(pipelineGenerationFromStage(stored.pipelineStage));
+                return;
+            }
+            if (resolution.status !== 'failed') {
+                console.warn(`⏭ Amazon timeout became ${resolution.status} before failure commit`);
+                return;
+            }
+
+            console.log(`🚫 Account ${failedEmail} timed out (${reason}, idle=${idleSec}s, total=${totalSec}s), skipping`);
+            await sendTelegramMessage(`🚫 Аккаунт ${failedEmail.split('@')[0]}: ${reason}, idle=${idleSec}с, total=${totalSec}с — пропускаю`).catch(() => {});
+            if (evidencePhoto) {
+                await sendTelegramPhoto(
+                    evidencePhoto,
+                    `🚫 Amazon timeout: ${failedEmail.split('@')[0]}\n${reason}, idle=${idleSec}s total=${totalSec}s\nточный tab=${evidence.tabId}`
+                ).catch(() => {});
+            }
             await logMultiAccountStep('account-parse:timeout', {
                 account: failedEmail,
                 reason,
@@ -3238,7 +6292,6 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             // content-amazon.js updates on every page.
             try {
                 const accountName = failedEmail.split('@')[0];
-                const partialFound = (cachedProgressState.amazon && cachedProgressState.amazon.found) || 0;
                 parseReport.stores[`amazon_${accountName}`] = {
                     found: partialFound,
                     status: isHardCap ? '⏱' : '🚫'
@@ -3246,78 +6299,66 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             } catch (e) { console.warn('partial parseReport failed:', e?.message || e); }
 
             // Restore state
-            isMultiAccountParsing = stored.multiAccountState.isMultiAccountParsing;
-            amazonAccountsQueue = stored.multiAccountState.amazonAccountsQueue || [];
-            currentAmazonAccount = stored.multiAccountState.currentAmazonAccount;
-
-            await chrome.storage.local.remove([
-                'accountSwitchStartedAt', 'lastAmazonProgressAt', 'amazonParsingComplete',
-                'amazonPaginationState', 'amazonNavigationGraceUntil'
-            ]);
-            await switchToNextAmazonAccount();
+            isMultiAccountParsing = !!resolution.multiAccountState?.isMultiAccountParsing;
+            amazonAccountsQueue = resolution.multiAccountState?.amazonAccountsQueue || [];
+            currentAmazonAccount = resolution.multiAccountState?.currentAmazonAccount || null;
+            await switchToNextAmazonAccount(
+                pipelineGenerationFromStage(resolution.pipelineStage)
+            );
             return;
         }
     }
     
     if (stored.amazonParsingComplete && stored.amazonParsingComplete.timestamp) {
-        const age = Date.now() - stored.amazonParsingComplete.timestamp;
-        // Only process if flag is fresh (less than 60 seconds old)
-        if (age < 60000) {
-            console.log('👀 Watchdog detected completion flag!', stored.amazonParsingComplete);
-            
-            // Restore multi-account state
-            if (stored.multiAccountState) {
-                isMultiAccountParsing = stored.multiAccountState.isMultiAccountParsing;
-                amazonAccountsQueue = stored.multiAccountState.amazonAccountsQueue || [];
-                currentAmazonAccount = stored.multiAccountState.currentAmazonAccount;
-            }
-            
-            // Clear the flag so we don't process again
-            await chrome.storage.local.set({
-                amazonParsingComplete: null,
-                accountSwitchStartedAt: null,
-                amazonNavigationGraceUntil: null
-            });
-            
-            const count = stored.amazonParsingComplete.found || 0;
-            const accountName = currentAmazonAccount ? currentAmazonAccount.split('@')[0] : 'current';
-            parseReport.stores[`amazon_${accountName}`] = { found: count, status: '✅' };
-            
-            // Process screenshots for THIS account before moving on.
-            // ВАЖНО: waitForScreenshotsDrained(), а НЕ голый processScreenshotQueue().
-            // У processScreenshotQueue есть re-entry guard (isProcessingScreenshots):
-            // если в этот момент скрины уже снимает другой вызов (хвост eBay/iHerb
-            // или минутный screenshotResume), голый `await` вернётся МГНОВЕННО, и
-            // switchToNextAmazonAccount переключит аккаунт, не доснявши скрины
-            // текущего. Страница трека Amazon открывается только под нужным
-            // аккаунтом → скрины первого аккаунта снимались под вторым и бились
-            // (симптом: «скрины только одного из двух аккаунтов»).
-            // waitForScreenshotsDrained крутится пока очередь реально не опустеет.
-            await waitForScreenshotsDrained({ maxWaitMs: null });
-            
-            if (isMultiAccountParsing && amazonAccountsQueue.length > 0) {
-                await switchToNextAmazonAccount();
-            } else if (isMultiAccountParsing) {
-                isMultiAccountParsing = false;
-                currentAmazonAccount = null;
-                await chrome.storage.local.remove(['multiAccountState']);
-
-                // Финальный возврат на основной аккаунт (ipochtoy) — без парсинга
-                finalReturnToPrimaryAmazon().catch(e => console.warn('finalReturn failed:', e));
-
-                setParserLock('amazon', false);
-
-                storesCompleted.amazon = true;
-                stopCompletionWatchdog();
-                checkAllStoresCompleted();
-            }
+        const generation = pipelineGenerationFromStage(stored.pipelineStage);
+        const consumed = await consumeAmazonCompletionMarker(generation);
+        if (!consumed) {
+            console.warn('⏭ Ignoring stale Amazon completion marker', stored.amazonParsingComplete);
         }
     }
 });
 
+let finalUploadScheduledRunId = null;
+let finalUploadScheduleInFlight = null;
+
 // Check if all stores completed and trigger auto-upload
-async function checkAllStoresCompleted() {
+function checkAllStoresCompleted() {
+    if (finalUploadScheduleInFlight) return finalUploadScheduleInFlight;
+    finalUploadScheduleInFlight = checkAllStoresCompletedOnce();
+    return finalUploadScheduleInFlight.finally(() => {
+        finalUploadScheduleInFlight = null;
+    });
+}
+
+async function checkAllStoresCompletedOnce() {
     if (storesCompleted.ebay && storesCompleted.iherb && storesCompleted.amazon) {
+        const runState = await chrome.storage.local.get(['pipelineRun', 'pipelineStage', 'pendingSheetsUpload']);
+        const runId = runState.pipelineRun?.id || null;
+        if (!runId
+            || !['completed', 'degraded'].includes(runState.pipelineRun?.status)
+            || runState.pipelineStage?.active !== false
+            || runState.pipelineStage?.runId !== runId
+            || runState.pipelineStage?.currentIndex !== PIPELINE_STAGES.length - 1) {
+            console.log('⏳ Final upload waits for the terminal pipeline stage');
+            return;
+        }
+        if (finalUploadScheduledRunId === runId || runState.pendingSheetsUpload?.runId === runId) {
+            console.log('⏭ Final upload already scheduled for this run');
+            return;
+        }
+        await chrome.storage.local.set({
+            pendingSheetsUpload: {
+                runId,
+                forSlot: runState.pipelineRun.slotAt,
+                savedAt: Date.now()
+            },
+            sheetsRetryCount: 0,
+            sheetsRetryGaveUp: false
+        });
+        // The in-memory dedupe becomes proof only after the durable retry
+        // marker exists. If storage.set rejects, the next call must retry
+        // instead of stranding the upload until a lucky service-worker restart.
+        finalUploadScheduledRunId = runId;
         isParsingAllStores = false;
         saveParsingState(); // Save final state
 
@@ -3328,29 +6369,15 @@ async function checkAllStoresCompleted() {
 
         // Upload + screenshots FIRST, then send final report
         setTimeout(async () => {
-            // Надёжность выгрузки (инцидент 2026-07-03): ставим персистентный маркер
-            // pendingSheetsUpload ДО первой попытки. Сам пэйлоад (orderData + логи) уже
-            // лежит в chrome.storage.local и читается uploadToSheets()/uploadLogsToSheet()
-            // изнутри — не дублируем его, храним лишь маркер+слот прогона. Если SW уснёт
-            // и in-memory ретрай ниже умрёт — sheetsUploadWatchdog догонит выгрузку по маркеру.
-            try {
-                await chrome.storage.local.set({
-                    pendingSheetsUpload: { forSlot: getLastDailyRunSlot(new Date()).getTime(), savedAt: Date.now() },
-                    sheetsRetryCount: 0,
-                    sheetsRetryGaveUp: false
-                });
-            } catch (_) {}
-
             // Финальная выгрузка в Google Sheets — до 3 попыток с паузой 60с.
             // Внешний сторож читает lastSheetsUploadOkAt, поэтому имя ключа фиксировано.
             let sheetsUploadErr = null;
             for (let attempt = 1; attempt <= 3; attempt++) {
                 try {
-                    await uploadToSheets();
-                    await uploadLogsToSheet();
-                    // Честный «зелёный» флаг — только после подтверждённой выгрузки: ставит
-                    // lastSheetsUploadOkAt + lastSuccessfulDailyRunAt/Date, гасит маркер.
-                    await markSheetsUploadSuccess();
+                    const upload = getOrStartFinalSheetsUpload(runId, {
+                        source: `final-timer-${attempt}`
+                    });
+                    await upload.promise;
                     sheetsUploadErr = null;
                     console.log(`✅ Выгрузка в Google Sheets успешна (попытка ${attempt}/3)`);
                     break;
@@ -3557,10 +6584,13 @@ async function checkAllStoresCompleted() {
     }
 }
 
-async function uploadToSheets() {
+async function uploadToSheets(runId = null) {
     try {
         // Get settings from storage
-        const result = await chrome.storage.local.get(['spreadsheetId', 'sheetName', 'orderData', 'chainPochtoy', 'skipProcessed', 'colorProcessed', 'limitRows', 'parseMode']);
+        const result = await chrome.storage.local.get([
+            'spreadsheetId', 'sheetName', 'orderData', 'chainPochtoy',
+            'skipProcessed', 'colorProcessed', 'limitRows', 'parseMode', 'pipelineRun'
+        ]);
         let spreadsheetId = result.spreadsheetId || DEFAULT_SPREADSHEET_ID;
         const parseMode = result.parseMode || 'warehouse';
         const sheetName = (parseMode === 'financial') ? 'Financial_Log' : (result.sheetName || 'Лист1');
@@ -3584,11 +6614,49 @@ async function uploadToSheets() {
         const allOrders = [];
         Object.values(orderData).forEach(storeData => {
             if (storeData.orders) {
-                allOrders.push(...storeData.orders);
+                const rows = runId
+                    ? storeData.orders.filter(order => order?.parser_run_id === runId)
+                    : storeData.orders;
+                allOrders.push(...rows);
             }
         });
 
+        if (runId) {
+            if (result.pipelineRun?.id !== runId
+                || !['completed', 'degraded'].includes(result.pipelineRun?.status)) {
+                throw new Error('Sheets payload does not belong to the terminal pipeline run');
+            }
+            const slotAt = Number(result.pipelineRun.slotAt);
+            const attemptedAt = Number(result.pipelineRun.attemptedAt);
+            const startedAt = Number(result.pipelineRun.startedAt);
+            const finishedAt = Number(result.pipelineRun.finishedAt);
+            if (!Number.isFinite(slotAt)
+                || !Number.isFinite(attemptedAt)
+                || !Number.isFinite(startedAt)
+                || !Number.isFinite(finishedAt)
+                || slotAt > attemptedAt
+                || attemptedAt > startedAt
+                || startedAt > finishedAt) {
+                throw new Error('Sheets payload has invalid pipeline timestamps');
+            }
+            for (const order of allOrders) {
+                const shop = /iherb/i.test(order.store_name || '') ? 'iherb'
+                    : /ebay/i.test(order.store_name || '') ? 'ebay'
+                        : /amazon/i.test(order.store_name || '') ? 'amazon' : null;
+                const observedAt = Date.parse(order.observed_at || '');
+                const account = normalizeAccountEmail(order.parser_account);
+                if (!shop
+                    || !result.pipelineRun.expected?.[shop]?.includes(account)
+                    || !Number.isFinite(observedAt)
+                    || observedAt < startedAt
+                    || observedAt > finishedAt) {
+                    throw new Error('Sheets payload contains a row outside the run/account/time fence');
+                }
+            }
+        }
+
         if (allOrders.length === 0) {
+            if (runId) throw new Error(`No parsed rows belong to pipeline run ${runId}`);
             console.log('No parsed data to upload.');
             console.log('ℹ️ No data to upload');
             
@@ -3636,12 +6704,9 @@ async function uploadToSheets() {
         }
 
         // Idempotency: read existing rows, update qty if changed, skip exact duplicates
-        let existing = [];
-        try {
-            existing = await readSheetData(spreadsheetId, sheetName) || [];
-        } catch (e) {
-            console.warn('Could not read existing sheet for dedupe, will append all.', e);
-        }
+        // Fail closed: without the existing sheet we cannot dedupe safely and
+        // would append every historical row again while still reporting green.
+        const existing = await readSheetData(spreadsheetId, sheetName) || [];
 
         let newValues = [];
         let rowsToUpdate = []; // {row: 1-based index, qty: new qty value}
@@ -3724,11 +6789,15 @@ async function uploadToSheets() {
                 values: [[u.qty]]
             }));
             
-            await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchUpdate`, {
+            const updateResponse = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchUpdate`, {
                 method: 'POST',
                 headers: { 'Authorization': `Bearer ${authToken}`, 'Content-Type': 'application/json' },
                 body: JSON.stringify({ valueInputOption: 'USER_ENTERED', data: updateData })
             });
+            if (!updateResponse.ok) {
+                const errorText = await updateResponse.text().catch(() => '');
+                throw new Error(`Google Sheets qty update failed: ${updateResponse.status} ${errorText}`.trim());
+            }
             console.log(`✅ Updated ${rowsToUpdate.length} qty values`);
             console.log(`📝 Updated qty in ${rowsToUpdate.length} rows`);
         }
@@ -3777,6 +6846,7 @@ async function uploadToSheets() {
         console.error("Upload failed:", error);
         chrome.runtime.sendMessage({ action: 'uploadComplete', status: 'error', message: `Upload Error: ${error.message}` });
         sendTelegramMessage(`❌ Ошибка загрузки: ${error.message}`);
+        throw error;
     }
 }
 
@@ -4208,7 +7278,7 @@ async function pollTelegramUpdates() {
                             // captureVisibleTab (active-tab contention). Sequential keeps
                             // one shop's tabs in focus at a time.
                             console.log('✅ Command accepted! Starting sequential pipeline...');
-                            startSequentialPipeline();
+                            await runDailyAutoParse('telegram');
                         }
                     }
                 }
@@ -4413,17 +7483,44 @@ async function sendSelfDeletingMessage(text, deleteAfterSec = 60) {
 let trackScreenshotQueue = [];
 let isProcessingScreenshots = false;
 let screenshotsEnabled = false;
+let screenshotQueueInitError = null;
 let screenshotQueuePersistChain = Promise.resolve();
+const SCREENSHOT_DRAIN_MAX_WAIT_MS = 90 * 60_000;
+const SCREENSHOT_MAX_ATTEMPTS = 3;
 
-chrome.storage.local.get(['screenshotsEnabled', 'trackScreenshotQueue'], (res) => {
-    screenshotsEnabled = res.screenshotsEnabled || false;
-    if (Array.isArray(res.trackScreenshotQueue) && res.trackScreenshotQueue.length > 0) {
-        trackScreenshotQueue = res.trackScreenshotQueue;
-        console.log(`📸 Restored ${trackScreenshotQueue.length} screenshots from storage`);
+function screenshotQueueKey(item) {
+    return `${item?.accountName || ''}|${item?.orderId || ''}|${item?.trackNumber || ''}`;
+}
+
+function mergePersistedScreenshotQueue(items) {
+    const seen = new Set(trackScreenshotQueue.map(screenshotQueueKey));
+    for (const item of (Array.isArray(items) ? items : [])) {
+        const key = screenshotQueueKey(item);
+        if (!seen.has(key)) {
+            trackScreenshotQueue.push(item);
+            seen.add(key);
+        }
     }
-});
+}
+
+// Initialization used to replace the whole in-memory queue from an async
+// callback. A producer could append first and then be silently overwritten by
+// the late callback. Merge once, and make every producer/consumer await it.
+const screenshotQueueReady = chrome.storage.local.get(['screenshotsEnabled', 'trackScreenshotQueue'])
+    .then(res => {
+        screenshotsEnabled = res.screenshotsEnabled || false;
+        mergePersistedScreenshotQueue(res.trackScreenshotQueue);
+        if (trackScreenshotQueue.length > 0) {
+            console.log(`📸 Restored ${trackScreenshotQueue.length} screenshots from storage`);
+        }
+    })
+    .catch(error => {
+        screenshotQueueInitError = error instanceof Error ? error : new Error(String(error));
+        console.warn('⚠️ Screenshot queue init failed:', error?.message || error);
+    });
 
 async function persistScreenshotQueue() {
+    await screenshotQueueReady;
     // storage.local.set сериализует не мгновенно. Передаём самостоятельный
     // snapshot и выстраиваем записи в цепочку, иначе поздняя запись старой
     // очереди может затереть финальный []. Await удерживает MV3 worker живым
@@ -4674,7 +7771,12 @@ async function sendScreenshotToArchive(base64Data, caption) {
 }
 
 async function queueTrackScreenshot(orderId, trackNumber, trackUrl, accountName) {
-    if (!screenshotsEnabled) return;
+    // A queue message can be the very first event after an MV3 worker restart.
+    // Wait for the persisted setting/queue before deciding whether screenshots
+    // are enabled; checking the default `false` first silently dropped cards.
+    await screenshotQueueReady;
+    if (screenshotQueueInitError) throw screenshotQueueInitError;
+    if (!screenshotsEnabled) return { queued: false, skipped: 'disabled' };
     const url = String(trackUrl || '');
     // eBay/iHerb: одна страница заказа на все товары/треки → дедуп по orderId.
     //   В существующую запись доливаем все доп. треки в extraTracks для подписи и записи в Sheet.
@@ -4689,16 +7791,17 @@ async function queueTrackScreenshot(orderId, trackNumber, trackUrl, accountName)
                 await persistScreenshotQueue();
                 console.log(`📸 Merged track ${trackNumber} into existing order ${orderId} (extras: ${existing.extraTracks.length})`);
             }
-            return;
+            return { queued: false, merged: true };
         }
     } else if (trackNumber && trackScreenshotQueue.some(q => q.trackNumber === trackNumber)) {
         console.log(`📸 Skip duplicate queue: ${trackNumber} already queued`);
-        return;
+        return { queued: false, duplicate: true };
     }
     const resolvedAccount = accountName || (currentAmazonAccount ? currentAmazonAccount.split('@')[0] : '');
     trackScreenshotQueue.push({ orderId, trackNumber, trackUrl, accountName: resolvedAccount, extraTracks: [] });
     await persistScreenshotQueue();
     console.log(`📸 Queued screenshot: ${orderId} / ${trackNumber} (queue: ${trackScreenshotQueue.length})`);
+    return { queued: true };
 }
 
 async function filterAlreadySent(queue) {
@@ -4740,19 +7843,23 @@ async function markAsSent(trackNumbers) {
 }
 
 async function processScreenshotQueue() {
-    // SW мог уснуть после queueTrackScreenshot — restore очереди из storage
+    await screenshotQueueReady;
+    if (screenshotQueueInitError) {
+        console.warn('⏸ Screenshot queue unavailable:', screenshotQueueInitError.message);
+        return false;
+    }
+    // SW мог уснуть после queueTrackScreenshot — merge очереди из storage.
+    // Сравнение только длины теряло другой item при равных размерах очередей.
     try {
-        const { trackScreenshotQueue: stored = [] } = await chrome.storage.local.get('trackScreenshotQueue');
-        if (Array.isArray(stored) && stored.length > trackScreenshotQueue.length) {
-            const seen = new Set(trackScreenshotQueue.map(x => x.trackNumber));
-            for (const item of stored) {
-                if (!seen.has(item.trackNumber)) trackScreenshotQueue.push(item);
-            }
-            console.log(`📸 Restored ${stored.length} from storage, in-memory now ${trackScreenshotQueue.length}`);
+        const state = await chrome.storage.local.get(['trackScreenshotQueue', 'screenshotQueueBlocked']);
+        if (state.screenshotQueueBlocked) {
+            console.warn('⏸ Screenshot queue remains blocked:', state.screenshotQueueBlocked);
+            return false;
         }
+        mergePersistedScreenshotQueue(state.trackScreenshotQueue);
     } catch (_) {}
 
-    if (isProcessingScreenshots || trackScreenshotQueue.length === 0) return;
+    if (isProcessingScreenshots || trackScreenshotQueue.length === 0) return true;
     isProcessingScreenshots = true;
     await beginScreenshotStageBudget();
 
@@ -4783,7 +7890,6 @@ async function processScreenshotQueue() {
         if (pJson.ok) progressMsgId = pJson.result.message_id;
     } catch(e) {}
 
-    const sentTracks = [];
     let done = 0;
 
     // Один переиспользуемый таб для всех скринов — раньше каждый item создавал
@@ -4811,38 +7917,99 @@ async function processScreenshotQueue() {
 
     let captchaPaused = false;
     while (trackScreenshotQueue.length > 0) {
-        const item = trackScreenshotQueue.shift();
+        // Keep the in-flight item at the persisted head until delivery is
+        // confirmed. A worker crash or archive error must never turn it into a
+        // disappearing card.
+        const item = trackScreenshotQueue[0];
         done++;
         // Поштучный дедуп: если ВСЕ треки этого заказа уже сняты — не переснимаем.
         const itemTracks = [item.trackNumber, ...(item.extraTracks || [])].filter(Boolean);
         if (itemTracks.length > 0 && itemTracks.every(t => sentSet.has(t))) {
             console.log(`⏭  skip already-sent order ${item.orderId} (${itemTracks.length} track(s))`);
             parseReport.screenshots.skipped++;
+            trackScreenshotQueue.shift();
             await persistScreenshotQueue();
             continue;
         }
         // Магазин по trackUrl — чтобы в сводке прогона видеть «сколько скринов ушло по iHerb / Amazon / eBay»
         const u = String(item.trackUrl || '');
         const shop = /iherb\.com/i.test(u) ? 'iherb' : /amazon\./i.test(u) ? 'amazon' : /ebay\./i.test(u) ? 'ebay' : 'other';
+        if (shop === 'iherb' || shop === 'amazon') {
+            const ownerState = await chrome.storage.local.get(['multiAccountIherbState', 'multiAccountState']);
+            const activeAccount = shop === 'iherb'
+                ? ownerState.multiAccountIherbState?.currentIherbAccount
+                : ownerState.multiAccountState?.currentAmazonAccount;
+            const normalizedItemAccount = String(item.accountName || '').split('@')[0].toLowerCase();
+            const normalizedActiveAccount = String(activeAccount || '').split('@')[0].toLowerCase();
+            if (!normalizedItemAccount || !normalizedActiveAccount || normalizedItemAccount !== normalizedActiveAccount) {
+                const blocked = {
+                    kind: 'account-mismatch',
+                    at: Date.now(),
+                    shop,
+                    itemKey: screenshotQueueKey(item),
+                    accountName: item.accountName || '',
+                    activeAccount: activeAccount || '',
+                    orderId: item.orderId || '',
+                    trackNumber: item.trackNumber || ''
+                };
+                await chrome.storage.local.set({ screenshotQueueBlocked: blocked });
+                await persistScreenshotQueue();
+                console.error(`⛔ Refusing ${shop} screenshot under a different account`);
+                break;
+            }
+        }
         try {
             const result = await captureTrackScreenshot(item, done, total, reuseTab?.id);
-            if (result === 'CAPTCHA') {
-                trackScreenshotQueue.unshift(item); // Вернуть в очередь
+            if (result?.status === 'captcha') {
+                const blocked = {
+                    kind: 'captcha',
+                    at: Date.now(),
+                    itemKey: screenshotQueueKey(item),
+                    accountName: item.accountName || '',
+                    orderId: item.orderId || '',
+                    trackNumber: item.trackNumber || ''
+                };
+                await chrome.storage.local.set({ screenshotQueueBlocked: blocked });
                 await persistScreenshotQueue();
                 captchaPaused = true; // не закрываем reuseTab — юзер будет решать капчу там
                 break;
             }
-            // captureTrackScreenshot вернул полный набор реально известных/снятых
-            // треков заказа — помечаем отправленными ВСЕ, а не один первичный.
-            const tracksToMark = (Array.isArray(result) && result.length)
-                ? result
-                : [item.trackNumber].filter(Boolean);
-            sentTracks.push(...tracksToMark);
+
+            const confirmed = new Set(Array.isArray(result?.tracks) ? result.tracks.filter(Boolean) : []);
+            const unresolved = itemTracks.filter(t => !sentSet.has(t));
+            if (result?.status !== 'sent' || unresolved.some(t => !confirmed.has(t))) {
+                throw new Error(result?.reason || `archive did not confirm ${unresolved.length} track(s)`);
+            }
+
+            // Only a confirmed archive response may remove the item and mark
+            // tracks sent. No fallback to the requested track is allowed.
+            const tracksToMark = [...confirmed];
             tracksToMark.forEach(t => sentSet.add(t)); // живой дедуп в рамках слива
             parseReport.screenshots.sent++;
             parseReport.screenshots.byShop = parseReport.screenshots.byShop || {};
             parseReport.screenshots.byShop[shop] = (parseReport.screenshots.byShop[shop] || 0) + 1;
             await markAsSent(tracksToMark);
+
+            // A producer may merge another track into this same order while
+            // capture/archive is in flight. Its durable ACK means that track
+            // must remain owned by the queue. Re-read the live head after the
+            // final await and remove it only if every track known *now* is sent.
+            const latestHead = trackScreenshotQueue[0];
+            const sameHead = latestHead
+                && screenshotQueueKey(latestHead) === screenshotQueueKey(item);
+            const latestTracks = sameHead
+                ? [latestHead.trackNumber, ...(latestHead.extraTracks || [])].filter(Boolean)
+                : [];
+            const lateUnsent = latestTracks.filter(track => !sentSet.has(track));
+            if (!sameHead) {
+                throw new Error('screenshot queue head changed during archive confirmation');
+            }
+            if (lateUnsent.length > 0) {
+                console.log(`📸 Keeping ${item.orderId}: ${lateUnsent.length} track(s) arrived during capture`);
+                await persistScreenshotQueue();
+                continue;
+            }
+            trackScreenshotQueue.shift();
             await persistScreenshotQueue();
             // Update progress message
             if (progressMsgId) {
@@ -4857,8 +8024,25 @@ async function processScreenshotQueue() {
             console.error(`❌ Screenshot failed for ${item.orderId}:`, e);
             parseReport.screenshots.failed++;
             console.error(`❌ Screenshot ${done}/${total} failed: ${item.orderId} — ${e.message || e}`);
-            // item уже снят из очереди; фиксируем это до возможного сна worker.
+            item._attempts = Math.max(0, Number(item._attempts) || 0) + 1;
+            item._lastError = String(e?.message || e).slice(0, 240);
+            item._lastAttemptAt = Date.now();
             await persistScreenshotQueue();
+            if (item._attempts >= SCREENSHOT_MAX_ATTEMPTS) {
+                await chrome.storage.local.set({
+                    screenshotQueueBlocked: {
+                        kind: 'delivery-failed',
+                        at: Date.now(),
+                        attempts: item._attempts,
+                        itemKey: screenshotQueueKey(item),
+                        accountName: item.accountName || '',
+                        orderId: item.orderId || '',
+                        trackNumber: item.trackNumber || '',
+                        reason: item._lastError
+                    }
+                });
+                break;
+            }
         }
         // Пауза между заказами: 1.2-2.2 сек базово; iHerb триггерит на бота → 3-6 сек.
         const isIherbItem = /(secure\.|www\.)?iherb\.com/i.test(String(item.trackUrl || ''));
@@ -4871,7 +8055,6 @@ async function processScreenshotQueue() {
         try { await chrome.tabs.remove(reuseTab.id); } catch (_) {}
     }
 
-    if (sentTracks.length > 0) await markAsSent(sentTracks);
     await persistScreenshotQueue();
     console.log(`✅ Screenshots done: ${done}/${total}`);
     // Delete progress message — final stats will be in the summary report
@@ -4886,6 +8069,8 @@ async function processScreenshotQueue() {
         isProcessingScreenshots = false;
         await finishScreenshotStageBudget();
     }
+    const { screenshotQueueBlocked = null } = await chrome.storage.local.get('screenshotQueueBlocked');
+    return !screenshotQueueBlocked && trackScreenshotQueue.length === 0;
 }
 
 
@@ -5422,10 +8607,12 @@ async function captureIherbTrackingCard(tab) {
 }
 
 async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountName, extraTracks }, current, total, reuseTabId) {
-    // Полный набор треков этого заказа — база для markAsSent (дедуп по ВСЕМ трекам,
-    // а не по одному первичному). По ходу съёмки доливаем реально снятые s.trackNum.
-    const capturedTracks = new Set([trackNumber, ...(extraTracks || [])].filter(Boolean));
-    if (!trackUrl) return Array.from(capturedTracks);
+    // markAsSent receives only tracks whose archive request actually succeeded.
+    // The old code pre-filled this set from the request, so every error looked
+    // like a successful delivery and the queue item was deleted.
+    const expectedTracks = [trackNumber, ...(extraTracks || [])].filter(Boolean);
+    const capturedTracks = new Set();
+    if (!trackUrl) return { status: 'failed', reason: 'missing tracking URL', tracks: [] };
 
     let fullUrl = trackUrl;
     if (fullUrl.startsWith('http')) {
@@ -5489,7 +8676,7 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                 console.error('🚨 CAPTCHA DETECTED! Stopping queue.');
                 sendTelegramMessage('🚨 ВНИМАНИЕ: На Amazon вылезла капча! Парсинг скриншотов приостановлен.\nПерейдите в открытую вкладку Amazon и решите капчу.');
                 keepTabOpen = true; // Не закрываем вкладку, чтобы юзер мог решить
-                return 'CAPTCHA';
+                return { status: 'captcha', reason: 'captcha', tracks: [] };
             }
         } catch (captchaErr) {
             console.warn('⚠️ Ошибка проверки капчи:', captchaErr);
@@ -5536,7 +8723,7 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                 if (broken) {
                     console.log(`⚠️ Broken tracking page for ${trackNumber}, skipping screenshot`);
                     parseReport.screenshots.broken++;
-                    return Array.from(capturedTracks);
+                    return { status: 'failed', reason: 'broken tracking page', tracks: [] };
                 }
             } catch (e) {
                 console.warn('⚠️ Broken page check failed:', e?.message || e);
@@ -5574,7 +8761,7 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
         const finalUrl = tabInfo.url || '';
         if (finalUrl.includes('signin') || finalUrl.includes('ap/challenge')) {
             console.log(`⚠️ Skipping screenshot - login page: ${finalUrl.substring(0, 80)}`);
-            return Array.from(capturedTracks);
+            return { status: 'failed', reason: 'tracking page requires login', tracks: [] };
         }
 
         // --- SCREENSHOTS ---
@@ -5595,13 +8782,16 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                     // Все shipment-карточки заказа уже были сняты в прошлые прогоны →
                     // ничего нового не шлём, заказ считаем обработанным.
                     console.log(`⏭  eBay: все карточки заказа ${orderId} уже сняты ранее — ничего не отправляю`);
+                    expectedTracks.forEach(track => capturedTracks.add(track));
                 } else if (shipments.length === 0) {
                     console.warn(`⚠️ captureEbayShipments returned [] for ${orderId}, fallback to single visible`);
                     const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
                     const fallbackBase64 = dataUrl.replace(/^data:image\/png;base64,/, '');
                     const captionFallback = `📦 ${orderLink(orderId)}\n🚚 ${esc(trackNumber || '—')}${accountTag}`;
                     const archive = await sendScreenshotToArchive(fallbackBase64, captionFallback);
-                    if (archive?.ok && archive.link) firstPageLink = archive.link;
+                    if (!archive?.ok) throw new Error('eBay fallback archive failed');
+                    if (archive.link) firstPageLink = archive.link;
+                    expectedTracks.forEach(track => capturedTracks.add(track));
                     screenshotsTaken++;
                 } else {
                     for (const s of shipments) {
@@ -5616,13 +8806,14 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                             continue;
                         }
                         const track = s.trackNum;
-                        capturedTracks.add(track);
                         const trackLine = '🚚 ' + esc(track);
                         const shipTag = s.shipmentTotal > 1 ? ` • пакет ${s.shipmentIdx}/${s.shipmentTotal}` : '';
                         const itemLine = s.itemName ? ('\n🛒 ' + esc(s.itemName)) : '';
                         const caption = `📦 ${orderLink(orderId)}${shipTag}\n${trackLine}${itemLine}${accountTag}`;
                         const archive = await sendScreenshotToArchive(s.base64, caption);
-                        if (archive?.ok && archive.link) {
+                        if (!archive?.ok) throw new Error(`eBay archive failed for ${track}`);
+                        capturedTracks.add(track);
+                        if (archive.link) {
                             if (!firstPageLink) firstPageLink = archive.link;
                             try { await writeScreenshotLinkToSheet(s.trackNum, archive.link); }
                             catch (e) { console.warn(`⚠️ writeScreenshotLinkToSheet ${s.trackNum}:`, e?.message || e); }
@@ -5633,6 +8824,7 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                 console.log(`✅ eBay screenshots sent for ${orderId} (shipments: ${shipments.length}, tracks: ${allTracks.length})`);
             } catch (capErr) {
                 console.error(`❌ eBay capture failed for ${orderId}:`, capErr);
+                throw capErr;
             }
         } else if (isIherb) {
             try {
@@ -5651,11 +8843,14 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                     const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
                     const fallbackBase64 = dataUrl.replace(/^data:image\/png;base64,/, '');
                     const archive = await sendScreenshotToArchive(fallbackBase64, captionFull);
-                    if (archive?.ok && archive.link) firstPageLink = archive.link;
+                    if (!archive?.ok) throw new Error('iHerb fallback archive failed');
+                    if (archive.link) firstPageLink = archive.link;
                 } else {
                     const archive = await sendScreenshotToArchive(cardBase64, captionFull);
-                    if (archive?.ok && archive.link) firstPageLink = archive.link;
+                    if (!archive?.ok) throw new Error('iHerb archive failed');
+                    if (archive.link) firstPageLink = archive.link;
                 }
+                allTracks.forEach(track => capturedTracks.add(track));
                 screenshotsTaken++;
                 console.log(`✅ iHerb tracking card screenshot sent for ${orderId} (tracks: ${allTracks.length})`);
 
@@ -5667,6 +8862,7 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                 }
             } catch (capErr) {
                 console.error(`❌ Fullpage capture failed for ${orderId}:`, capErr);
+                throw capErr;
             }
         } else {
             // === Ветка Amazon (как было): карусель ===
@@ -5706,7 +8902,8 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                 const caption = `📦 ${orderLink(orderId)}${pageLabel}\n🚚 ${esc(trackNumber)}${accountTag}`;
 
                 const archive = await sendScreenshotToArchive(base64, caption);
-                if (archive?.ok && archive.link && !firstPageLink) firstPageLink = archive.link;
+                if (!archive?.ok) throw new Error(`Amazon archive failed on carousel page ${page}`);
+                if (archive.link && !firstPageLink) firstPageLink = archive.link;
 
                 screenshotsTaken++;
                 console.log(`✅ Screenshot ${page}/${carouselPages} sent for ${orderId}`);
@@ -5729,6 +8926,7 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                 try { await writeScreenshotLinkToSheet(trackNumber, firstPageLink); }
                 catch (e) { console.warn(`⚠️ writeScreenshotLinkToSheet ${trackNumber}:`, e?.message || e); }
             }
+            if (screenshotsTaken > 0 && trackNumber) capturedTracks.add(trackNumber);
         }
     } finally {
         // Закрываем только если сами создали локальную вкладку (без reuseTabId).
@@ -5737,8 +8935,10 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
             try { await chrome.tabs.remove(tab.id); } catch (_) {}
         }
     }
-    // Полный набор треков заказа → в markAsSent (дедуп по всем трекам).
-    return Array.from(capturedTracks);
+    if (capturedTracks.size === 0 && expectedTracks.length > 0) {
+        return { status: 'failed', reason: 'no screenshot was archived', tracks: [] };
+    }
+    return { status: 'sent', tracks: Array.from(capturedTracks) };
 }
 
 /**

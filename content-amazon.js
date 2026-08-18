@@ -1,7 +1,7 @@
-/* content-amazon.js — v7.5 (Fix: multi-product deduplication) */
+/* content-amazon.js — v7.8.0 (generation-fenced pagination and account ownership) */
 
 (function () {
-  console.log("🚀 Amazon Parser v7.5 (Fix: multi-product deduplication)");
+  console.log("🚀 Amazon Parser v7.8.0 loaded");
   
   // Get current Amazon account name for logs
   function getAmazonAccountName() {
@@ -82,6 +82,16 @@
 
     const data = await chrome.storage.local.get(['autoParsePending', 'autoParse_amazon', 'autoParseTimestamp', 'accountSwitchInProgress', 'switchedToEmail', 'amazonFinalReturn']);
 
+    const hasParserIntent = !!(data.amazonFinalReturn
+      || data.accountSwitchInProgress
+      || data.autoParsePending === 'amazon'
+      || data.autoParse_amazon);
+    const ownership = hasParserIntent ? await getOwnedAmazonParserContext() : null;
+    if (hasParserIntent && !ownership) {
+      console.log('⏭ Amazon auto-parse intent belongs to another tab/run');
+      return;
+    }
+
     // Гард: финальный возврат на ipochtoy — парс не запускаем
     if (data.amazonFinalReturn) {
       console.log('🏁 amazonFinalReturn=true — пропускаю auto-parse');
@@ -90,17 +100,22 @@
     
     // Check if this is after account switch (multi-account parsing)
     if (data.accountSwitchInProgress) {
+      if (String(ownership?.account || '').trim().toLowerCase()
+          !== String(data.switchedToEmail || '').trim().toLowerCase()) {
+        console.log('⏭ Amazon switched account does not match owned parser context');
+        return;
+      }
       console.log(`✅ Account switch detected! Now parsing as: ${data.switchedToEmail}`);
       
       await chrome.storage.local.remove(['accountSwitchInProgress', 'switchedToEmail']);
       
       setTimeout(async () => {
+        const freshOwnership = await getOwnedAmazonParserContext();
+        if (!freshOwnership
+            || freshOwnership.runId !== ownership.runId
+            || freshOwnership.account !== ownership.account) return;
         const pages = await getSavedPageCount();
         console.log(`🚀 Starting parse after account switch (${pages} pages)...`);
-        chrome.runtime.sendMessage({
-          action: 'parserStarted',
-          store: 'Amazon'
-        });
         parseAmazonOrdersWithPagination({ pages });
       }, 3000);
       return;
@@ -117,12 +132,12 @@
       await chrome.storage.local.remove(['autoParsePending', 'autoParse_amazon', 'autoParseTimestamp']);
 
       setTimeout(async () => {
+        const freshOwnership = await getOwnedAmazonParserContext();
+        if (!freshOwnership
+            || freshOwnership.runId !== ownership.runId
+            || freshOwnership.account !== ownership.account) return;
         const pages = await getSavedPageCount();
         console.log(`🚀 Starting auto-parse (${pages} pages)...`);
-        chrome.runtime.sendMessage({
-          action: 'parserStarted',
-          store: 'Amazon'
-        });
         parseAmazonOrdersWithPagination({ pages });
       }, 3000);
     } else {
@@ -502,7 +517,21 @@
     }
   }
 
-  async function parseIndividualItemSimpleByTrackUrl(card, productLink, orderId, trackUrl) {
+  async function queueAmazonTrackScreenshot(payload) {
+    try {
+      const response = await chrome.runtime.sendMessage({ action: 'queueTrackScreenshot', ...payload });
+      if (response?.status !== 'queued') {
+        throw new Error(response?.error || 'screenshot queue commit was not acknowledged');
+      }
+      return response;
+    } catch (cause) {
+      const error = new Error(cause?.message || String(cause));
+      error.code = 'SCREENSHOT_QUEUE_COMMIT_FAILED';
+      throw error;
+    }
+  }
+
+  async function parseIndividualItemSimpleByTrackUrl(card, productLink, orderId, trackUrl, parserAccount) {
     const scope = closestItemScope(productLink || card);
     
     // PRODUCT NAME - keep the good v6.6 logic
@@ -639,16 +668,12 @@
       }
     }
     if (!skipForAge_1) {
-      chrome.storage.local.get(['multiAccountState', 'manualAccountName'], (res) => {
-        const acct = res.multiAccountState?.currentAmazonAccount || res.manualAccountName || '';
-        console.log('📸 Sending queueTrackScreenshot for ' + trackNumber + ' acct: ' + acct);
-        chrome.runtime.sendMessage({
-          action: 'queueTrackScreenshot',
-          orderId: individualOrderId,
-          trackNumber: trackNumber,
-          trackUrl: trackUrl,
-          accountName: acct
-        }, () => chrome.runtime.lastError);
+      console.log('📸 Sending queueTrackScreenshot for ' + trackNumber + ' acct: ' + parserAccount);
+      await queueAmazonTrackScreenshot({
+        orderId: individualOrderId,
+        trackNumber,
+        trackUrl,
+        accountName: parserAccount
       });
     }
 
@@ -684,7 +709,7 @@
     return Array.from(new Set(allTracks));
   }
 
-  async function parseIndividualItemSimple(card, productLink, orderId) {
+  async function parseIndividualItemSimple(card, productLink, orderId, parserAccount) {
     const scope = closestItemScope(productLink || card);
     let title = extractTitleFromDOM(scope);
     if (!title) {
@@ -772,16 +797,12 @@
       }
     }
     if (!skipForAge_2) {
-      chrome.storage.local.get(['multiAccountState', 'manualAccountName'], (res) => {
-        const acct = res.multiAccountState?.currentAmazonAccount || res.manualAccountName || '';
-        console.log('📸 Sending queueTrackScreenshot for ' + trackNumber + ' acct: ' + acct);
-        chrome.runtime.sendMessage({
-          action: 'queueTrackScreenshot',
-          orderId: orderId,
-          trackNumber: trackNumber,
-          trackUrl: trackUrl,
-          accountName: acct
-        }, () => chrome.runtime.lastError);
+      console.log('📸 Sending queueTrackScreenshot for ' + trackNumber + ' acct: ' + parserAccount);
+      await queueAmazonTrackScreenshot({
+        orderId,
+        trackNumber,
+        trackUrl,
+        accountName: parserAccount
       });
     }
 
@@ -834,6 +855,12 @@
 
   async function parseAmazonOrders(currentPage = 1, totalPages = 1) {
     console.log(`\n📦 Запуск парсера Amazon для страницы ${currentPage}/${totalPages}`);
+
+      const ownerState = await chrome.storage.local.get(['multiAccountState', 'manualAccountName']);
+      const parserAccount = ownerState.multiAccountState?.currentAmazonAccount
+        || ownerState.manualAccountName
+        || '';
+      if (!parserAccount) throw new Error('Amazon parser account is not pinned');
 
       const cards = getOrderCards(document);
       console.log(`📦 Найдено ${cards.length} карточек заказов`);
@@ -1013,7 +1040,7 @@
             
             for (let prodIdx = 0; prodIdx < productsToProcess.length; prodIdx++) {
               const prod = productsToProcess[prodIdx];
-              const order = await parseIndividualItemSimpleByTrackUrl(card, prod, orderId, trackUrl);
+              const order = await parseIndividualItemSimpleByTrackUrl(card, prod, orderId, trackUrl, parserAccount);
               if (order) {
                 // --- FINANCIAL MERGE ---
                 if (PARSE_MODE === 'financial') {
@@ -1032,6 +1059,7 @@
             }
           } catch (itemError) {
             console.error(`❌ Ошибка обработки посылки ${j + 1}:`, itemError);
+            if (itemError?.code === 'SCREENSHOT_QUEUE_COMMIT_FAILED') throw itemError;
           }
         }
         
@@ -1052,6 +1080,7 @@
         
       } catch (cardError) {
         console.error(`❌ Ошибка обработки карточки ${i + 1}:`, cardError);
+        if (cardError?.code === 'SCREENSHOT_QUEUE_COMMIT_FAILED') throw cardError;
         processedCards++;
       }
     }
@@ -1090,19 +1119,68 @@
     });
   }
   
-  async function savePaginationState(state) {
-    return new Promise(resolve => {
-      chrome.storage.local.set({ [PAGINATION_STATE_KEY]: state }, resolve);
+  function amazonParserContextMatchesState(context, state) {
+    return !!context?.owned
+      && !!state?.runId
+      && context.runId === state.runId
+      && String(context.account || '').trim().toLowerCase()
+        === String(state.account || '').trim().toLowerCase()
+      && context.tabId === state.parserTabId
+      && context.stageStartedAt === state.stageStartedAt
+      && context.accountSwitchStartedAt === state.accountSwitchStartedAt;
+  }
+
+  async function requireOwnedAmazonPaginationState(state, phase) {
+    const context = await getOwnedAmazonParserContext();
+    if (!amazonParserContextMatchesState(context, state)) {
+      throw new Error(`stale Amazon parser run/account/tab ${phase || 'before cursor mutation'}`);
+    }
+    return context;
+  }
+
+  function amazonAttemptRefFromState(state) {
+    return {
+      runId: state?.runId || null,
+      account: state?.account || '',
+      parserTabId: state?.parserTabId || null,
+      stageStartedAt: state?.stageStartedAt || null,
+      accountSwitchStartedAt: state?.accountSwitchStartedAt || null,
+      parseId: state?.parseId || null
+    };
+  }
+
+  async function commitAmazonAttempt(kind, state, extra = {}) {
+    const response = await chrome.runtime.sendMessage({
+      action: 'commitAmazonAttempt',
+      kind,
+      attempt: amazonAttemptRefFromState(state),
+      paginationState: state,
+      ...extra
     });
+    if (!response?.ok) {
+      const error = new Error(`Amazon ${kind} commit rejected: ${response?.reason || response?.status || 'unknown'}`);
+      error.code = response?.reason === 'timeout-won' || response?.reason === 'timeout-resolving'
+        ? 'AMAZON_TIMEOUT_WON'
+        : 'AMAZON_STALE_ATTEMPT';
+      throw error;
+    }
+    return response;
+  }
+
+  async function savePaginationState(state) {
+    // Background validates and writes under the same serialized attempt lock.
+    // A post-write ownership check cannot undo a stale cursor that already
+    // poisoned the next account's shared pagination slot.
+    await commitAmazonAttempt('cursor', state);
+    return true;
   }
   
   async function clearPaginationState() {
     console.log('🧹 ПРИНУДИТЕЛЬНАЯ ОЧИСТКА ПАГИНАЦИИ');
-    return new Promise(resolve => {
-      chrome.storage.local.remove([PAGINATION_STATE_KEY, 'amazonOrders'], () => {
-        resolve();
-      });
-    });
+    const state = await getPaginationState();
+    if (!state) return true;
+    await commitAmazonAttempt('clear', state);
+    return true;
   }
   
   function getAmazonPageFromUrl(rawUrl) {
@@ -1154,25 +1232,37 @@
     return null;
   }
 
+  function hasExplicitAmazonLastPage() {
+    return !!document.querySelector(
+      'li.a-last.a-disabled, .a-pagination .a-last.a-disabled, a.s-pagination-next[aria-disabled="true"]'
+    );
+  }
+
   async function navigateToNextPage(state) {
+    await requireOwnedAmazonPaginationState(state, 'before next-page planning');
     const targetPage = state.currentPage;
-    const targetUrl = findNextPageUrl(targetPage);
+    if (hasExplicitAmazonLastPage()) {
+      return { status: 'explicit-end' };
+    }
+    // Amazon changes the pagination DOM often. A missing selector is not proof
+    // that the order list ended; build the exact next URL from the current safe
+    // order-history URL before declaring the transition blocked.
+    const targetUrl = findNextPageUrl(targetPage) || buildAmazonPageUrl(location.href, targetPage);
     if (!targetUrl) {
       console.log('⚠️ Next URL not found');
-      return false;
+      return { status: 'blocked', reason: 'missing-safe-next-url' };
     }
 
     // Save a durable transition marker BEFORE leaving the document. If Chrome is
     // starved while navigating, the background watchdog can retry this exact URL
     // without discarding the already parsed pages.
     state.navigation = {
+      navId: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
       targetPage,
       targetUrl,
       fromUrl: location.href.slice(0, 500),
-      startedAt: Date.now(),
-      retryCount: 0
+      startedAt: Date.now()
     };
-    await savePaginationState(state);
     try {
       chrome.runtime.sendMessage({
         action: 'multiAccountLog',
@@ -1182,11 +1272,79 @@
     } catch (_) {}
 
     console.log(`🔄 Переходим на страницу ${targetPage}: ${targetUrl}`);
-    location.assign(targetUrl);
-    return true;
+    try {
+      // Cursor commit and tab navigation share the background attempt lock, so
+      // an account transition can be ordered either before both (stale/no-op)
+      // or after both — never between them.
+      const result = await commitAmazonAttempt('navigate', state, { targetUrl });
+      return { status: result.status || 'navigating', navId: state.navigation.navId };
+    } catch (error) {
+      state.navigation.lastError = String(error?.message || error).slice(0, 240);
+      state.navigation.lastErrorAt = Date.now();
+      if (error?.code === 'AMAZON_STALE_ATTEMPT'
+          || error?.code === 'AMAZON_TIMEOUT_WON') {
+        throw error;
+      }
+      // If navigation itself failed while this attempt is still current, retain
+      // the marker for the background recovery path. A stale attempt is already
+      // fenced and must not write anything else.
+      if (error?.code !== 'AMAZON_STALE_ATTEMPT' && error?.code !== 'AMAZON_TIMEOUT_WON') {
+        await savePaginationState(state);
+      }
+      return { status: 'blocked', reason: 'navigation-assign-failed', navId: state.navigation.navId };
+    }
+  }
+
+  async function failPaginationParsing(state, reason, error = null) {
+    const message = error ? String(error?.message || error).slice(0, 300) : '';
+    state.incomplete = {
+      at: Date.now(),
+      reason,
+      message,
+      lastCompletedPage: Math.max(0, (Number(state.currentPage) || 1) - 1),
+      totalPages: state.totalPages
+    };
+    await commitAmazonAttempt('incomplete', state, {
+      incomplete: {
+        timestamp: Date.now(),
+        reason,
+        message,
+        found: Array.isArray(state.allOrders) ? state.allOrders.length : 0,
+        lastCompletedPage: state.incomplete.lastCompletedPage,
+        totalPages: state.totalPages
+      }
+    });
+    try {
+      chrome.runtime.sendMessage({
+        action: 'progress',
+        store: 'Amazon',
+        status: `Incomplete: ${reason}`,
+        found: Array.isArray(state.allOrders) ? state.allOrders.length : 0
+      });
+    } catch (_) {}
+    return { success: false, incomplete: true, reason, orders: state.allOrders || [] };
   }
   
-  async function finishPaginationParsing(state) {
+  async function getOwnedAmazonParserContext() {
+    try {
+      const context = await chrome.runtime.sendMessage({ action: 'getAmazonParserContext' });
+      return context?.owned ? context : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function finishPaginationParsing(state, reason) {
+    if (!['configured-limit', 'explicit-end'].includes(reason) || state.navigation) {
+      return failPaginationParsing(state, reason || 'invalid-completion-state');
+    }
+    const ownedContext = await getOwnedAmazonParserContext();
+    if (!ownedContext
+        || ownedContext.runId !== state.runId
+        || ownedContext.account !== state.account
+        || ownedContext.tabId !== state.parserTabId) {
+      throw new Error('stale Amazon parser run/account/tab before commit');
+    }
     console.log(`\n🎉 ПАРСИНГ ЗАВЕРШЁН!`);
     console.log(`📊 Итого: ${state.allOrders.length} товаров с ${state.totalPages} страниц`);
     console.log(`⏱️ Время: ${Math.round((Date.now() - state.startedAt) / 1000)}с`);
@@ -1219,74 +1377,20 @@
       console.log("  ✅ Multi-order shipments не найдены");
     }
     
-    // Final save - APPEND to existing orders (for multi-account) with deduplication
-    const timestamp = new Date().toISOString();
-    chrome.storage.local.get(['orderData'], (result) => {
-      const orderData = result.orderData || {};
-      const existingOrders = orderData['Amazon']?.orders || [];
-      
-      // Combine existing + new orders
-      const allCombinedOrders = [...existingOrders, ...state.allOrders];
-      
-      // Deduplicate by order_id + track_number + product_name combo
-      // IMPORTANT: Include product_name to allow multiple DIFFERENT products in same shipment!
-      const seen = new Set();
-      const uniqueOrders = allCombinedOrders.filter(order => {
-        const key = `${order.order_id}_${order.track_number}_${order.product_name || ''}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
-      
-      const uniqueOrderIds = new Set(uniqueOrders.map(o => o.order_id));
-      
-      orderData['Amazon'] = {
-        orders: uniqueOrders,
-        lastParsed: timestamp,
-        totalOrders: uniqueOrders.length,
-        totalProductsCount: uniqueOrders.length,
-        uniqueOrdersCount: uniqueOrderIds.size
-      };
-      chrome.storage.local.set({ orderData }, () => {
-        console.log(`💾 Финальное сохранение: ${state.allOrders.length} новых + ${existingOrders.length} существующих = ${uniqueOrders.length} уникальных`);
-      });
+    // Keep the cursor until background acknowledges the completion and switches
+    // the account. The background arbiter rereads fresh shared data, validates
+    // ownership and commits rows + cursor + completion permit in one critical
+    // section; content-side check-then-set cannot provide that guarantee.
+    state.completedAt = Date.now();
+    state.completionReason = reason;
+    delete state.incomplete;
+    const finalCommit = await commitAmazonAttempt('complete', state, {
+      orders: state.allOrders,
+      cancelledOrders: Array.isArray(state.cancelledOrders) ? state.cancelledOrders : [],
+      reason
     });
-    
-    chrome.storage.local.set({ amazonOrders: state.allOrders });
-
-    // Persist CANCELLED orders (money-safety) — append across accounts, dedup by order_id.
-    // Background reads `amazonCancelledOrders` when building the night report + alert.
-    try {
-      const cxlNew = Array.isArray(state.cancelledOrders) ? state.cancelledOrders : [];
-      await new Promise((resolve) => {
-        chrome.storage.local.get(['amazonCancelledOrders'], (r) => {
-          const prev = Array.isArray(r.amazonCancelledOrders) ? r.amazonCancelledOrders : [];
-          const merged = [...prev, ...cxlNew];
-          const seen = new Set();
-          const uniq = merged.filter((o) => {
-            const k = o && o.order_id;
-            if (!k || seen.has(k)) return false;
-            seen.add(k);
-            return true;
-          });
-          chrome.storage.local.set({ amazonCancelledOrders: uniq, amazonCancelledUpdatedAt: Date.now() }, resolve);
-        });
-      });
-      if (cxlNew.length) console.log(`🚫 Сохранено отменённых Amazon-заказов (этот аккаунт): ${cxlNew.length}`);
-    } catch (e) { console.warn('cancelled persist failed:', e?.message || e); }
-
-    console.log("🔥 CALLING CLEAR PAGINATION"); await clearPaginationState();
-    
-    // НАДЕЖНЫЙ механизм: записываем флаг завершения напрямую в storage
-    // чтобы background.js мог его проверить даже если sendMessage потеряется
-    await new Promise(resolve => {
-      chrome.storage.local.set({
-        amazonParsingComplete: {
-          timestamp: Date.now(),
-          found: state.allOrders.length
-        }
-      }, resolve);
-    });
+    console.log(`💾 Финальное сохранение: ${state.allOrders.length} новых + ${finalCommit.existingCount || 0} существующих = ${finalCommit.totalCount || state.allOrders.length} уникальных`);
+    if (state.cancelledOrders?.length) console.log(`🚫 Сохранено отменённых Amazon-заказов (этот аккаунт): ${state.cancelledOrders.length}`);
     console.log('🚩 Флаг завершения Amazon записан в storage');
     try {
       chrome.runtime.sendMessage({
@@ -1303,7 +1407,9 @@
       current: state.allOrders.length, 
       total: state.allOrders.length, 
       status: 'Done ✅',
-      found: state.allOrders ? state.allOrders.length : 0
+      found: state.allOrders ? state.allOrders.length : 0,
+      runId: state.runId || null,
+      account: state.account || ''
     }).catch(() => console.log('⚠️ sendMessage failed, but storage flag is set'));
     
     chrome.runtime.sendMessage({ 
@@ -1333,6 +1439,16 @@
       });
     } catch (e) { /* SW may be asleep, ignore */ }
 
+    const ownedContext = await getOwnedAmazonParserContext();
+    if (!ownedContext) {
+      console.log('⏭ Amazon parse ignored in a non-parser tab/run');
+      return { success: false, stale: true, orders: [] };
+    }
+    chrome.runtime.sendMessage({
+      action: 'parserStarted', store: 'Amazon',
+      runId: ownedContext.runId, account: ownedContext.account
+    }).catch(() => {});
+
     if (await shouldStop()) {
       console.log('🛑 Stopped before start');
       chrome.runtime.sendMessage({ action: 'progress', store: 'Amazon', current: 0, total: maxPagesToParse, status: 'Stopped' });
@@ -1344,6 +1460,12 @@
     if (!state) {
       console.log(`🆕 Начинаем новый цикл парсинга (${maxPagesToParse} страниц)`);
       state = {
+        parseId: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+        runId: ownedContext.runId,
+        account: ownedContext.account,
+        parserTabId: ownedContext.tabId,
+        stageStartedAt: ownedContext.stageStartedAt,
+        accountSwitchStartedAt: ownedContext.accountSwitchStartedAt,
         currentPage: 1,
         totalPages: maxPagesToParse,
         allOrders: [],
@@ -1353,6 +1475,18 @@
       await savePaginationState(state);
     } else {
       console.log(`🔄 Продолжаем парсинг - страница ${state.currentPage}/${state.totalPages}`);
+      if (state.runId !== ownedContext.runId
+          || state.account !== ownedContext.account
+          || state.parserTabId !== ownedContext.tabId
+          || state.stageStartedAt !== ownedContext.stageStartedAt
+          || state.accountSwitchStartedAt !== ownedContext.accountSwitchStartedAt) {
+        return failPaginationParsing(state, 'stale-pagination-context');
+      }
+    }
+
+    if (state.completedAt) {
+      console.log('✅ Amazon completion already persisted; waiting for background acknowledgement');
+      return { success: true, completed: true, waitingForBackground: true, orders: state.allOrders || [] };
     }
 
     if (state.navigation && state.navigation.targetPage === state.currentPage) {
@@ -1377,7 +1511,11 @@
 
       const navigation = state.navigation;
       delete state.navigation;
-      await savePaginationState(state);
+      delete state.incomplete;
+      await commitAmazonAttempt('cursor', state, {
+        amazonOrders: state.allOrders,
+        clearRecovery: true
+      });
       try {
         chrome.runtime.sendMessage({
           action: 'multiAccountLog',
@@ -1400,7 +1538,7 @@
 
       if (await shouldStop()) {
         console.log('🛑 Stopped during pagination');
-        return await finishPaginationParsing(state);
+        return await failPaginationParsing(state, 'stopped-during-pagination');
       }
       
       chrome.runtime.sendMessage({ 
@@ -1438,6 +1576,9 @@
       } finally {
         clearInterval(__heartbeat);
       }
+      if (!pageResult?.success) {
+        throw new Error(pageResult?.error || `Amazon page ${state.currentPage} did not parse successfully`);
+      }
       const pageOrders = pageResult.orders || [];
       console.log(`✅ Страница ${state.currentPage}: найдено ${pageOrders.length} заказов`);
       
@@ -1451,33 +1592,59 @@
       
       // Промежуточное сохранение - save current account progress only (NOT appending)
       // Appending happens only in final save
-      chrome.storage.local.set({ amazonOrders: state.allOrders });
+      await commitAmazonAttempt('cursor', state, { amazonOrders: state.allOrders });
       
       // Переходим на следующую страницу?
       if (state.currentPage <= state.totalPages) {
         console.log(`\n⏳ Пауза ${PAGE_DELAY_MS / 1000}с перед переходом на страницу ${state.currentPage}...`);
-        await savePaginationState(state);
         await sleep(PAGE_DELAY_MS);
 
         if (await shouldStop()) {
           console.log('🛑 Stopped before clicking next');
-          return await finishPaginationParsing(state);
+          return await failPaginationParsing(state, 'stopped-before-navigation');
         }
         
-        const navigating = await navigateToNextPage(state);
-        if (!navigating) {
-          console.log('⚠️ Не удалось перейти на следующую страницу, завершаем');
-          return await finishPaginationParsing(state);
+        const navigationResult = await navigateToNextPage(state);
+        if (navigationResult.status === 'explicit-end') {
+          return await finishPaginationParsing(state, 'explicit-end');
+        }
+        if (navigationResult.status !== 'navigating') {
+          console.log('⚠️ Не удалось перейти на следующую страницу; оставляю честный incomplete');
+          return await failPaginationParsing(state, navigationResult.reason || 'navigation-blocked');
         }
         return { success: true, continuing: true };
         
       } else {
-        return await finishPaginationParsing(state);
+        return await finishPaginationParsing(state, 'configured-limit');
       }
       
     } catch (error) {
       console.error('❌ Ошибка парсинга:', error);
-      return await finishPaginationParsing(state);
+      if (error?.code === 'AMAZON_STALE_ATTEMPT'
+          || error?.code === 'AMAZON_TIMEOUT_WON') {
+        return {
+          success: false,
+          stale: error.code === 'AMAZON_STALE_ATTEMPT',
+          timeout: error.code === 'AMAZON_TIMEOUT_WON',
+          reason: error.code,
+          orders: state?.allOrders || []
+        };
+      }
+      try {
+        return await failPaginationParsing(state, 'parser-error', error);
+      } catch (commitError) {
+        if (commitError?.code === 'AMAZON_STALE_ATTEMPT'
+            || commitError?.code === 'AMAZON_TIMEOUT_WON') {
+          return {
+            success: false,
+            stale: commitError.code === 'AMAZON_STALE_ATTEMPT',
+            timeout: commitError.code === 'AMAZON_TIMEOUT_WON',
+            reason: commitError.code,
+            orders: state?.allOrders || []
+          };
+        }
+        throw commitError;
+      }
     }
   }
   // ========== END PAGINATION ==========
@@ -1489,6 +1656,11 @@
   // НО: если это новый multi-account парсинг — начинаем заново!
   (async function checkAutoResume() {
     await sleep(1500);
+    const ownership = await getOwnedAmazonParserContext();
+    if (!ownership) {
+      console.log('⏭ Amazon auto-resume skipped: this is not the parser-owned tab');
+      return;
+    }
     
     // Проверяем, есть ли активный multi-account парсинг
     const multiState = await new Promise(resolve => 

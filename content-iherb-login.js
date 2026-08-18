@@ -23,6 +23,33 @@ const IS_LOGOFF    = /\/account\/logoff/i.test(location.href);
 const IS_NEW_LOGIN = /\/auth\/ui\/account\/login/i.test(location.href);        // checkout.iherb.com (2-step)
 const IS_OLD_LOGIN = /\/account\/sign-in/i.test(location.href);                // secure.iherb.com (legacy)
 const IS_LOGIN     = IS_NEW_LOGIN || IS_OLD_LOGIN;
+let iherbSwitchRunId = null;
+
+function normalizeIherbEmail(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+async function readFreshIherbLoginIntent(expected) {
+  const [ownership, data] = await Promise.all([
+    sendMessageAsync({ action: 'getParserContext', store: 'iherb', purpose: 'login' }).catch(() => null),
+    chrome.storage.local.get(['pendingIherbSwitch', 'iherbFinalReturn'])
+  ]);
+  const pending = data.pendingIherbSwitch;
+  const matches = !!ownership?.owned
+    && ownership.runId === expected.runId
+    && ownership.tabId === expected.tabId
+    && normalizeIherbEmail(ownership.account) === normalizeIherbEmail(expected.email)
+    && pending?.runId === expected.runId
+    && normalizeIherbEmail(pending?.email) === normalizeIherbEmail(expected.email)
+    && !!data.iherbFinalReturn === expected.finalReturn;
+  return matches ? { ownership, pending, finalReturn: !!data.iherbFinalReturn } : null;
+}
+
+async function assertFreshIherbLoginIntent(expected) {
+  const fresh = await readFreshIherbLoginIntent(expected);
+  if (!fresh) throw new Error('stale_iherb_login_intent');
+  return fresh;
+}
 
 (async function main() {
   // Внешний email captured для catch блока: чтобы при любом неожиданном
@@ -37,8 +64,19 @@ const IS_LOGIN     = IS_NEW_LOGIN || IS_OLD_LOGIN;
   if (IS_LOGOFF) {
     // iHerb после /account/logoff сам редиректит на home. Фолбэк на sign-in если застряли.
     console.log('🔐 [iHerb Login] logoff page — waiting for redirect');
-    setTimeout(() => {
-      if (/\/account\/logoff/i.test(location.href)) {
+    const logoffData = await chrome.storage.local.get(['pendingIherbSwitch', 'iherbFinalReturn']);
+    const logoffOwnership = await sendMessageAsync({ action: 'getParserContext', store: 'iherb', purpose: 'login' })
+      .catch(() => null);
+    if (!logoffData.pendingIherbSwitch || !logoffOwnership?.owned) return;
+    const logoffIntent = {
+      runId: logoffOwnership.runId,
+      tabId: logoffOwnership.tabId,
+      email: logoffData.pendingIherbSwitch.email,
+      finalReturn: !!logoffData.iherbFinalReturn
+    };
+    setTimeout(async () => {
+      if (/\/account\/logoff/i.test(location.href)
+          && await readFreshIherbLoginIntent(logoffIntent)) {
         console.log('🔐 [iHerb Login] stuck on logoff — forcing www.iherb.com');
         location.href = 'https://www.iherb.com/';
       }
@@ -62,12 +100,29 @@ const IS_LOGIN     = IS_NEW_LOGIN || IS_OLD_LOGIN;
     return;
   }
 
-  const { email, password } = data.pendingIherbSwitch;
+  const { email, password, runId } = data.pendingIherbSwitch;
   if (!email || !password) {
     console.warn('🔐 [iHerb Login] pendingIherbSwitch missing email/password');
     return;
   }
   emailForFailure = email;
+  iherbSwitchRunId = runId || null;
+
+  const ownership = await sendMessageAsync({ action: 'getParserContext', store: 'iherb', purpose: 'login' })
+    .catch(() => null);
+  if (!ownership?.owned
+      || ownership.runId !== runId
+      || String(ownership.account || '').trim().toLowerCase()
+        !== String(email || '').trim().toLowerCase()) {
+    console.warn('🔐 [iHerb Login] stale or foreign login tab — leaving it untouched');
+    return;
+  }
+  const expectedIntent = {
+    runId,
+    tabId: ownership.tabId,
+    email,
+    finalReturn: !!data.iherbFinalReturn
+  };
 
   console.log(`🔐 [iHerb Login] auto-login as ${email} (finalReturn=${!!data.iherbFinalReturn}, layout=${IS_NEW_LOGIN ? '2step' : 'legacy'})`);
 
@@ -78,24 +133,24 @@ const IS_LOGIN     = IS_NEW_LOGIN || IS_OLD_LOGIN;
     if (retries <= MAX) {
       const wait = retries === 1 ? 5000 : retries === 2 ? 15000 : 30000;
       console.warn(`🔐 [iHerb Login] error page (try ${retries}/${MAX}) — reload in ${wait}ms`);
+      await assertFreshIherbLoginIntent(expectedIntent);
       await chrome.storage.local.set({ iherbSignInRetries: retries });
       await sleep(wait);
+      await assertFreshIherbLoginIntent(expectedIntent);
       location.reload();
       return;
     } else {
       console.error('🔐 [iHerb Login] error page persists after retries');
-      await chrome.storage.local.remove(['iherbSignInRetries']);
       sendFailed(email, 'sign_in_page_error_after_retries');
       return;
     }
   }
-  await chrome.storage.local.remove(['iherbSignInRetries']);
 
   try {
     if (IS_NEW_LOGIN) {
-      await runTwoStepLogin(email, password);
+      await runTwoStepLogin(email, password, expectedIntent);
     } else {
-      await runLegacyLogin(email, password);
+      await runLegacyLogin(email, password, expectedIntent);
     }
   } catch (e) {
     console.error('🔐 [iHerb Login] fatal during login flow:', e);
@@ -125,7 +180,7 @@ const IS_LOGIN     = IS_NEW_LOGIN || IS_OLD_LOGIN;
     if (cap.active) {
       console.warn(`🔐 [iHerb Login] active CAPTCHA detected (${cap.type})`);
       // Пытаемся решить через 2captcha (reCAPTCHA с известным sitekey).
-      const solved = await trySolveCaptcha(cap);
+      const solved = await trySolveCaptcha(cap, expectedIntent);
       if (solved) {
         console.log('🔐 [iHerb Login] CAPTCHA solved via 2captcha, continuing');
         // упали в нормальный flow ниже (redirect уже случился внутри trySolveCaptcha)
@@ -151,18 +206,32 @@ const IS_LOGIN     = IS_NEW_LOGIN || IS_OLD_LOGIN;
     return;
   }
 
-  // Login завершён — чистим pendingIherbSwitch
-  await chrome.storage.local.remove(['pendingIherbSwitch']);
-
-  if (data.iherbFinalReturn) {
+  const completionIntent = await readFreshIherbLoginIntent(expectedIntent);
+  if (!completionIntent) {
+    console.log('⏭ [iHerb Login] intent changed before landing mutation');
+    return;
+  }
+  if (completionIntent.finalReturn) {
     console.log('🏁 [iHerb Login] final return done, going to home');
-    await chrome.storage.local.remove(['iherbFinalReturn', 'iherbSwitchInProgress', 'iherbSwitchStartedAt']);
+    await chrome.storage.local.set({
+      iherbFinalReturnConfirmed: {
+        runId,
+        account: email,
+        tabId: expectedIntent.tabId,
+        confirmedAt: Date.now()
+      }
+    });
+    if (!await readFreshIherbLoginIntent(expectedIntent)) return;
     location.href = 'https://www.iherb.com/';
     return;
   }
 
+  // Keep the run-scoped pending intent until the background consumes or
+  // overwrites it. A content-script remove could otherwise delete a newer run.
+  if (!await readFreshIherbLoginIntent(expectedIntent)) return;
   console.log('🔐 [iHerb Login] → /myaccount/orders for parse');
   await chrome.storage.local.set({ iherbSwitchInProgress: true });
+  if (!await readFreshIherbLoginIntent(expectedIntent)) return;
   location.href = 'https://secure.iherb.com/myaccount/orders';
   } catch (e) {
     console.error('🔐 [iHerb Login] uncaught exception in main():', e);
@@ -177,7 +246,7 @@ const IS_LOGIN     = IS_NEW_LOGIN || IS_OLD_LOGIN;
 // ─── 2-step login (checkout.iherb.com/auth/ui/account/login) ───
 // LastPass-aware: до и после type ждём чтобы autofill отработал и стабилизировался,
 // потом verify value и retry если LastPass перезаписал наш ввод.
-async function runTwoStepLogin(email, password) {
+async function runTwoStepLogin(email, password, expectedIntent) {
   // Settle wait: LastPass autofill инжектится с delay 1-3 сек после load.
   // Если начнём clear сразу — LastPass дозальёт ПОСЛЕ нашего type → invalid password.
   console.log('🔐 [iHerb Login] settle 4s (LastPass autofill window)');
@@ -190,6 +259,7 @@ async function runTwoStepLogin(email, password) {
   );
   if (!emailInput) throw new Error('email_field_not_found');
 
+  await assertFreshIherbLoginIntent(expectedIntent);
   await clearAndType(emailInput, email);
   await verifyOrRetry(emailInput, email, 'email');
   await sleep(800 + Math.random() * 400);
@@ -199,6 +269,7 @@ async function runTwoStepLogin(email, password) {
     'button[type="submit"]'
   ], btn => /continue/i.test((btn.textContent || '').trim()));
   if (!continueBtn) throw new Error('continue_button_not_found');
+  await assertFreshIherbLoginIntent(expectedIntent);
   console.log('🔐 [iHerb Login] click Continue');
   continueBtn.click();
 
@@ -213,6 +284,7 @@ async function runTwoStepLogin(email, password) {
   console.log('🔐 [iHerb Login] password step settle 4s');
   await sleep(4000);
 
+  await assertFreshIherbLoginIntent(expectedIntent);
   await clearAndType(passInput, password);
   await verifyOrRetry(passInput, password, 'password');
 
@@ -223,6 +295,7 @@ async function runTwoStepLogin(email, password) {
     'button[type="submit"]'
   ], btn => /^sign\s*in$/i.test((btn.textContent || '').trim()));
   if (!signInBtn) throw new Error('sign_in_button_not_found');
+  await assertFreshIherbLoginIntent(expectedIntent);
   console.log('🔐 [iHerb Login] click Sign In');
   signInBtn.click();
 }
@@ -245,7 +318,7 @@ async function verifyOrRetry(input, expected, label) {
 }
 
 // ─── Legacy single-form (secure.iherb.com/account/sign-in) ───
-async function runLegacyLogin(email, password) {
+async function runLegacyLogin(email, password, expectedIntent) {
   const emailInput = await waitForSelector(
     'input[type="email"], input[name="email"], input[id*="email" i], input[autocomplete="username"]',
     16, 500
@@ -258,6 +331,7 @@ async function runLegacyLogin(email, password) {
 
   console.log('🔐 [iHerb Login Legacy] settle 4s (LastPass autofill window)');
   await sleep(4000);
+  await assertFreshIherbLoginIntent(expectedIntent);
   await clearAndType(emailInput, email);
   await verifyOrRetry(emailInput, email, 'legacy_email');
   await sleep(600 + Math.random() * 300);
@@ -269,6 +343,7 @@ async function runLegacyLogin(email, password) {
   let submitBtn = form?.querySelector('button[type="submit"], input[type="submit"]');
   if (!submitBtn) submitBtn = document.querySelector('button[type="submit"], input[type="submit"], button[id*="sign" i]');
 
+  await assertFreshIherbLoginIntent(expectedIntent);
   if (submitBtn) submitBtn.click();
   else if (form) try { form.requestSubmit(); } catch (_) { form.submit(); }
   else throw new Error('legacy_submit_method_not_available');
@@ -464,7 +539,7 @@ const CAPTCHA_SOLVE_BUDGET_MS = 60000;
 // Возвращает true только если после применения мы реально ушли со страницы логина.
 // Решаем только reCAPTCHA с известным sitekey — Press&Hold/DataDome 2captcha-токеном
 // не закрыть, для них сразу false (→ skip).
-async function trySolveCaptcha(cap) {
+async function trySolveCaptcha(cap, expectedIntent) {
   const isRecaptcha = cap.type === 'recaptcha-challenge' || cap.type === 'recaptcha-checkbox';
   if (!isRecaptcha || !cap.sitekey) {
     console.warn(`🧩 [iHerb Login] captcha type "${cap.type}" not auto-solvable (no sitekey / unsupported)`);
@@ -491,6 +566,7 @@ async function trySolveCaptcha(cap) {
   }
 
   // Применяем токен в page-world (isolated content script не видит grecaptcha).
+  await assertFreshIherbLoginIntent(expectedIntent);
   injectRecaptchaToken(token);
   await sleep(800);
 
@@ -500,6 +576,7 @@ async function trySolveCaptcha(cap) {
     '#auth-sign-in-button, #auth-continue-button, button[type="submit"], input[type="submit"]'
   );
   if (submitBtn && submitBtn.offsetParent !== null) {
+    await assertFreshIherbLoginIntent(expectedIntent);
     try { submitBtn.click(); } catch (_) {}
   }
 
@@ -564,7 +641,8 @@ function sendFailed(email, reason) {
   chrome.runtime.sendMessage({
     action: 'iherbSwitchFailed',
     email,
-    reason
+    reason,
+    runId: iherbSwitchRunId
   }, () => chrome.runtime.lastError /* swallow */);
 }
 

@@ -6,8 +6,7 @@ console.log('🔄 Amazon redirect script loaded on:', window.location.href);
 (async function() {
   // Skip if already on order-history page (avoid redirect loop)
   if (window.location.href.includes('order-history')) {
-    console.log('📋 Already on order-history, clearing switch flag...');
-    await chrome.storage.local.remove(['accountSwitchInProgress', 'switchedToEmail']);
+    console.log('📋 Already on order-history; content-amazon owns the gated parse flags');
     return;
   }
   
@@ -22,24 +21,78 @@ console.log('🔄 Amazon redirect script loaded on:', window.location.href);
 
   console.log('📋 Checking for account switch flag:', data);
 
+  const hasParserIntent = !!(data.amazonFinalReturn || data.accountSwitchInProgress);
+  const ownership = hasParserIntent
+    ? await chrome.runtime.sendMessage({ action: 'getAmazonParserContext' }).catch(() => null)
+    : null;
+  if (hasParserIntent && !ownership?.owned) {
+    console.log('⏭ Foreign Amazon home tab — leaving parser flags and URL untouched');
+    return;
+  }
+
   // Final return: добрались до главной на нужном аккаунте — просто чистим флаги
   if (data.amazonFinalReturn) {
-    console.log('🏁 Amazon final return complete, clearing flags (no parse)');
-    await chrome.storage.local.remove(['amazonFinalReturn', 'accountSwitchInProgress', 'switchedToEmail']);
+    await new Promise(resolve => setTimeout(resolve, 500));
+    const [freshOwnership, freshFlags] = await Promise.all([
+      chrome.runtime.sendMessage({ action: 'getAmazonParserContext' }).catch(() => null),
+      chrome.storage.local.get(['amazonFinalReturn', 'pendingAccountSwitch'])
+    ]);
+    const finalStillOwned = freshOwnership?.owned
+      && freshOwnership.runId === ownership.runId
+      && freshOwnership.account === ownership.account
+      && freshOwnership.tabId === ownership.tabId
+      && !!freshFlags.amazonFinalReturn
+      && freshFlags.pendingAccountSwitch?.runId === ownership.runId
+      && String(freshFlags.pendingAccountSwitch?.email || '').trim().toLowerCase()
+        === String(ownership.account || '').trim().toLowerCase();
+    if (!finalStillOwned) {
+      console.log('⏭ Amazon final-return intent changed before confirmation');
+      return;
+    }
+    console.log('🏁 Amazon final return complete (no parse)');
+    await chrome.storage.local.set({
+      amazonFinalReturnConfirmed: {
+        runId: ownership.runId,
+        account: ownership.account,
+        tabId: ownership.tabId,
+        confirmedAt: Date.now()
+      }
+    });
+    // Do not clear global intent keys from a content script. A newer run could
+    // be prepared between the proof above and an awaited remove(). The
+    // generation-fenced background finalizer consumes them when it advances.
     return;
   }
 
   if (data.accountSwitchInProgress) {
+    if (String(ownership.account || '').trim().toLowerCase()
+        !== String(data.switchedToEmail || '').trim().toLowerCase()) {
+      console.log('⏭ Amazon switch landing account does not match parser ownership');
+      return;
+    }
     console.log(`✅ Account switch completed to ${data.switchedToEmail}, redirecting to orders...`);
-    
-    // Clear flag BEFORE redirect to avoid loops
-    await chrome.storage.local.remove(['accountSwitchInProgress', 'switchedToEmail']);
     
     // Small delay to let page settle
     await new Promise(resolve => setTimeout(resolve, 500));
+
+    const [freshOwnership, freshFlags] = await Promise.all([
+      chrome.runtime.sendMessage({ action: 'getAmazonParserContext' }).catch(() => null),
+      chrome.storage.local.get(['accountSwitchInProgress', 'switchedToEmail', 'amazonFinalReturn'])
+    ]);
+    if (!freshOwnership?.owned
+        || freshOwnership.runId !== ownership.runId
+        || freshOwnership.account !== ownership.account
+        || freshOwnership.tabId !== ownership.tabId
+        || !freshFlags.accountSwitchInProgress
+        || freshFlags.amazonFinalReturn
+        || String(freshFlags.switchedToEmail || '').trim().toLowerCase()
+          !== String(ownership.account || '').trim().toLowerCase()) {
+      console.log('⏭ Amazon ownership changed before redirect to orders');
+      return;
+    }
     
     // Redirect to orders page
-    window.location.href = 'https://www.amazon.com/gp/your-account/order-history?orderFilter=year-2025';
+    window.location.href = 'https://www.amazon.com/gp/your-account/order-history?orderFilter=months-3';
   } else {
     console.log('📋 No account switch in progress');
   }

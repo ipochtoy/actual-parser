@@ -1,5 +1,5 @@
-/* content-ebay.js — v7.7.5 (feed-only by default: detail-page tracking enrichment gated OFF to avoid soft-ban; page-loop fetch timeout+retry) */
-console.log('🔧 eBay Parser v7.7.5 loaded');
+/* content-ebay.js — v7.8.0 (owned nightly run with durable completion) */
+console.log('🔧 eBay Parser v7.8.0 loaded');
 
 // Silence the benign MV3 console flood during long scans. Fire-and-forget
 // chrome.runtime.sendMessage() calls (progress/parserStarted/updatePopup)
@@ -21,6 +21,8 @@ let isParsingInProgress = false;
 // eBay account email (single account in this extension). Preloaded by
 // parseEbayOrders() before calling parseItem() so every row carries it.
 let __ebayAccountName = '';
+let __ebayRunId = null;
+let __ebayScreenshotQueueCommits = [];
 // CANCELLED / REFUNDED orders caught this run (money-safety) — reset at parse start,
 // persisted to storage `ebayCancelledOrders` at the end for the background night report.
 let __ebayCancelledOrders = [];
@@ -68,6 +70,43 @@ async function getEbayAccount() {
   } catch (_) {
     return '';
   }
+}
+
+function normalizeEbayAccount(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+async function captureEbayParserContext(fallbackAccount = '') {
+  const door = await chrome.runtime.sendMessage({ action: 'getParserContext', store: 'ebay' }).catch(() => null);
+  if (door?.active && !door.owned) {
+    throw new Error('eBay pipeline context belongs to a different tab');
+  }
+  if (door?.owned) {
+    if (normalizeEbayAccount(door.account) !== normalizeEbayAccount(fallbackAccount)) {
+      throw new Error('eBay account does not match the configured pipeline account');
+    }
+    return { runId: door.runId, account: door.account, parserTabId: door.tabId, standalone: false };
+  }
+  return { runId: null, account: fallbackAccount, parserTabId: null, standalone: true };
+}
+
+async function verifyEbayParserContext(context) {
+  const fresh = await chrome.storage.local.get(['pipelineRun', 'pipelineStage']);
+  if (!context.runId) {
+    if (['starting', 'running'].includes(fresh.pipelineRun?.status)) {
+      throw new Error('standalone eBay parse overlapped a pipeline run');
+    }
+    return true;
+  }
+  const valid = fresh.pipelineRun?.id === context.runId
+    && ['starting', 'running'].includes(fresh.pipelineRun?.status)
+    && fresh.pipelineStage?.active === true
+    && fresh.pipelineStage?.runId === context.runId
+    && fresh.pipelineStage?.stages?.[fresh.pipelineStage?.currentIndex] === 'ebay'
+    && normalizeEbayAccount(fresh.pipelineRun?.expected?.ebay?.[0])
+      === normalizeEbayAccount(context.account);
+  if (!valid) throw new Error('stale eBay run/account before commit');
+  return true;
 }
 
 // Save log entry directly to storage
@@ -130,12 +169,12 @@ async function sendLog(orderId, trackNumber, status, details) {
       }
       isParsingInProgress = true;
       console.log('🚀 Starting auto-parse...');
-      // Notify background that parsing actually started
-      chrome.runtime.sendMessage({
-        action: 'parserStarted',
-        store: 'eBay'
+      parseEbayOrders().catch(error => {
+        chrome.runtime.sendMessage({
+          action: 'parseError', store: 'eBay', error: error.message,
+          runId: __ebayRunId, account: __ebayAccountName
+        }).catch(() => {});
       });
-      parseEbayOrders();
     }, 3000);
   } else {
     console.log('ℹ️ No auto-parse flag (or expired)');
@@ -281,9 +320,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // Respond IMMEDIATELY to confirm receipt (so popup knows script is alive)
     sendResponse({ received: true, store: 'eBay' });
 
-    // Notify background that parsing actually started
-    chrome.runtime.sendMessage({ action: 'parserStarted', store: 'eBay' });
-
     // Start parsing asynchronously
     parseEbayOrders()
       .then(orders => {
@@ -295,7 +331,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         chrome.runtime.sendMessage({
           action: 'parseError',
           store: 'eBay',
-          error: error.message
+          error: error.message,
+          runId: __ebayRunId,
+          account: __ebayAccountName
         });
       });
     return false; // Don't keep channel open - we already responded
@@ -305,11 +343,21 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 async function parseEbayOrders() {
   console.log(`🚀 parseEbayOrders() started (Mode: ${PARSE_MODE})`);
   __ebayCancelledOrders = []; // fresh per run
+  __ebayScreenshotQueueCommits = [];
   console.log('📍 Current URL:', window.location.href);
 
   // Resolve eBay account_name BEFORE we call parseItem() so every row
   // carries it. eBay has only one account in this extension.
   __ebayAccountName = await getEbayAccount();
+  const parserContext = await captureEbayParserContext(__ebayAccountName);
+  __ebayAccountName = parserContext.account || __ebayAccountName;
+  __ebayRunId = parserContext.runId;
+  if (parserContext.runId) {
+    chrome.runtime.sendMessage({
+      action: 'parserStarted', store: 'eBay',
+      runId: parserContext.runId, account: parserContext.account
+    }).catch(() => {});
+  }
   console.log(`👤 eBay account_name: ${__ebayAccountName || '(empty)'}`);
 
   // Wait a bit for page to fully load
@@ -514,32 +562,52 @@ async function parseEbayOrders() {
 
     console.log(`📊 TOTAL: ${allOrders.length} orders`);
 
-    // Save orders to storage (store-specific)
+    // Zero rows is not a successful cabinet pass. The old code emitted Done and
+    // only then threw, so the pipeline advanced while the report claimed eBay
+    // completed. Keep the stage on its explicit error/watchdog path instead.
+    if (allOrders.length === 0) {
+      throw new Error('Found 0 orders. Check if you are on the correct eBay page (www.ebay.com/mye/myebay/purchase) and have orders for this year.');
+    }
+
+    // Save orders to storage (store-specific) and await the actual commit before
+    // Done is the account-switch permit: every producer ACK must have reached
+    // persisted storage before this content script can release it.
+    await Promise.all(__ebayScreenshotQueueCommits);
+
+    // Bind every row and the completion permit to the same durable pipeline run.
+    await verifyEbayParserContext(parserContext);
+    const runId = parserContext.runId;
+    const parserAccount = parserContext.account || '';
+    const observedAt = new Date().toISOString();
+    for (const order of allOrders) {
+      order.parser_run_id = runId;
+      order.parser_account = parserAccount;
+      order.observed_at = observedAt;
+    }
+
+    // emitting Done. Done is the background's permission to advance to Amazon.
     const timestamp = new Date().toISOString();
-    chrome.storage.local.get(['orderData'], (result) => {
-      const orderData = result.orderData || {};
-
-      orderData['eBay'] = {
-        orders: allOrders,
-        lastParsed: timestamp,
-        totalOrders: allOrders.length
-      };
-
-      chrome.storage.local.set({ orderData });
-      console.log('💾 Saved eBay data to storage');
-      // Notify popup to refresh UI states (copy buttons etc.)
-      chrome.runtime.sendMessage({ action: 'updatePopup' });
-    });
+    const stored = await chrome.storage.local.get(['orderData']);
+    const orderData = stored.orderData || {};
+    orderData['eBay'] = {
+      orders: allOrders,
+      lastParsed: timestamp,
+      totalOrders: allOrders.length
+    };
+    await chrome.storage.local.set({ orderData });
+    console.log('💾 Saved eBay data to storage');
+    // Notify popup to refresh UI states (copy buttons etc.)
+    chrome.runtime.sendMessage({ action: 'updatePopup' }).catch(() => {});
 
     // AUTO-SAVE: Also save to ebayOrders for direct access
-    chrome.storage.local.set({
+    await chrome.storage.local.set({
       ebayOrders: allOrders,
       ebayLastUpdate: Date.now()
     });
     console.log('💾 Auto-saved to ebayOrders:', allOrders.length);
 
     // Persist CANCELLED orders (money-safety) — single-account, overwrite per run.
-    chrome.storage.local.set({
+    await chrome.storage.local.set({
       ebayCancelledOrders: __ebayCancelledOrders.slice(),
       ebayCancelledUpdatedAt: Date.now()
     });
@@ -552,13 +620,10 @@ async function parseEbayOrders() {
       current: MAX_PAGES,
       total: MAX_PAGES,
       status: 'Done ✅', // Explicit 'Done ✅' for background.js to detect completion
-      found: allOrders.length
+      found: allOrders.length,
+      runId,
+      account: parserAccount
     });
-
-    // Check if we found any orders
-    if (allOrders.length === 0) {
-      throw new Error('Found 0 orders. Check if you are on the correct eBay page (www.ebay.com/mye/myebay/purchase) and have orders for this year.');
-    }
 
     // NO auto-download - user will use Copy button for Google Sheets
     // CSV download only via popup "Export to CSV" button if needed
@@ -633,14 +698,17 @@ async function enrichMissingTrackings(allOrders) {
       sendLog(orderId, tracking, '✅ Found (detail)', 'tracking recovered from order-details page');
       // Queue the same order-page screenshot that feed-tracked orders get.
       try {
-        chrome.runtime.sendMessage({
+        const commit = chrome.runtime.sendMessage({
           action: 'queueTrackScreenshot',
           orderId,
           trackNumber: tracking,
           trackUrl: `https://order.ebay.com/ord/show?orderid=${orderId}`,
           accountName: __ebayAccountName || 'ebay'
-        }, () => chrome.runtime.lastError);
-      } catch (_) {}
+        }).then(response => {
+          if (response?.status !== 'queued') throw new Error(response?.error || 'screenshot queue commit was not acknowledged');
+        });
+        __ebayScreenshotQueueCommits.push(commit);
+      } catch (error) { __ebayScreenshotQueueCommits.push(Promise.reject(error)); }
     } else {
       console.log(`   ⏭ ${orderId}: still no tracking (genuinely un-shipped) — will drop`);
     }
@@ -838,14 +906,17 @@ function parseItem(item) {
     if (orderId && orderId !== 'N/A') {
       for (const tn of trackingsInOrder) {
         try {
-          chrome.runtime.sendMessage({
+          const commit = chrome.runtime.sendMessage({
             action: 'queueTrackScreenshot',
             orderId,
             trackNumber: tn,
             trackUrl: `https://order.ebay.com/ord/show?orderid=${orderId}`,
             accountName: __ebayAccountName || 'ebay'
-          }, () => chrome.runtime.lastError);
-        } catch (_) {}
+          }).then(response => {
+            if (response?.status !== 'queued') throw new Error(response?.error || 'screenshot queue commit was not acknowledged');
+          });
+          __ebayScreenshotQueueCommits.push(commit);
+        } catch (error) { __ebayScreenshotQueueCommits.push(Promise.reject(error)); }
       }
     }
 

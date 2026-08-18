@@ -9,6 +9,26 @@ function switchLog(step, detail = {}) {
   } catch (e) { /* SW may be starting, ignore */ }
 }
 
+function normalizeSwitchEmail(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+async function readFreshSwitchIntent(expected) {
+  const [ownership, data] = await Promise.all([
+    chrome.runtime.sendMessage({ action: 'getAmazonParserContext' }).catch(() => null),
+    chrome.storage.local.get(['pendingAccountSwitch', 'amazonFinalReturn'])
+  ]);
+  const pending = data.pendingAccountSwitch;
+  const matches = !!ownership?.owned
+    && ownership.runId === expected.runId
+    && ownership.tabId === expected.tabId
+    && normalizeSwitchEmail(ownership.account) === normalizeSwitchEmail(expected.account)
+    && pending?.runId === expected.runId
+    && normalizeSwitchEmail(pending?.email) === normalizeSwitchEmail(expected.account)
+    && !!data.amazonFinalReturn === expected.finalReturn;
+  return matches ? { ownership, pending, finalReturn: !!data.amazonFinalReturn } : null;
+}
+
 // Only run on switch account picker page
 if (!window.location.href.includes('switch_account=picker') && !window.location.href.includes('switchacct')) {
   console.log('📋 Not a switch account page, skipping');
@@ -19,6 +39,15 @@ if (!window.location.href.includes('switch_account=picker') && !window.location.
 
     // Wait a bit for background to set the flag
     await new Promise(resolve => setTimeout(resolve, 1000));
+
+    // The shared Chrome can have another Amazon switch-account tab.  Only the
+    // tab explicitly created/owned by the active parser run may consume the
+    // global pendingAccountSwitch instruction.
+    const ownership = await chrome.runtime.sendMessage({ action: 'getAmazonParserContext' }).catch(() => null);
+    if (!ownership?.owned) {
+      console.log('⏭ Not the parser-owned Amazon tab; leaving this picker untouched');
+      return;
+    }
     
     // Check if we need to switch account (with retry)
     let data = await chrome.storage.local.get(['pendingAccountSwitch']);
@@ -36,13 +65,28 @@ if (!window.location.href.includes('switch_account=picker') && !window.location.
       return;
     }
     
+    if (!data.pendingAccountSwitch.runId || data.pendingAccountSwitch.runId !== ownership.runId) {
+      console.log('⏭ Stale pendingAccountSwitch ignored');
+      return;
+    }
     console.log('✅ Found pending switch to:', data.pendingAccountSwitch.email);
     
     const targetEmail = data.pendingAccountSwitch.email;
+    const expectedIntent = {
+      runId: ownership.runId,
+      tabId: ownership.tabId,
+      account: targetEmail,
+      finalReturn: !!(await chrome.storage.local.get(['amazonFinalReturn'])).amazonFinalReturn
+    };
     console.log(`🎯 Looking for account: ${targetEmail}`);
     
     // Wait for page to fully load
     await new Promise(resolve => setTimeout(resolve, 2500));
+
+    if (!await readFreshSwitchIntent(expectedIntent)) {
+      console.log('⏭ Amazon switch intent changed while picker was settling');
+      return;
+    }
     
     // Debug: log page content
     console.log('📄 Page text:', document.body.innerText.substring(0, 1500));
@@ -51,10 +95,12 @@ if (!window.location.href.includes('switch_account=picker') && !window.location.
     if (!document.body.innerText.includes(targetEmail)) {
       console.log(`❌ Email ${targetEmail} not found in page text!`);
       switchLog('email-missing', { targetEmail, bodyPreview: document.body.innerText.slice(0, 400) });
-      await chrome.storage.local.remove(['pendingAccountSwitch']);
+      const failureIntent = await readFreshSwitchIntent(expectedIntent);
+      if (!failureIntent) return;
       chrome.runtime.sendMessage({
         action: 'accountSwitchFailed',
         email: targetEmail,
+        runId: expectedIntent.runId,
         error: 'Email not visible on page'
       });
       return;
@@ -67,40 +113,10 @@ if (!window.location.href.includes('switch_account=picker') && !window.location.
     const allDivs = Array.from(document.querySelectorAll('div'));
     
     let targetRow = null;
-    let isAlreadySelected = false;
     
     for (const div of allDivs) {
       // Check if this div contains our target email
       if (div.textContent.includes(targetEmail) && div.textContent.length < 400) {
-        // Check if this row has a checkmark (means already selected)
-        const hasCheckmark = div.querySelector('svg') !== null || 
-                            div.innerHTML.includes('✓') ||
-                            div.innerHTML.includes('✔') ||
-                            div.querySelector('[class*="check"]') !== null;
-        
-        // Look for checkmark more precisely - should be INSIDE this account row
-        const svgs = div.querySelectorAll('svg');
-        let hasCheckmarkSvg = false;
-        for (const svg of svgs) {
-          // Checkmark SVGs usually have path with specific pattern
-          if (svg.innerHTML.includes('path') && svg.closest('div')?.textContent.includes(targetEmail)) {
-            // Check if svg is actually a checkmark (near the avatar, not a signout icon)
-            const svgParent = svg.parentElement;
-            if (svgParent && !svgParent.textContent.includes('Sign out')) {
-              hasCheckmarkSvg = true;
-            }
-          }
-        }
-        
-        console.log(`📋 Found container for ${targetEmail}, length=${div.textContent.length}, hasCheckmark=${hasCheckmark}, hasCheckmarkSvg=${hasCheckmarkSvg}`);
-        
-        // If has checkmark, this account is already selected
-        if (hasCheckmarkSvg) {
-          isAlreadySelected = true;
-          console.log('✅ This account appears to be already selected!');
-          break;
-        }
-        
         // Save this as potential target row (prefer smaller/more specific containers)
         if (!targetRow || div.textContent.length < targetRow.textContent.length) {
           targetRow = div;
@@ -108,40 +124,15 @@ if (!window.location.href.includes('switch_account=picker') && !window.location.
       }
     }
     
-    if (isAlreadySelected) {
-      switchLog('already-selected', { targetEmail });
-      const flagData = await chrome.storage.local.get(['amazonFinalReturn']);
-      if (flagData.amazonFinalReturn) {
-        console.log('🏁 Already on primary account — final return done, clearing flag');
-        switchLog('final-return:home', { targetEmail });
-        await chrome.storage.local.remove([
-          'pendingAccountSwitch',
-          'amazonFinalReturn',
-          'accountSwitchInProgress',
-          'switchedToEmail',
-          'accountSwitchStartedAt'
-        ]);
-        window.location.href = 'https://www.amazon.com/';
-      } else {
-        console.log('🚀 Already on target account, going straight to orders!');
-        await chrome.storage.local.remove(['pendingAccountSwitch']);
-        await chrome.storage.local.set({
-          accountSwitchInProgress: true,
-          switchedToEmail: targetEmail
-        });
-        window.location.href = 'https://www.amazon.com/gp/your-account/order-history?orderFilter=year-2025';
-      }
-      return;
-    }
-    
     if (targetRow) {
       console.log(`🖱️ Found target row for: ${targetEmail}`);
       console.log('Row HTML:', targetRow.outerHTML.substring(0, 300));
-      const flagData = await chrome.storage.local.get(['amazonFinalReturn']);
-      const isFinalReturn = !!flagData.amazonFinalReturn;
-      
-      // Clear pending switch before clicking
-      await chrome.storage.local.remove(['pendingAccountSwitch']);
+      const clickIntent = await readFreshSwitchIntent(expectedIntent);
+      if (!clickIntent) {
+        console.log('⏭ Amazon switch intent changed before picker mutation');
+        return;
+      }
+      const isFinalReturn = clickIntent.finalReturn;
       
       // Only parse after a real account switch. Final return must land on home and
       // let content-amazon-redirect.js clear amazonFinalReturn without starting parse.
@@ -175,6 +166,15 @@ if (!window.location.href.includes('switch_account=picker') && !window.location.
           clickTarget = nameEl;
         }
       }
+
+      // DOM discovery and storage writes both await. Re-read exact ownership and
+      // pending intent immediately before the click so an old picker cannot
+      // consume or execute a newer run's switch.
+      const finalClickIntent = await readFreshSwitchIntent(expectedIntent);
+      if (!finalClickIntent) {
+        console.log('⏭ Amazon switch intent changed before click');
+        return;
+      }
       
       if (clickTarget) {
         console.log('🖱️ Clicking:', clickTarget.tagName, clickTarget.textContent.substring(0, 50));
@@ -186,28 +186,21 @@ if (!window.location.href.includes('switch_account=picker') && !window.location.
         targetRow.click();
       }
 
-      // Wait and redirect — на orders для парса, или на главную если final return
-      setTimeout(async () => {
-        const currentFlags = await chrome.storage.local.get(['amazonFinalReturn']);
-        if (currentFlags.amazonFinalReturn) {
-          console.log('🏁 Final return — redirecting to Amazon home (no parse)');
-          switchLog('final-return:home', { targetEmail });
-          window.location.href = 'https://www.amazon.com/';
-        } else {
-          console.log('🔄 Redirecting to orders page...');
-          switchLog('redirect-to-orders', { targetEmail });
-          window.location.href = 'https://www.amazon.com/gp/your-account/order-history?orderFilter=year-2025';
-        }
-      }, 2000);
+      // Do not force a redirect after click. The Amazon navigation itself is
+      // the account-switch proof. If the click was ignored or slow, the
+      // watchdog must retry/fail instead of parsing the old cabinet under the
+      // target email.
 
     } else {
       console.log(`❌ Could not find clickable element for ${targetEmail}`);
       switchLog('no-click-target', { targetEmail });
 
-      await chrome.storage.local.remove(['pendingAccountSwitch']);
+      const failureIntent = await readFreshSwitchIntent(expectedIntent);
+      if (!failureIntent) return;
       chrome.runtime.sendMessage({
         action: 'accountSwitchFailed',
         email: targetEmail,
+        runId: expectedIntent.runId,
         error: 'Could not find clickable account element'
       });
     }

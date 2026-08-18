@@ -38,7 +38,7 @@ function extractFunction(name) {
 
 test('screenshot stage credit includes open MV3 tail only for a non-empty persisted queue', () => {
   const context = {
-    SCREENSHOT_STAGE_BUDGET_MAX_MS: 45 * 60_000,
+    SCREENSHOT_STAGE_BUDGET_MAX_MS: 6 * 60 * 60_000,
     result: null,
   };
   vm.createContext(context);
@@ -65,7 +65,7 @@ test('screenshot stage credit includes open MV3 tail only for a non-empty persis
     budget: { stageName: 'iherb', stageStartedAt: 100_000, accruedMs: 9_999_999, activeSince: null },
     stageName: 'iherb', stageStartedAt: 100_000, queueHasItems: true, now: 500_000
   });`, context);
-  assert.equal(context.result, 45 * 60_000, 'credit must stay bounded');
+  assert.equal(context.result, 9_999_999, 'healthy sequential account drains must not be clipped at 45 minutes');
 });
 
 test('51 minutes of wall time with 49 minutes of screenshots is only 2 minutes of parser time', () => {
@@ -89,7 +89,7 @@ test('51 minutes of wall time with 49 minutes of screenshots is only 2 minutes o
 
 test('sequential drains accumulate but later real parser time still counts', () => {
   const context = {
-    SCREENSHOT_STAGE_BUDGET_MAX_MS: 45 * 60_000,
+    SCREENSHOT_STAGE_BUDGET_MAX_MS: 6 * 60 * 60_000,
     credit: null,
     elapsed: null,
   };
@@ -153,15 +153,26 @@ test('watchdog closes stale activeSince only when persisted queue is empty', asy
 
 test('queue persistence serializes immutable snapshots and commits final []', async () => {
   const writes = [];
+  let firstSetStartedResolve;
+  let releaseFirstResolve;
+  const firstSetStarted = new Promise(resolve => { firstSetStartedResolve = resolve; });
+  const releaseFirst = new Promise(resolve => { releaseFirstResolve = resolve; });
+  let setCalls = 0;
   const context = {
     trackScreenshotQueue: [],
     isProcessingScreenshots: false,
     screenshotQueuePersistChain: Promise.resolve(),
+    screenshotQueueReady: Promise.resolve(),
+    checkpointScreenshotStageBudget: async () => {},
     chrome: {
       storage: {
         local: {
           set: async value => {
-            await Promise.resolve();
+            setCalls++;
+            if (setCalls === 1) {
+              firstSetStartedResolve();
+              await releaseFirst;
+            }
             writes.push(JSON.parse(JSON.stringify(value)));
           },
         },
@@ -174,9 +185,11 @@ test('queue persistence serializes immutable snapshots and commits final []', as
 
   context.trackScreenshotQueue = [{ orderId: 'A', trackNumber: 'T1', extraTracks: ['T2'] }];
   const first = context.persistScreenshotQueue();
+  await firstSetStarted;
   context.trackScreenshotQueue[0].extraTracks.push('late-mutation');
   context.trackScreenshotQueue = [];
   const second = context.persistScreenshotQueue();
+  releaseFirstResolve();
   await Promise.all([first, second]);
 
   assert.deepEqual(writes, [
@@ -185,23 +198,23 @@ test('queue persistence serializes immutable snapshots and commits final []', as
   ]);
 });
 
-test('iHerb account switch is gated by a real unlimited drain', () => {
-  const switchFn = extractFunction('switchToNextIherbAccount');
-  const drainAt = switchFn.indexOf('await waitForScreenshotsDrained({ maxWaitMs: null })');
-  const shiftAt = switchFn.indexOf('iherbAccountsQueue.shift()');
+test('account switches are gated by a bounded terminal drain', () => {
+  const switchFn = extractFunction('switchToNextIherbAccountOnce');
+  const drainAt = switchFn.indexOf('await waitForScreenshotsDrained()');
+  const shiftAt = switchFn.indexOf('queue.shift()');
   assert.ok(drainAt > -1 && drainAt < shiftAt, 'drain must happen before account queue shift');
 
   const finalizeFn = extractFunction('finalizeIherbStage');
   assert.match(
     finalizeFn,
-    /if \(currentIherbAccount\) \{\s*await waitForScreenshotsDrained\(\{ maxWaitMs: null \}\);/,
+    /if \(currentIherbAccount\) \{\s*if \(!await waitForScreenshotsDrained\(\)\)/,
     'watchdog/captcha finalize paths must use the same account drain gate',
   );
 
   const amazonSwitchFn = extractFunction('switchToNextAmazonAccount');
   assert.match(
     amazonSwitchFn,
-    /if \(currentAmazonAccount\) \{\s*await waitForScreenshotsDrained\(\{ maxWaitMs: null \}\);/,
+    /if \(currentAmazonAccount\) \{\s*if \(!await waitForScreenshotsDrained\(\)\)/,
     'Amazon account-bound cards must not cross an account switch either',
   );
 
@@ -212,8 +225,24 @@ test('iHerb account switch is gated by a real unlimited drain', () => {
   );
   assert.match(
     background,
-    /await waitForScreenshotsDrained\(\{ maxWaitMs: null \}\);\s*await switchToNextIherbAccount\(\);/,
+    /if \(!await waitForScreenshotsDrained\(\)\)[\s\S]*?await switchToNextIherbAccount\(\);/,
   );
+});
+
+test('three long healthy iHerb drains remain outside the parser stage budget', () => {
+  const context = { SCREENSHOT_STAGE_BUDGET_MAX_MS: 6 * 60 * 60_000, credit: null, elapsed: null };
+  vm.createContext(context);
+  vm.runInContext(extractFunction('getScreenshotStageBudgetCreditMs'), context);
+  vm.runInContext(extractFunction('getEffectivePipelineStageElapsedMs'), context);
+  vm.runInContext(`
+    credit = getScreenshotStageBudgetCreditMs({
+      budget: { stageName: 'iherb', stageStartedAt: 1_000, accruedMs: 96 * 60_000, activeSince: null },
+      stageName: 'iherb', stageStartedAt: 1_000, queueHasItems: false, now: 116 * 60_000 + 1_000
+    });
+    elapsed = getEffectivePipelineStageElapsedMs({ startedAt: 1_000, now: 116 * 60_000 + 1_000, screenshotCreditMs: credit });
+  `, context);
+  assert.equal(context.credit, 96 * 60_000);
+  assert.equal(context.elapsed, 20 * 60_000, 'only real parser/account-switch time counts toward the 25-minute cap');
 });
 
 test('filtered empty queue is awaited before processor returns', () => {
@@ -226,12 +255,13 @@ test('filtered empty queue is awaited before processor returns', () => {
 });
 
 test('budget generation is reset on every pipeline stage and on runtime cleanup', () => {
-  const runStageFn = extractFunction('runPipelineStage');
+  const advanceFn = extractFunction('advancePipelineStageOnce');
   assert.match(
-    runStageFn,
-    /screenshotStageBudget:\s*\{\s*stageName,\s*stageStartedAt,\s*accruedMs: 0,\s*activeSince: null/,
+    advanceFn,
+    /screenshotStageBudget:[\s\S]*?stageName: nextStage,[\s\S]*?stageStartedAt: nextStageStartedAt,[\s\S]*?accruedMs: 0,[\s\S]*?activeSince: null/,
   );
-  assert.match(runStageFn, /screenshotStageBudget: null/);
+  const finishTerminalFn = extractFunction('finishTerminalPipelineState');
+  assert.match(finishTerminalFn, /screenshotStageBudget: null/);
 
   const cleanupFn = extractFunction('clearPipelineRuntimeState');
   assert.match(cleanupFn, /'screenshotStageBudget'/);

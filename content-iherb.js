@@ -1,5 +1,5 @@
-/* content-iherb.js — v7.5.1 (Reliable auto-parse with retry fallback) */
-console.log('🟢 iHerb Parser v7.5.1 loaded!', window.location.href);
+/* content-iherb.js — v7.8.0 (attempt-fenced multi-account nightly parser) */
+console.log('🟢 iHerb Parser v7.8.0 loaded!', window.location.href);
 console.log('📄 Page title:', document.title);
 console.log('📄 Page HTML length:', document.body?.innerHTML?.length || 0);
 
@@ -10,6 +10,8 @@ let isParsingInProgress = false;
 // before parseOrders() composes rows). Rows emitted during this run will
 // include this email as `account_name`.
 window.__iherbCurrentAccountName = window.__iherbCurrentAccountName || '';
+window.__iherbRunId = window.__iherbRunId || null;
+window.__iherbParseAttemptId = window.__iherbParseAttemptId || null;
 
 // Resolve primary iHerb account from accountsConfig — used when we're not in
 // multi-account mode (manual /myaccount/orders parse).
@@ -23,6 +25,79 @@ async function getIherbAccountFromConfig() {
   } catch (_) {
     return '';
   }
+}
+
+function normalizeIherbAccount(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+async function captureIherbParserContext(fallbackAccount = '') {
+  const door = await chrome.runtime.sendMessage({
+    action: 'getParserContext', store: 'iherb', purpose: 'parse'
+  }).catch(() => null);
+  if (door?.blocked) {
+    throw new Error('iHerb pipeline is blocked for human Press & Hold');
+  }
+  if (door?.active && !door.owned) {
+    throw new Error('iHerb pipeline context belongs to a different tab');
+  }
+  if (door?.owned) {
+    return {
+      runId: door.runId,
+      account: door.account,
+      parserTabId: door.tabId,
+      attemptId: door.attemptId,
+      stageStartedAt: door.stageStartedAt,
+      standalone: false
+    };
+  }
+  return { runId: null, account: fallbackAccount, parserTabId: null, attemptId: null, stageStartedAt: null, standalone: true };
+}
+
+async function verifyIherbParserContext(context) {
+  const fresh = await chrome.storage.local.get([
+    'pipelineRun', 'pipelineStage', 'multiAccountIherbState', 'iherbStageFinalizing',
+    'iherbParseAttemptId', 'iherbTimeoutAttempt'
+  ]);
+  if (!context.runId) {
+    if (['starting', 'running'].includes(fresh.pipelineRun?.status)) {
+      throw new Error('standalone iHerb parse overlapped a pipeline run');
+    }
+    return true;
+  }
+  const valid = fresh.pipelineRun?.id === context.runId
+    && ['starting', 'running'].includes(fresh.pipelineRun?.status)
+    && fresh.pipelineStage?.active === true
+    && fresh.pipelineStage?.runId === context.runId
+    && fresh.pipelineStage?.stages?.[fresh.pipelineStage?.currentIndex] === 'iherb'
+    && (fresh.pipelineStage?.stageStartedAt || null) === context.stageStartedAt
+    && fresh.iherbStageFinalizing?.runId !== context.runId
+    && fresh.iherbParseAttemptId === context.attemptId
+    && fresh.iherbTimeoutAttempt?.attemptId !== context.attemptId
+    && normalizeIherbAccount(fresh.multiAccountIherbState?.currentIherbAccount)
+      === normalizeIherbAccount(context.account);
+  if (!valid) throw new Error('stale iHerb run/account before commit');
+  return true;
+}
+
+async function commitIherbAttemptResult(context, orders, cancelledOrders, found) {
+  const response = await chrome.runtime.sendMessage({
+    action: 'commitIherbAttempt',
+    attempt: {
+      runId: context.runId,
+      account: context.account,
+      parserTabId: context.parserTabId,
+      attemptId: context.attemptId,
+      stageStartedAt: context.stageStartedAt || null
+    },
+    orders,
+    cancelledOrders,
+    found
+  });
+  if (!response?.ok) {
+    throw new Error(`iHerb result commit rejected: ${response?.reason || response?.status || 'unknown'}`);
+  }
+  return response;
 }
 
 // Save log entry directly to storage
@@ -134,7 +209,10 @@ async function retryOnServiceUnavailable(maxRetries = 5, baseDelay = 20000) {
     chrome.runtime.sendMessage({
       action: 'parseError',
       store: 'iHerb',
-      error: 'Service unavailable after ' + maxRetries + ' retries'
+      error: 'Service unavailable after ' + maxRetries + ' retries',
+      runId: window.__iherbRunId,
+      account: window.__iherbCurrentAccountName,
+      attemptId: window.__iherbParseAttemptId
     });
 
     return false;
@@ -197,17 +275,24 @@ async function retryOnServiceUnavailable(maxRetries = 5, baseDelay = 20000) {
   const finalReturnCheck = await chrome.storage.local.get(['iherbFinalReturn']);
   if (finalReturnCheck.iherbFinalReturn === true) {
     console.log('🏁 iherbFinalReturn=true — skipping parse (session restore only)');
-    await chrome.storage.local.remove(['iherbFinalReturn']);
+    // Only content-iherb-login may clear this proof, after the exact primary
+    // credentials redirected away from the login page. Clearing it here could
+    // turn an intermediate orders redirect into a false successful return.
     return;
   }
 
   // Multi-account resume: pipeline switched to next iHerb account and landed
   // us on /myaccount/orders. Pick up the current account name so rows carry
   // the right `account_name`.
-  const multiCheck = await chrome.storage.local.get(['multiAccountIherbState', 'iherbSwitchInProgress']);
+  const multiCheck = await chrome.storage.local.get([
+    'multiAccountIherbState', 'iherbSwitchInProgress', 'pipelineRun',
+    'iherbParseAttemptId'
+  ]);
   const multiState = multiCheck.multiAccountIherbState;
   if (multiState && multiState.isMultiAccountIherb && multiState.currentIherbAccount) {
     window.__iherbCurrentAccountName = multiState.currentIherbAccount;
+    window.__iherbRunId = multiCheck.pipelineRun?.id || null;
+    window.__iherbParseAttemptId = multiCheck.iherbParseAttemptId || null;
     console.log(`👥 Multi-account iHerb resume: currentAccount=${multiState.currentIherbAccount}`);
   }
   // --------------------------------------------------------------------------
@@ -260,19 +345,24 @@ async function retryOnServiceUnavailable(maxRetries = 5, baseDelay = 20000) {
   console.log('🔍 Quick check - has orders:', hasOrders);
 
   if (!hasOrders) {
-    // PerimeterX "Press & Hold to confirm you are a human"? Это не пустой SPA-shell,
-    // а поведенческий челлендж. Content-script не может его пройти (JS-события
-    // isTrusted:false). Делегируем background'у — там chrome.debugger генерит
-    // настоящие mouse-события (isTrusted:true) и зажимает кнопку ~11с. После успеха
-    // background перезагрузит /orders, и этот IIFE перезапустится уже с заказами.
+    // PerimeterX "Press & Hold" is intentionally human-only. Keep the exact
+    // parser tab untouched and ask background to persist/dedupe an operator
+    // alert; never synthesize trusted mouse input.
     const phText = (document.body?.innerText || '').toLowerCase();
     const isPressHold = /press\s*&?\s*hold/.test(phText) &&
                         (/confirm you are a human/.test(phText) || /reference id/.test(phText));
     if (isPressHold) {
-      console.log('🧩 Press & Hold detected — delegating to background solver');
-      await sendLog('-', '-', '🧩 Captcha', 'Press & Hold — авто-решение (human-hold)');
-      try { chrome.runtime.sendMessage({ action: 'solveIherbPressHold' }); } catch (_) {}
-      return; // не парсим; background решит челлендж и перезагрузит страницу
+      console.log('🧩 Press & Hold detected — waiting for a human');
+      await sendLog('-', '-', '🧩 Captcha', 'Press & Hold — требуется человек');
+      try {
+        chrome.runtime.sendMessage({
+          action: 'iherbPressHoldDetected',
+          runId: window.__iherbRunId,
+          account: window.__iherbCurrentAccountName,
+          attemptId: window.__iherbParseAttemptId
+        });
+      } catch (_) {}
+      return; // no parsing/navigation until a person handles the exact tab
     }
 
     // Orders not loaded yet - wait more
@@ -329,8 +419,6 @@ async function retryOnServiceUnavailable(maxRetries = 5, baseDelay = 20000) {
   }
   isParsingInProgress = true;
   console.log('🚀 Starting auto-parse...');
-  // Notify background that parsing actually started
-  chrome.runtime.sendMessage({ action: 'parserStarted', store: 'iHerb' });
   exportOrders();
 })();
 
@@ -405,9 +493,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // Respond IMMEDIATELY to confirm receipt (so popup knows script is alive)
     sendResponse({ received: true, store: 'iHerb' });
 
-    // Notify background that parsing actually started
-    chrome.runtime.sendMessage({ action: 'parserStarted', store: 'iHerb' });
-
     // Start parsing asynchronously
     waitForOrdersToLoad(15000).then(() => {
       return exportOrders();
@@ -423,7 +508,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         chrome.runtime.sendMessage({
           action: 'parseError',
           store: 'iHerb',
-          error: error.message
+          error: error.message,
+          runId: window.__iherbRunId,
+          account: window.__iherbCurrentAccountName,
+          attemptId: window.__iherbParseAttemptId
         });
       });
     return false; // Don't keep channel open - we already responded
@@ -707,10 +795,11 @@ function detectIherbCancelled(container) {
     return { cancelled: false };
 }
 
-function parseOrders() {
+async function parseOrders() {
     const orders = [];
     const cancelledThisRun = [];   // отменённые/возвращённые заказы этого прогона (money-safety)
     const cancelledSeen = new Set();
+    const screenshotQueueCommits = [];
 
     console.log('🧪 === IHERB PARSER (REAL STRUCTURE - Jan 2026) ===');
     console.log('🕐 Parse time:', new Date().toISOString());
@@ -911,19 +1000,23 @@ function parseOrders() {
         if (trackingNumber && orderId && trackBtn) {
             const carrierUrl = trackBtn.href || trackBtn.getAttribute('href') || '';
             if (carrierUrl) {
-                try {
-                    chrome.storage.local.get(['multiAccountIherbState'], (acc) => {
-                        const accEmail = acc?.multiAccountIherbState?.currentIherbAccount || '';
-                        const accountName = accEmail ? accEmail.split('@')[0] : 'iherb';
-                        chrome.runtime.sendMessage({
-                            action: 'queueTrackScreenshot',
-                            orderId,
-                            trackNumber: trackingNumber,
-                            trackUrl: carrierUrl,
-                            accountName
-                        }, () => chrome.runtime.lastError);
-                    });
-                } catch (_) {}
+                // Account was resolved before parseOrders. Queue through the
+                // background's acknowledged/persisted door and retain every
+                // promise: Done must not race ahead of a late storage callback.
+                const accountName = (window.__iherbCurrentAccountName || 'iherb').split('@')[0];
+                screenshotQueueCommits.push(
+                    chrome.runtime.sendMessage({
+                        action: 'queueTrackScreenshot',
+                        orderId,
+                        trackNumber: trackingNumber,
+                        trackUrl: carrierUrl,
+                        accountName
+                    }).then(response => {
+                        if (response?.status !== 'queued') {
+                            throw new Error(response?.error || 'screenshot queue commit was not acknowledged');
+                        }
+                    })
+                );
             }
         }
 
@@ -1018,6 +1111,11 @@ function parseOrders() {
         }
     });
 
+    // Background responds only after trackScreenshotQueue is durably committed.
+    // Await all producers before orderData/Done so an empty-looking drain can
+    // never switch to the next iHerb account prematurely.
+    await Promise.all(screenshotQueueCommits);
+
     // Filter out Fulfilling orders (no tracking number)
     const shippedOrders = orders.filter(order => {
         return order.track_number && order.track_number.trim() !== '';
@@ -1039,18 +1137,6 @@ function parseOrders() {
     console.log(`  ✓ Unique orders with tracking: ${uniqueOrderIds.size}`);
     console.log(`  ✓ Products being exported: ${shippedOrders.length}`);
     console.log(`  ✓ Average products per order: ${(shippedOrders.length / (uniqueOrderIds.size || 1)).toFixed(1)}`);
-
-    // Send completion progress (with parsingProgress wrapper for background.js)
-    chrome?.runtime?.sendMessage?.({
-        action: 'parsingProgress',
-        data: {
-            store: 'iHerb',
-            current: uniqueOrderIds.size,
-            total: uniqueOrderIds.size,
-            status: 'Done ✅', // Match eBay/Amazon format for auto-upload trigger
-            found: shippedOrders.length
-        }
-    });
 
     if (shippedOrders.length === 0) {
         console.error('\n❌ NO SHIPPED ORDERS FOUND!');
@@ -1206,6 +1292,21 @@ async function exportOrders() {
 
         console.log('✅ User logged in, starting parse...');
 
+        const fallbackAccount = window.__iherbCurrentAccountName || await getIherbAccountFromConfig();
+        const parserContext = await captureIherbParserContext(fallbackAccount);
+        window.__iherbCurrentAccountName = parserContext.account || fallbackAccount;
+        window.__iherbRunId = parserContext.runId;
+        window.__iherbParseAttemptId = parserContext.attemptId;
+        if (parserContext.runId) {
+          chrome.runtime.sendMessage({
+            action: 'parserStarted',
+            store: 'iHerb',
+            runId: parserContext.runId,
+            account: parserContext.account,
+            attemptId: parserContext.attemptId
+          }).catch(() => {});
+        }
+
         // Wait a bit for dynamic content to load
         console.log('⏳ Waiting for page to fully load...');
         await new Promise(resolve => setTimeout(resolve, 2000));
@@ -1213,13 +1314,10 @@ async function exportOrders() {
         // Resolve account_name BEFORE parseOrders() runs so every emitted row
         // carries `account_name`. multi-account path already sets the global
         // in checkAutoParse(); fall back to accountsConfig primary.
-        if (!window.__iherbCurrentAccountName) {
-          window.__iherbCurrentAccountName = await getIherbAccountFromConfig();
-        }
         console.log(`👤 iHerb account_name: ${window.__iherbCurrentAccountName || '(empty)'}`);
 
         await slowProgressiveScroll(150);
-        const result = parseOrders();
+        const result = await parseOrders();
 
         if (!result.orders || result.orders.length === 0) {
             console.error('🛑 No orders parsed!');
@@ -1229,30 +1327,55 @@ async function exportOrders() {
         console.log(`✅ Parsed ${result.uniqueOrdersCount} orders (${result.totalProductsCount} products total)`);
         console.log('ℹ️  Tracking numbers extracted from DOM (when available)');
 
-        // Save with deduplication
-        const stats = await saveOrdersWithDeduplication(result.orders, 'iHerb');
+        await verifyIherbParserContext(parserContext);
+        const runId = parserContext.runId;
+        const observedAt = new Date().toISOString();
+        const parserAccount = parserContext.account || '';
+        result.orders = result.orders.map(order => ({
+            ...order,
+            parser_run_id: runId,
+            parser_account: parserAccount,
+            observed_at: observedAt
+        }));
 
-        // AUTO-SAVE: Also save to iherbOrders for direct access
-        chrome.storage.local.set({
-            iherbOrders: result.orders,
-            iherbLastUpdate: Date.now()
-        });
+        let stats;
+        if (parserContext.runId) {
+            // Shared rows + direct snapshot + durable completion permit are
+            // validated and committed under one background attempt arbiter.
+            stats = await commitIherbAttemptResult(
+                parserContext,
+                result.orders,
+                Array.isArray(result.cancelled) ? result.cancelled : [],
+                result.totalProductsCount
+            );
+        } else {
+            // Standalone/manual parse has no pipeline attempt; keep its legacy
+            // local save path separate from the six-cabinet nightly contract.
+            stats = await saveOrdersWithDeduplication(result.orders, 'iHerb');
+            await chrome.storage.local.set({
+                iherbOrders: result.orders,
+                iherbLastUpdate: Date.now()
+            });
+        }
         console.log('💾 Auto-saved to iherbOrders:', result.orders.length);
 
-        // Persist CANCELLED iHerb orders (money-safety) — append across accounts, dedup by order_id.
-        // background.js обнуляет iherbCancelledOrders в начале прогона, поэтому за ночь копится
-        // объединённый список всех отменённых по всем аккаунтам iHerb.
-        try {
-            const cxlNew = Array.isArray(result.cancelled) ? result.cancelled : [];
-            const prev = await chrome.storage.local.get(['iherbCancelledOrders']);
-            const merged = Array.isArray(prev.iherbCancelledOrders) ? prev.iherbCancelledOrders.slice() : [];
-            const seen = new Set(merged.map(o => o.order_id));
-            for (const c of cxlNew) {
-                if (!seen.has(c.order_id)) { seen.add(c.order_id); merged.push(c); }
+        // Completion is an account-switch permit. Emit it only after both the
+        // shared orderData and direct iHerb snapshot are durably committed;
+        // otherwise a zero/already-sent screenshot queue can navigate away and
+        // destroy this content script before Alice's bridge can ever see rows.
+        await chrome.runtime.sendMessage({
+            action: 'parsingProgress',
+            data: {
+                store: 'iHerb',
+                current: result.uniqueOrdersCount,
+                total: result.uniqueOrdersCount,
+                status: 'Done ✅',
+                found: result.totalProductsCount,
+                runId,
+                account: parserAccount,
+                attemptId: parserContext.attemptId
             }
-            await chrome.storage.local.set({ iherbCancelledOrders: merged, iherbCancelledUpdatedAt: Date.now() });
-            if (cxlNew.length) console.log(`🚫 Отменённых iHerb-заказов за прогон: ${cxlNew.length}`);
-        } catch (_) {}
+        }).catch(() => {});
 
         // NO auto-download - user will use Copy button for Google Sheets
         // CSV download only via popup "Export to CSV" button if needed
