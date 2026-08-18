@@ -470,6 +470,25 @@ test('completion and timeout have deterministic priority for final-first, resolv
   }
 });
 
+test('Amazon completion records the exact last parsed page for both terminal doors', async () => {
+  for (const { reason, cursor, lastCompletedPage } of [
+    { reason: 'configured-limit', cursor: 21, lastCompletedPage: 20 },
+    { reason: 'explicit-end', cursor: 8, lastCompletedPage: 7 },
+  ]) {
+    const runtime = makeRuntime();
+    runtime.amazonPaginationState.currentPage = cursor;
+    runtime.amazonPaginationState.totalPages = 20;
+    const request = completionRequest(runtime, []);
+    request.reason = reason;
+    request.paginationState.currentPage = cursor;
+    const harness = createHarness(runtime);
+    const result = await harness.context.handleAmazonAttemptCommit(request, 9);
+    assert.equal(result.ok, true);
+    assert.equal(harness.storage.data.amazonParsingComplete.lastCompletedPage, lastCompletedPage);
+    assert.equal(harness.storage.data.amazonPaginationState.currentPage, cursor);
+  }
+});
+
 test('restart consumes a valid completion before an older terminal failure', async () => {
   const runtime = makeRuntime({ terminal: true });
   const attempt = attemptFrom(runtime);

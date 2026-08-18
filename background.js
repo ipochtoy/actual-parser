@@ -808,7 +808,11 @@ let amazonAccountsQueue = [];
 let currentAmazonAccount = null;
 let isMultiAccountParsing = false;
 const MAX_ACCOUNT_SWITCH_ATTEMPTS = 2;
-const ACCOUNT_PARSE_TIMEOUT_MS = 90000;
+const ACCOUNT_PARSE_TIMEOUT_MS = 600000; // 10 мин (07.08.2026: при 4 мин кабинет photopochtoy бросался с нулём КАЖДУЮ ночь —
+// в журнале account-parse:timeout reason="no progress" idleSec=243 при пороге 240, totalSec=1156: он честно отработал
+// 19 минут и застрял на три секунды сверх лимита. Виноваты медленные страницы отслеживания Amazon (та же причина, по
+// которой 05.08 подняли PAGE_DELAY_MS до 5 с).
+const AMAZON_ACCOUNT_HARD_CAP_MS = 45 * 60_000; // живой 20-страничный кабинет занимает около 40 мин; два лимита оставляют 10 мин стадии на переключения
 
 // --- Multi-Account iHerb Parsing ---
 // Список аккаунтов с паролями теперь загружается из accountsConfig (см. выше).
@@ -4840,6 +4844,20 @@ function isAmazonHardCapExpired({ totalElapsed, hardCapMs, now = Date.now(), gra
     return !(Number.isFinite(graceUntil) && now < graceUntil);
 }
 
+function getAmazonAccountTimeoutDecision({
+    totalElapsed,
+    sinceLastProgress,
+    matchingIncomplete = false,
+    now = Date.now(),
+    graceUntil,
+    idleTimeoutMs = ACCOUNT_PARSE_TIMEOUT_MS,
+    hardCapMs = AMAZON_ACCOUNT_HARD_CAP_MS
+}) {
+    const isIdleTimeout = matchingIncomplete || sinceLastProgress > idleTimeoutMs;
+    const isHardCap = isAmazonHardCapExpired({ totalElapsed, hardCapMs, now, graceUntil });
+    return { isIdleTimeout, isHardCap, timedOut: isIdleTimeout || isHardCap };
+}
+
 async function getAmazonParserTab(tabId) {
     if (tabId) {
         try {
@@ -5484,9 +5502,15 @@ chrome.alarms.create(IHERB_WATCHDOG_ALARM, { delayInMinutes: 1, periodInMinutes:
 // 'done' and uploads — even if one store is broken or rate-limited (eBay limitexceeded).
 const PIPELINE_WATCHDOG_ALARM = 'pipelineStageWatchdog';
 const PIPELINE_STAGE_MAX_MS = {
-  iherb: 25 * 60_000,  // 3 аккаунта: парсинг ×3 + 2 переключения (+5 мин ретрай логина) + возврат
-  ebay:  6 * 60_000,   // 40 pages + detail-page tracking enrichment; generous
-  amazon: 15 * 60_000  // multi-account; has its own watchdog too, this is a backstop
+  // 06.08.2026: подняты после того, как Amazon в отчёте давал «found 0 ⏱» КАЖДЫЙ прогон
+  // с 05.08. Причина не поломка магазина: 05.08 паузу между страницами подняли 2с→5с
+  // (иначе Amazon отшивал страницу трека), а лимиты остались старыми — живой обход не
+  // укладывался, сторож рубил его и второй кабинет не читался вовсе. Замер 06.08: Amazon
+  // ~40 мин на кабинет × 2 кабинета, iHerb ~26 мин на три кабинета (лимит был 25 — впритык).
+  // Это ГРУБАЯ подстраховка: настоящее зависание ловит сторож прогресса (4 мин без движения).
+  iherb: 50 * 60_000,   // 3 аккаунта: парсинг ×3 + 2 переключения (+5 мин ретрай логина) + возврат
+  ebay:  15 * 60_000,   // 40 pages + detail-page tracking enrichment
+  amazon: 100 * 60_000  // 2 кабинета × 20 страниц с паузой 5с; свой сторож прогресса тоже есть
 };
 // Очередь кадров может быть большой (129 карточек заняли 32 минуты в ночь
 // 17→18.08). Эти минуты не являются зависанием парсера и не должны съедать
@@ -6185,26 +6209,27 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 
     // TIMEOUT: progress-based (idle) + hard cap.
     // Old logic killed after 90s from switch-start — fatally short for accounts with
-    // 20 pages (needs 5-7 min). New logic: kill if no parsing progress for 90s, or
-    // if total time exceeds 20-minute hard cap (bumped from 10min after 2026-04-22
-    // observation: ipochtoy finished 19 pages + started page 20 at exactly 600s).
+    // 20 pages. New logic: kill if no parsing progress for 10 minutes, or if a
+    // single cabinet exceeds the measured 45-minute ceiling. The old 20-minute
+    // cap guaranteed a false timeout for healthy 40-minute histories.
     const activeAttempt = amazonWatchdogAttemptFromState(stored);
     const hasMatchingCompletion = amazonCompletionMatchesAttempt(stored, activeAttempt);
     if (!hasMatchingCompletion && stored.accountSwitchStartedAt && stored.multiAccountState) {
         const now = Date.now();
         const totalElapsed = now - stored.accountSwitchStartedAt;
         const sinceLastProgress = now - (stored.lastAmazonProgressAt || stored.accountSwitchStartedAt);
-        const HARD_CAP_MS = 1_200_000; // 20 min absolute
-        const isIdleTimeout = matchingIncomplete || sinceLastProgress > ACCOUNT_PARSE_TIMEOUT_MS;
-        const isHardCap = isAmazonHardCapExpired({
+        const { isIdleTimeout, isHardCap } = getAmazonAccountTimeoutDecision({
             totalElapsed,
-            hardCapMs: HARD_CAP_MS,
+            sinceLastProgress,
+            matchingIncomplete,
             now,
-            graceUntil: stored.amazonNavigationGraceUntil
+            graceUntil: stored.amazonNavigationGraceUntil,
+            idleTimeoutMs: ACCOUNT_PARSE_TIMEOUT_MS,
+            hardCapMs: AMAZON_ACCOUNT_HARD_CAP_MS
         });
         if (isIdleTimeout || isHardCap) {
             const timeoutReason = isHardCap
-                ? 'hard-cap 20min'
+                ? 'hard-cap 45min'
                 : (matchingIncomplete
                     ? `incomplete: ${stored.amazonParsingIncomplete.reason || 'content error'}`
                     : 'no progress');
@@ -6231,6 +6256,13 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             const reason = timeoutReason;
             const idleSec = Math.round(sinceLastProgress / 1000);
             const totalSec = Math.round(totalElapsed / 1000);
+            // Человеку — словами: что случилось, сколько ждал, что я сделал.
+            // «hard-cap / no progress / idle= / total=» оставляем только в консоли для разбора.
+            const waitText = idleSec >= 120 ? `${Math.round(idleSec / 60)} мин` : `${idleSec} сек`;
+            const spentText = totalSec >= 120 ? `${Math.round(totalSec / 60)} мин` : `${totalSec} сек`;
+            const humanReason = isHardCap
+                ? `сидел в кабинете ${spentText} и не закончил`
+                : `кабинет молчал ${waitText}`;
 
             // Capture the exact parser tab through CDP. captureVisibleTab(windowId)
             // photographed whichever unrelated tab was active in that window and
@@ -6269,11 +6301,11 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             }
 
             console.log(`🚫 Account ${failedEmail} timed out (${reason}, idle=${idleSec}s, total=${totalSec}s), skipping`);
-            await sendTelegramMessage(`🚫 Аккаунт ${failedEmail.split('@')[0]}: ${reason}, idle=${idleSec}с, total=${totalSec}с — пропускаю`).catch(() => {});
+            await sendTelegramMessage(`🚫 Amazon, почта ${failedEmail.split('@')[0]}: ${humanReason} — иду дальше, заказы оттуда посмотрю в следующий обход`).catch(() => {});
             if (evidencePhoto) {
                 await sendTelegramPhoto(
                     evidencePhoto,
-                    `🚫 Amazon timeout: ${failedEmail.split('@')[0]}\n${reason}, idle=${idleSec}s total=${totalSec}s\nточный tab=${evidence.tabId}`
+                    `🚫 Amazon, почта ${failedEmail.split('@')[0]}: ${humanReason}.\nВот что было на экране в этот момент. Точная вкладка ${evidence.tabId}.`
                 ).catch(() => {});
             }
             await logMultiAccountStep('account-parse:timeout', {
@@ -6402,7 +6434,10 @@ async function checkAllStoresCompletedOnce() {
             const elapsed = parseReport.startedAt ? Math.round((Date.now() - parseReport.startedAt) / 1000) : 0;
             const mins = Math.floor(elapsed / 60);
             const secs = elapsed % 60;
-            // ── Человекочитаемая ночная сводка (вместо технического дампа) ──
+            // ── Сводка обхода — человеческим языком (оператор не программист) ──
+            // Правило: каждая строка отвечает «что случилось» и, если нужно, «что мне делать».
+            // Слов «трек», «скриншот», «выгрузка», «строк в таблице» тут быть не должно —
+            // 05.08.2026 оператор прочёл прошлую сводку и половину не понял.
             const uploadOk = !sheetsUploadErr;         // тот же флаг, что гейтит "❗ не удалось после 3 попыток"
             const stores = parseReport.stores || {};
             const roster = parseReport.iherbRoster || null;
@@ -6410,7 +6445,9 @@ async function checkAllStoresCompletedOnce() {
             const nu = parseReport.newUploads || null;
 
             // Собираем заказы по МАГАЗИНУ (не по аккаунту): iherb_* → iHerb, amazon_* → Amazon и т.д.
-            const STATUS_RANK = { '❌': 3, '⏱': 2, '⚠️': 2, '✅': 1 };
+            // '🚫' (кабинет перестал отвечать, :2891) раньше в таблице рангов отсутствовал —
+            // сорванный аккаунт Amazon получал ранг 0 и НЕ попадал в «на что посмотреть».
+            const STATUS_RANK = { '❌': 3, '🚫': 3, '⏱': 2, '⚠️': 2, '✅': 1 };
             const bucketFor = (key) => {
                 if (/^iherb/i.test(key)) return { id: 'iherb', name: 'iHerb' };
                 if (/^amazon/i.test(key)) return { id: 'amazon', name: 'Amazon' };
@@ -6439,64 +6476,82 @@ async function checkAllStoresCompletedOnce() {
             };
             const rosterMissing = (roster && Array.isArray(roster.missing)) ? roster.missing : [];
             if (roster && rosterMissing.length > 0) {
-                const parsedN = Array.isArray(roster.parsed) ? roster.parsed.length : 0;
                 const names = rosterMissing.map(e => String(e).split('@')[0]).join(', ');
-                addProblem('iherb', `iHerb: собрал ${parsedN} из ${roster.total} — не вошёл в ${names}`);
+                addProblem('iherb', `iHerb — не смог зайти в почту ${names}, её заказы не смотрел`);
             }
             for (const [id, bk] of Object.entries(buckets)) {
-                if (bk.worst === '❌') addProblem(id, `${bk.name}: ошибка при сборе`);
-                else if (bk.worst === '⏱' || bk.worst === '⚠️') addProblem(id, `${bk.name}: не доделал (завис)`);
+                if (bk.worst === '❌') addProblem(id, `${bk.name} — не смог прочитать заказы, нужен человек`);
+                else if (bk.worst === '🚫') addProblem(id, `${bk.name} — кабинет перестал отвечать, обошёл не весь`);
+                else if (bk.worst === '⏱' || bk.worst === '⚠️') addProblem(id, `${bk.name} — завис и не доделал круг`);
             }
-            if (!uploadOk) addProblem('sheets', 'таблица не выгрузилась в Google');
+            if (!uploadOk) addProblem('sheets', 'таблица заказов не записалась, нужен человек');
 
-            // ── Header ──
+            // ── Шапка: когда, сколько заняло ──
             const dateStr = new Date().toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' });
-            let report = `🌙 Ночной парсинг — ${dateStr}, готово за ${mins}м ${secs}с`;
-            if (problems.length > 0) report += ` ⚠️ с заминками`;
+            const hours = Math.floor(mins / 60);
+            const durationText = hours > 0
+                ? `${hours} ${plural(hours, 'час', 'часа', 'часов')} ${mins % 60} мин`
+                : (mins > 0 ? `${mins} мин` : `${secs} сек`);
+            let report = `🌙 Обошёл кабинеты магазинов — ${dateStr}, занял ${durationText}`;
 
-            // ── Блок проблем ──
+            // ── Что не получилось (сразу под шапкой: это то, ради чего сводку читают) ──
             if (problems.length > 0) {
-                report += `\n\n⚠️ Обрати внимание:\n` + problems.map(p => `   • ${p}`).join('\n');
+                report += `\n\n⚠️ Не получилось:\n` + problems.map(p => `   • ${p}`).join('\n');
             }
 
-            // ── Собрано заказов (по магазину) ──
+            // ── Сколько заказов просмотрел (по магазину) ──
             const bucketOrder = ['iherb', 'ebay', 'amazon'];
             const orderedIds = [
                 ...bucketOrder.filter(id => buckets[id]),
                 ...Object.keys(buckets).filter(id => !bucketOrder.includes(id))
             ];
             if (orderedIds.length > 0) {
-                report += `\n\n📦 Собрано заказов:\n`;
+                report += `\n\n👀 Просмотрел заказов:\n`;
                 report += orderedIds.map(id => {
                     const bk = buckets[id];
+                    // «Amazon — 0» человеку ничего не говорит: ноль тут значит «не смотрел вовсе».
+                    if (!bk.found && (bk.worst === '🚫' || bk.worst === '❌' || bk.worst === '⏱')) {
+                        return `   ${bk.worst} ${bk.name} — не смотрел, кабинет не ответил`;
+                    }
                     let line = `   ${bk.worst} ${bk.name} — ${bk.found}`;
                     if (id === 'iherb' && roster) {
+                        const parsedN = Array.isArray(roster.parsed) ? roster.parsed.length : 0;
                         line += (rosterMissing.length === 0)
-                            ? `  (все ${roster.total} аккаунта)`
-                            : `  (${Array.isArray(roster.parsed) ? roster.parsed.length : 0} из ${roster.total})`;
+                            ? ` (обошёл все ${roster.total} почты)`
+                            : ` (обошёл ${parsedN} почты из ${roster.total})`;
                     } else if (id === 'amazon' && amazonAcctCount > 0) {
-                        line += `  (${amazonAcctCount} акк.)`;
+                        line += ` (${amazonAcctCount} ${plural(amazonAcctCount, 'почта', 'почты', 'почт')})`;
                     }
                     return line;
                 }).join('\n');
             }
 
-            // ── 🆕 Новизна прогона ──
+            // ── Новые посылки: главная польза обхода ──
+            // nu.tracks — сколько НОВЫХ номеров посылок (магазин+номер) добавилось в таблицу.
+            // nu.rows и nu.qtyUpdated человеку не нужны: это внутренний счёт строк таблицы.
             if (nu) {
-                report += `\n\n🆕 Новых в таблице: ${nu.tracks} трек, ${nu.rows} строк`;
-                const nparts = Object.entries(nu.byShop || {})
-                    .filter(([, n]) => Number(n) > 0)
-                    .map(([s, n]) => `${s} ${n}`);
-                if (nparts.length) report += `\n   ${nparts.join(' · ')}`;
-                if (Number(nu.qtyUpdated) > 0) report += `\n   +${nu.qtyUpdated} где обновилось количество`;
+                const newParcels = Number(nu.tracks) || 0;
+                report += `\n\n📦 Новых посылок: ${newParcels}`;
+                if (newParcels > 0) {
+                    const nparts = Object.entries(nu.byShop || {})
+                        .filter(([, n]) => Number(n) > 0)
+                        .map(([s, n]) => `${s} ${n}`);
+                    if (nparts.length) report += ` (${nparts.join(', ')})`;
+                    report += `\n   это заказы, у которых сегодня впервые появился номер посылки`;
+                } else {
+                    report += `\n   магазины новых отправок за это время не показали`;
+                }
             }
 
-            // ── 📸 Скриншоты ──
-            if (ss.sent > 0 || ss.skipped > 0 || ss.broken > 0 || ss.failed > 0) {
-                report += `\n\n📸 Скриншоты: ${ss.sent || 0} новых`;
-                if (ss.skipped > 0) report += `, ${ss.skipped} уже были`;
-                if (ss.broken > 0) report += `, ${ss.broken} пропущено`;
-                if (ss.failed > 0) report += `, ${ss.failed} ошибок`;
+            // ── Карточки заказов, которые ушли в этот чат ──
+            // После надёжной очереди sent растёт только после подтверждения архива.
+            // broken — подмножество окончательно failed, а не уже отправленных карточек.
+            const { cardsSent, brokenCards, otherFailedCards } = screenshotReportCounters(ss);
+            if (cardsSent > 0 || ss.skipped > 0 || ss.broken > 0 || ss.failed > 0) {
+                report += `\n\n📸 Прислал сюда карточек: ${cardsSent}`;
+                if (ss.skipped > 0) report += `\n   ещё ${ss.skipped} — их карточки присылал раньше, повторно не слал`;
+                if (brokenCards > 0) report += `\n   ${brokenCards} снять не смог: магазин не показал страницу посылки`;
+                if (otherFailedCards > 0) report += `\n   ${otherFailedCards} сорвалось из-за другой ошибки — сниму в следующий обход`;
             }
 
             // ── 🚫 Отменённые заказы (money-safety) ──
@@ -6525,36 +6580,77 @@ async function checkAllStoresCompletedOnce() {
                 }
 
                 if (cancelled.length > 0) {
-                    report += `\n\n🚫 Отменённые заказы (клиент заплатил — товар не придёт), ${cancelled.length}:\n`;
-                    report += cancelled.map(c => {
-                        const prod = c.product_name ? ` — ${String(c.product_name).slice(0, 50)}` : '';
-                        return `   • ${c.store_name} #${c.order_id}${prod}`;
-                    }).join('\n');
+                    const CXL_MAX = 20;      // длинный список отменённых заказов раньше топил всю сводку
+                    const cxlWord = plural(cancelled.length, 'заказ', 'заказа', 'заказов');
 
-                    // Отдельный ГРОМКИЙ алерт только про НОВЫЕ отменённые (дедуп между прогонами).
+                    // Новые — те, про которые ещё не писали. Раньше в сводку каждую ночь падал
+                    // ВЕСЬ список, и оператор видел одни и те же номера сутками, не понимая,
+                    // где настоящая работа (оператор 05.08.2026). Теперь перечисляем только новые.
                     const notified = Array.isArray(cxlStore.notifiedCancelledOrderIds) ? cxlStore.notifiedCancelledOrderIds : [];
                     const notifiedSet = new Set(notified.map(String));
                     const fresh = cancelled.filter(c => !notifiedSet.has(String(c.order_id)));
+
+                    // Название товара магазин отдаёт не всегда — тогда берём его из уже
+                    // собранных строк заказа, иначе в списке остаются голые номера.
+                    const nameOf = async (c) => {
+                        if (c.product_name) return String(c.product_name).slice(0, 50);
+                        try {
+                            const { orderData } = await chrome.storage.local.get(['orderData']);
+                            for (const store of Object.values(orderData || {})) {
+                                const rows = (store && Array.isArray(store.orders)) ? store.orders : [];
+                                const hit = rows.find(r => String(r.order_id || '') === String(c.order_id) && r.product_name);
+                                if (hit) return String(hit.product_name).slice(0, 50);
+                            }
+                        } catch (_) {}
+                        return '';
+                    };
+                    const listLines = async (rows) => {
+                        const out = [];
+                        for (const c of rows.slice(0, CXL_MAX)) {
+                            const name = await nameOf(c);
+                            out.push(`   • ${c.store_name} ${c.order_id}${name ? ` — ${name}` : ''}`);
+                        }
+                        return out.join('\n');
+                    };
+
+                    // Обходчик видит ВСЕ отмены в кабинетах, включая чужие покупки, и про
+                    // наши заказы ничего не знает: 05.08.2026 из 57 отмен нашими были 21,
+                    // а клиента реально ждали 5. Поэтому здесь только число, без обещаний
+                    // про деньги — разбор «где клиент ещё ждёт» делает отдельный робот,
+                    // который смотрит в наши записи (agent/parser-cancels-digest.mjs).
+                    report += `\n\n🚫 Магазин отменил ${cancelled.length} ${cxlWord} в кабинетах`;
+                    if (fresh.length > 0) report += `, из них ${fresh.length} впервые вижу сегодня`;
+                    report += `.\n   Разбор, где клиент ещё ждёт товар, пришлю отдельным сообщением.`;
+
+                    // Список новых отмен — коротким сообщением, БЕЗ слов про деньги клиента:
+                    // наш это заказ или чужая покупка, обходчик не знает. Кто реально ждёт
+                    // товар и что с ним делать — говорит разбор по нашим записям.
                     if (fresh.length > 0) {
-                        let alert = `🚨🚫 ВНИМАНИЕ: найдены ОТМЕНЁННЫЕ заказы в магазине — их ${fresh.length}.\n`;
-                        alert += `Клиент заплатил, а товар не придёт (в Pochtoy заказ числится «Выкуплен»). Нужен оператор:\n\n`;
-                        alert += fresh.map(c => {
-                            const prod = c.product_name ? `\n     ${String(c.product_name).slice(0, 70)}` : '';
-                            const acct = c.account_name ? ` (акк. ${c.account_name})` : '';
-                            return `   • ${c.store_name} #${c.order_id}${acct}${prod}`;
-                        }).join('\n');
-                        try { await sendTelegramMessage(alert); } catch (_) {}
-                        // Запоминаем, что уже сообщили — чтобы не спамить теми же заказами каждую ночь.
-                        const merged = [...notifiedSet, ...fresh.map(c => String(c.order_id))];
-                        await chrome.storage.local.set({ notifiedCancelledOrderIds: merged.slice(-500) });
+                        const freshWord = plural(fresh.length, 'заказ', 'заказа', 'заказов');
+                        let alert = `🚫 В кабинетах появилось ${fresh.length} новых отменённых ${freshWord}:\n\n`;
+                        alert += await listLines(fresh);
+                        if (fresh.length > CXL_MAX) alert += `\n   …и ещё ${fresh.length - CXL_MAX} — весь список в таблице заказов`;
+                        alert += `\n\nСледом пришлю разбор: по каким из них клиент ещё ждёт товар.`;
+                        try {
+                            await deliverFreshCancellationAlert(
+                                alert,
+                                notified,
+                                fresh.map(c => String(c.order_id))
+                            );
+                        } catch (e) {
+                            // Fail open for the nightly report, but never claim the
+                            // cancellation alert was delivered. The same IDs stay
+                            // fresh and will be retried after Telegram recovers.
+                            console.warn('⚠️ Новые отмены не доставлены в Telegram:', e?.message || e);
+                        }
                     }
                 }
             } catch (e) {
                 console.warn('⚠️ Не удалось собрать отменённые заказы:', e?.message || e);
             }
 
-            // ── Footer (честный статус выгрузки) ──
-            report += `\n\n${uploadOk ? '✅ Всё выгружено в таблицу' : '❗ Таблица не выгрузилась — нужен оператор'}`;
+            // ── Подвал (честный статус записи в таблицу) ──
+            report += `\n\n${uploadOk ? '✅ Все заказы записал в таблицу' : '❗ Таблицу записать не смог — нужен человек'}`;
 
             // Сохраняем сводку прогона в storage — чтобы «как прошло» можно было
             // посмотреть в любой момент с цифрами, без раскопок. История — 20 прогонов. (2026-06-08)
@@ -6579,7 +6675,9 @@ async function checkAllStoresCompletedOnce() {
                 console.warn('⚠️ Не удалось сохранить сводку прогона:', e?.message || e);
             }
 
-            sendTelegramMessage(report);
+            sendTelegramLong(report).catch(e => {
+                console.warn('⚠️ Утренняя сводка не доставлена в Telegram:', e?.message || e);
+            });
         }, 1000);
     }
 }
@@ -7425,7 +7523,7 @@ async function launchParsersFromBackground() {
 async function sendTelegramMessage(text) {
     if (!tgBotToken || !tgChatId) {
         console.warn('⚠️ Cannot send Telegram message - missing token or chat ID');
-        return;
+        return false;
     }
     
     console.log(`📤 Sending Telegram message: "${text}"`);
@@ -7441,12 +7539,83 @@ async function sendTelegramMessage(text) {
         if (!res.ok) {
              const err = await res.text();
              console.error(`❌ Telegram send failed: ${res.status} ${err}`);
+             return false;
         } else {
              console.log('✅ Telegram message sent.');
+             return true;
         }
     } catch (e) {
         console.error('Failed to send Telegram message:', e);
+        return false;
     }
+}
+
+// Telegram не принимает сообщение длиннее 4096 знаков и молча выбрасывает его целиком.
+// Так пропала утренняя сводка в ночь на 05.08.2026 (длинный список отмен). Режем по
+// строкам и отправляем частями — лучше две части, чем ни одной.
+async function sendTelegramLong(text, limit = 3500) {
+    const full = String(text == null ? '' : text);
+    if (full.length <= limit) {
+        if (!await sendTelegramMessage(full)) throw new Error('Telegram message was not accepted');
+        return true;
+    }
+    const parts = [];
+    let buf = '';
+    for (const line of full.split('\n')) {
+        if (line.length > limit) {                       // одна строка длиннее лимита — рубим её
+            if (buf) { parts.push(buf); buf = ''; }
+            for (let i = 0; i < line.length; i += limit) parts.push(line.slice(i, i + limit));
+            continue;
+        }
+        if (buf && (buf.length + 1 + line.length) > limit) { parts.push(buf); buf = ''; }
+        buf = buf ? `${buf}\n${line}` : line;
+    }
+    if (buf) parts.push(buf);
+    for (let i = 0; i < parts.length; i++) {
+        const sent = await sendTelegramMessage(
+            parts.length > 1 ? `(часть ${i + 1} из ${parts.length})\n${parts[i]}` : parts[i]
+        );
+        if (!sent) throw new Error(`Telegram part ${i + 1}/${parts.length} was not accepted`);
+        await new Promise(r => setTimeout(r, 400));
+    }
+    return true;
+}
+
+async function deliverFreshCancellationAlert(
+    alert,
+    previouslyNotified = [],
+    freshOrderIds = [],
+    telegramPartLimit = 3500
+) {
+    await sendTelegramLong(alert, telegramPartLimit);
+    const merged = new Set([
+        ...previouslyNotified.map(String),
+        ...freshOrderIds.map(String)
+    ]);
+    const notifiedCancelledOrderIds = [...merged].slice(-500);
+    await chrome.storage.local.set({ notifiedCancelledOrderIds });
+    return notifiedCancelledOrderIds;
+}
+
+function screenshotReportCounters(stats = {}) {
+    const cardsSent = Math.max(0, Number(stats.sent) || 0);
+    const brokenCards = Math.max(0, Number(stats.broken) || 0);
+    const failedCards = Math.max(0, Number(stats.failed) || 0);
+    return {
+        cardsSent,
+        brokenCards,
+        otherFailedCards: Math.max(0, failedCards - brokenCards)
+    };
+}
+
+// «5 посылок» / «2 посылки» / «1 посылка» — без склонения сводка читается как машинный лог.
+function plural(n, one, few, many) {
+    const abs = Math.abs(Number(n) || 0) % 100;
+    const last = abs % 10;
+    if (abs > 10 && abs < 20) return many;
+    if (last > 1 && last < 5) return few;
+    if (last === 1) return one;
+    return many;
 }
 
 
@@ -7694,6 +7863,67 @@ function orderLink(orderId) {
     const id = String(orderId == null ? '' : orderId);
     const url = `https://www.pochtoy.com/admin-room/orders?shop_order_number=${encodeURIComponent(id)}`;
     return `<a href="${url}">${esc(id)}</a>`;
+}
+
+// Строка состава под карточкой: «🛒 2× Название / 1× Название».
+// Товары берём из уже собранных строк (chrome.storage.local.orderData) — на сайт не ходим,
+// лишних заходов в магазин это не создаёт. Если у строк проставлен номер посылки, показываем
+// состав ИМЕННО этой коробки; иначе — весь заказ. Раньше под кадром был только номер посылки,
+// и оператор не понимал, что внутри (оператор 05.08.2026).
+// Подпись Telegram — не длиннее 1024 знаков, поэтому держим бюджет и честно пишем остаток.
+let _itemsCache = { at: 0, data: null };   // за обход кадров сотни, а список заказов один
+async function itemsCaptionLine(orderId, trackNumber, budget = 620) {
+    try {
+        if (!orderId) return '';
+        // Держим список товаров минуту: перечитывать его на каждый кадр — сотни лишних
+        // обращений к памяти расширения за один обход.
+        if (!_itemsCache.data || Date.now() - _itemsCache.at > 60_000) {
+            const fresh = await chrome.storage.local.get(['orderData']);
+            _itemsCache = { at: Date.now(), data: fresh.orderData || {} };
+        }
+        const orderData = _itemsCache.data;
+        const rowsOfOrder = [];
+        for (const store of Object.values(orderData || {})) {
+            const rows = (store && Array.isArray(store.orders)) ? store.orders : [];
+            for (const r of rows) if (String(r.order_id || '') === String(orderId)) rowsOfOrder.push(r);
+        }
+        if (!rowsOfOrder.length) return '';
+        const ofThisBox = trackNumber
+            ? rowsOfOrder.filter(r => String(r.track_number || '') === String(trackNumber))
+            : [];
+        const rows = ofThisBox.length ? ofThisBox : rowsOfOrder;
+
+        // Один и тот же товар мог прийти из нескольких проходов списка — берём БОЛЬШЕЕ
+        // количество, а не сумму: сложение задваивало бы штуки на повторном чтении.
+        const merged = new Map();
+        for (const r of rows) {
+            const name = String(r.product_name || '').replace(/\s+/g, ' ').trim();
+            if (!name) continue;
+            const qty = Number(r.qty) || 1;
+            merged.set(name, Math.max(merged.get(name) || 0, qty));
+        }
+        const list = [...merged.entries()];
+        if (!list.length) return '';
+
+        const lines = [];
+        let used = 0;
+        for (const [name, qty] of list) {
+            const short = name.length > 70 ? `${name.slice(0, 69)}…` : name;
+            const line = `${qty}× ${short}`;
+            if (lines.length > 0 && used + line.length > budget) break;
+            lines.push(line);
+            used += line.length + 7;                      // + перевод строки и отступ
+        }
+        const rest = list.length - lines.length;
+        const body = lines.map((l, i) => (i === 0 ? `🛒 ${esc(l)}` : `       ${esc(l)}`)).join('\n');
+        const tail = rest > 0
+            ? `\n       …и ещё ${rest} ${plural(rest, 'товар', 'товара', 'товаров')} — весь список в таблице`
+            : '';
+        return `\n${body}${tail}`;
+    } catch (e) {
+        console.warn('⚠️ itemsCaptionLine failed:', e?.message || e);
+        return '';
+    }
 }
 
 async function sendScreenshotToArchive(base64Data, caption) {
@@ -8022,13 +8252,18 @@ async function processScreenshotQueue() {
             }
         } catch (e) {
             console.error(`❌ Screenshot failed for ${item.orderId}:`, e);
-            parseReport.screenshots.failed++;
             console.error(`❌ Screenshot ${done}/${total} failed: ${item.orderId} — ${e.message || e}`);
             item._attempts = Math.max(0, Number(item._attempts) || 0) + 1;
             item._lastError = String(e?.message || e).slice(0, 240);
             item._lastAttemptAt = Date.now();
             await persistScreenshotQueue();
             if (item._attempts >= SCREENSHOT_MAX_ATTEMPTS) {
+                // Счётчики отчёта — по окончательно не доставленным карточкам,
+                // а не по трём внутренним попыткам одной и той же карточки.
+                parseReport.screenshots.failed++;
+                if (/broken tracking page/i.test(item._lastError)) {
+                    parseReport.screenshots.broken++;
+                }
                 await chrome.storage.local.set({
                     screenshotQueueBlocked: {
                         kind: 'delivery-failed',
@@ -8722,7 +8957,6 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                 }
                 if (broken) {
                     console.log(`⚠️ Broken tracking page for ${trackNumber}, skipping screenshot`);
-                    parseReport.screenshots.broken++;
                     return { status: 'failed', reason: 'broken tracking page', tracks: [] };
                 }
             } catch (e) {
@@ -8807,8 +9041,11 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                         }
                         const track = s.trackNum;
                         const trackLine = '🚚 ' + esc(track);
-                        const shipTag = s.shipmentTotal > 1 ? ` • пакет ${s.shipmentIdx}/${s.shipmentTotal}` : '';
-                        const itemLine = s.itemName ? ('\n🛒 ' + esc(s.itemName)) : '';
+                        const shipTag = s.shipmentTotal > 1 ? ` • коробка ${s.shipmentIdx} из ${s.shipmentTotal}` : '';
+                        // Полный состав коробки из собранных строк; если их нет — хотя бы
+                        // название первого товара со страницы, как было раньше.
+                        const itemLine = (await itemsCaptionLine(orderId, track))
+                            || (s.itemName ? ('\n🛒 ' + esc(s.itemName)) : '');
                         const caption = `📦 ${orderLink(orderId)}${shipTag}\n${trackLine}${itemLine}${accountTag}`;
                         const archive = await sendScreenshotToArchive(s.base64, caption);
                         if (!archive?.ok) throw new Error(`eBay archive failed for ${track}`);
@@ -8829,11 +9066,13 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
         } else if (isIherb) {
             try {
                 const allTracks = [trackNumber, ...(extraTracks || [])].filter(Boolean);
-                const tracksLine = allTracks.length > 1
-                    ? '🚚 ' + allTracks.map(esc).join(', ')
-                    : '🚚 ' + esc(trackNumber || '—');
+                // Кадр снимается со страницы ОДНОЙ посылки (secure.iherb.com/tr/carrierTracking),
+                // поэтому и номер в подписи должен быть ОДИН — тот, что на картинке. Раньше сюда
+                // склеивались через запятую все номера заказа, и оператор не понимал, что на кадре.
+                const tracksLine = '🚚 ' + esc(trackNumber || '—');
                 const accountTag = accountName ? '\n📧 ' + esc(accountName) : '';
-                const captionFull = `📦 ${orderLink(orderId)}\n${tracksLine}${accountTag}`;
+                const itemsLine = await itemsCaptionLine(orderId, trackNumber);
+                const captionFull = `📦 ${orderLink(orderId)}\n${tracksLine}${itemsLine}${accountTag}`;
 
                 // iHerb: кропим только левую tracking-карточку (carrier + delivery + product thumbs + timeline).
                 // Ждём пока догрузятся картинки товаров — без этого снимок получается без thumb-квадратиков.
@@ -8854,11 +9093,13 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                 screenshotsTaken++;
                 console.log(`✅ iHerb tracking card screenshot sent for ${orderId} (tracks: ${allTracks.length})`);
 
-                if (firstPageLink) {
-                    for (const tn of allTracks) {
-                        try { await writeScreenshotLinkToSheet(tn, firstPageLink); }
-                        catch (e) { console.warn(`⚠️ writeScreenshotLinkToSheet ${tn}:`, e?.message || e); }
-                    }
+                // Ссылку на кадр пишем ТОЛЬКО тому номеру посылки, который на кадре и есть.
+                // Раньше одна ссылка проставлялась всем номерам заказа — и вторая коробка
+                // навсегда считалась снятой (фильтр «уже присылали» смотрит именно эту колонку),
+                // то есть её карточка не приходила НИКОГДА.
+                if (firstPageLink && trackNumber) {
+                    try { await writeScreenshotLinkToSheet(trackNumber, firstPageLink); }
+                    catch (e) { console.warn(`⚠️ writeScreenshotLinkToSheet ${trackNumber}:`, e?.message || e); }
                 }
             } catch (capErr) {
                 console.error(`❌ Fullpage capture failed for ${orderId}:`, capErr);
@@ -8897,9 +9138,10 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                     break;
                 }
                 const base64 = dataUrl.replace(/^data:image\/png;base64,/, '');
-                const pageLabel = page > 1 ? ` [${page}]` : '';
+                const pageLabel = carouselPages > 1 ? ` • кадр ${page} из ${carouselPages}` : '';
                 const accountTag = accountName ? '\n📧 ' + esc(accountName) : '';
-                const caption = `📦 ${orderLink(orderId)}${pageLabel}\n🚚 ${esc(trackNumber)}${accountTag}`;
+                const itemLine = await itemsCaptionLine(orderId, trackNumber);
+                const caption = `📦 ${orderLink(orderId)}${pageLabel}\n🚚 ${esc(trackNumber)}${itemLine}${accountTag}`;
 
                 const archive = await sendScreenshotToArchive(base64, caption);
                 if (!archive?.ok) throw new Error(`Amazon archive failed on carousel page ${page}`);

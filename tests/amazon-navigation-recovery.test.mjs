@@ -56,10 +56,11 @@ test('Amazon page URL helpers preserve the filter and target page 17 exactly', (
 });
 
 test('content script delegates cursor plus navigation to the background arbiter', () => {
+  const prepare = extractFunction(content, 'prepareAmazonNextPageNavigation');
   const fn = extractFunction(content, 'navigateToNextPage');
-  const markerAt = fn.indexOf('state.navigation =');
+  const markerAt = prepare.indexOf('state.navigation =');
   const commitAt = fn.indexOf("await commitAmazonAttempt('navigate', state, { targetUrl })");
-  assert.ok(markerAt > -1 && markerAt < commitAt);
+  assert.ok(markerAt > -1 && commitAt > -1);
   assert.doesNotMatch(fn, /location\.(?:assign|replace)\(/);
 
   const commit = extractFunction(background, 'handleAmazonAttemptCommit');
@@ -69,11 +70,69 @@ test('content script delegates cursor plus navigation to the background arbiter'
   );
 
   const wrapper = extractFunction(content, 'parseAmazonOrdersWithPagination');
-  assert.match(wrapper, /actualPage !== state\.currentPage[\s\S]*?navigationPending: true/);
+  assert.match(wrapper, /actualPage !== state\.currentPage[\s\S]*?await navigateToNextPage\(state\)[\s\S]*?navigationPending: true/);
   assert.match(
     wrapper,
     /delete state\.navigation;[\s\S]*?await commitAmazonAttempt\('cursor', state, \{[\s\S]*?amazonOrders: state\.allOrders,[\s\S]*?clearRecovery: true/,
   );
+});
+
+test('next-page cursor is never durable without its matching navigation marker', () => {
+  const wrapper = extractFunction(content, 'parseAmazonOrdersWithPagination');
+  const advanceAt = wrapper.indexOf('state.currentPage = completedPage + 1');
+  const prepareAt = wrapper.indexOf('await prepareAmazonNextPageNavigation(state)', advanceAt);
+  const cursorAt = wrapper.indexOf("await commitAmazonAttempt('cursor', state", prepareAt);
+  const delayAt = wrapper.indexOf('await sleep(PAGE_DELAY_MS)', cursorAt);
+  const navigateAt = wrapper.indexOf('await navigateToNextPage(state)', delayAt);
+  assert.ok(advanceAt > -1 && advanceAt < prepareAt);
+  assert.ok(prepareAt < cursorAt && cursorAt < delayAt && delayAt < navigateAt);
+  assert.match(wrapper.slice(prepareAt, cursorAt), /navigationPlan\.status !== 'prepared'/);
+  assert.doesNotMatch(wrapper, /state\.currentPage = completedPage;/,
+    'completion must retain next-page cursor so lastCompletedPage remains exact');
+});
+
+test('prepared navigation survives a restart during the page settle and redispatches page 17', async () => {
+  const requests = [];
+  const state = {
+    parseId: 'parse-1', runId: 'run-1', account: 'a@example.com', parserTabId: 9,
+    stageStartedAt: 10, accountSwitchStartedAt: 11, currentPage: 17,
+    navigation: {
+      navId: 'nav-17', targetPage: 17,
+      targetUrl: 'https://www.amazon.com/gp/your-account/order-history?orderFilter=months-3&startIndex=160',
+      fromUrl: 'https://www.amazon.com/gp/your-account/order-history?orderFilter=months-3&startIndex=150',
+      startedAt: 12,
+    },
+  };
+  const context = {
+    console,
+    location: { href: state.navigation.fromUrl },
+    document: { querySelector: () => null },
+    chrome: { runtime: { sendMessage: async request => {
+      requests.push(request);
+      if (request.action === 'getAmazonParserContext') {
+        return {
+          owned: true, runId: state.runId, account: state.account, tabId: state.parserTabId,
+          stageStartedAt: state.stageStartedAt, accountSwitchStartedAt: state.accountSwitchStartedAt,
+        };
+      }
+      return { ok: true, status: 'navigating' };
+    } } },
+  };
+  vm.createContext(context);
+  for (const name of [
+    'amazonParserContextMatchesState', 'getOwnedAmazonParserContext',
+    'requireOwnedAmazonPaginationState', 'amazonAttemptRefFromState',
+    'commitAmazonAttempt', 'hasExplicitAmazonLastPage',
+    'prepareAmazonNextPageNavigation', 'navigateToNextPage',
+  ]) vm.runInContext(extractFunction(content, name), context);
+
+  const result = await context.navigateToNextPage(state);
+  assert.equal(result.status, 'navigating');
+  const commits = requests.filter(request => request.action === 'commitAmazonAttempt');
+  assert.equal(commits.length, 1);
+  assert.equal(commits[0].kind, 'navigate');
+  assert.equal(commits[0].paginationState.navigation.navId, 'nav-17');
+  assert.equal(commits[0].targetUrl, state.navigation.targetUrl);
 });
 
 test('late old Amazon page sends one fenced cursor request and performs no direct write', async () => {
@@ -491,7 +550,7 @@ test('missing Next, stop and parser errors cannot emit Amazon completion', () =>
   const wrapper = extractFunction(content, 'parseAmazonOrdersWithPagination');
   assert.match(wrapper, /failPaginationParsing\(state, 'stopped-during-pagination'\)/);
   assert.match(wrapper, /failPaginationParsing\(state, 'stopped-before-navigation'\)/);
-  assert.match(wrapper, /navigationResult\.status === 'explicit-end'/);
+  assert.match(wrapper, /navigationPlan\.status === 'explicit-end'/);
   assert.match(wrapper, /failPaginationParsing\(state, navigationResult\.reason \|\| 'navigation-blocked'\)/);
   assert.match(wrapper, /failPaginationParsing\(state, 'parser-error', error\)/);
 

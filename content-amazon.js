@@ -1103,7 +1103,7 @@
 
   // ========== PAGINATION v6.8 (wrapper, не трогает parseAmazonOrders) ==========
   const PAGINATION_STATE_KEY = 'amazonPaginationState';
-  const PAGE_DELAY_MS = 2000; // 2 секунды (вернули безопасное значение)
+  const PAGE_DELAY_MS = 5000; // 5 секунд (05.08.2026: на 2 с Amazon отшивал страницу трека «redirecting in 7 seconds», кабинет уходил в ноль)
   
   async function getPaginationState() {
     return new Promise(resolve => {
@@ -1238,9 +1238,20 @@
     );
   }
 
-  async function navigateToNextPage(state) {
+  async function prepareAmazonNextPageNavigation(state) {
     await requireOwnedAmazonPaginationState(state, 'before next-page planning');
     const targetPage = state.currentPage;
+    if (state.navigation) {
+      if (state.navigation.targetPage === targetPage && state.navigation.targetUrl) {
+        return {
+          status: 'prepared',
+          targetPage,
+          targetUrl: state.navigation.targetUrl,
+          navId: state.navigation.navId
+        };
+      }
+      return { status: 'blocked', reason: 'navigation-generation-mismatch' };
+    }
     if (hasExplicitAmazonLastPage()) {
       return { status: 'explicit-end' };
     }
@@ -1270,6 +1281,14 @@
         detail: { targetPage, targetUrl: targetUrl.slice(0, 200) }
       });
     } catch (_) {}
+
+    return { status: 'prepared', targetPage, targetUrl, navId: state.navigation.navId };
+  }
+
+  async function navigateToNextPage(state) {
+    const prepared = await prepareAmazonNextPageNavigation(state);
+    if (prepared.status !== 'prepared') return prepared;
+    const { targetPage, targetUrl } = prepared;
 
     console.log(`🔄 Переходим на страницу ${targetPage}: ${targetUrl}`);
     try {
@@ -1504,9 +1523,17 @@
             }
           });
         } catch (_) {}
-        // Do not parse the previous page under the next page number. The durable
-        // marker remains open; the background watchdog will retry targetUrl.
-        return { success: true, continuing: true, navigationPending: true };
+        // Do not parse the previous page under the next page number. Redispatch
+        // the already durable exact marker immediately; waiting for the idle
+        // watchdog would waste ten minutes after a content-script restart.
+        const resumedNavigation = await navigateToNextPage(state);
+        if (resumedNavigation.status === 'navigating') {
+          return { success: true, continuing: true, navigationPending: true };
+        }
+        return failPaginationParsing(
+          state,
+          resumedNavigation.reason || 'navigation-resume-blocked'
+        );
       }
 
       const navigation = state.navigation;
@@ -1588,14 +1615,30 @@
       if (Array.isArray(pageResult.cancelled) && pageResult.cancelled.length) {
         state.cancelledOrders.push(...pageResult.cancelled);
       }
-      state.currentPage++;
-      
-      // Промежуточное сохранение - save current account progress only (NOT appending)
-      // Appending happens only in final save
-      await commitAmazonAttempt('cursor', state, { amazonOrders: state.allOrders });
-      
+      const completedPage = state.currentPage;
+      // The durable cursor always means "the next page to parse". Completion
+      // provenance therefore uses cursor - 1 for both configured limit and an
+      // explicit Amazon last page.
+      state.currentPage = completedPage + 1;
+
       // Переходим на следующую страницу?
-      if (state.currentPage <= state.totalPages) {
+      if (completedPage < state.totalPages) {
+        // Persist the next-page cursor together with its exact navigation marker
+        // before the five-second settle. A crash anywhere in that delay can then
+        // only redispatch this page; it can never parse the old URL under the new
+        // cursor and silently skip an order-history page.
+        const navigationPlan = await prepareAmazonNextPageNavigation(state);
+        if (navigationPlan.status === 'explicit-end') {
+          return await finishPaginationParsing(state, 'explicit-end');
+        }
+        if (navigationPlan.status !== 'prepared') {
+          return await failPaginationParsing(
+            state,
+            navigationPlan.reason || 'navigation-plan-blocked'
+          );
+        }
+        await commitAmazonAttempt('cursor', state, { amazonOrders: state.allOrders });
+
         console.log(`\n⏳ Пауза ${PAGE_DELAY_MS / 1000}с перед переходом на страницу ${state.currentPage}...`);
         await sleep(PAGE_DELAY_MS);
 
@@ -1605,18 +1648,14 @@
         }
         
         const navigationResult = await navigateToNextPage(state);
-        if (navigationResult.status === 'explicit-end') {
-          return await finishPaginationParsing(state, 'explicit-end');
-        }
         if (navigationResult.status !== 'navigating') {
           console.log('⚠️ Не удалось перейти на следующую страницу; оставляю честный incomplete');
           return await failPaginationParsing(state, navigationResult.reason || 'navigation-blocked');
         }
         return { success: true, continuing: true };
         
-      } else {
-        return await finishPaginationParsing(state, 'configured-limit');
       }
+      return await finishPaginationParsing(state, 'configured-limit');
       
     } catch (error) {
       console.error('❌ Ошибка парсинга:', error);
