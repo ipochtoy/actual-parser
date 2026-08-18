@@ -10,6 +10,7 @@
 
 ### Account transitions and screenshots
 - Serializes account switches and final returns. Concurrent completion/watchdog calls share one login/navigation flow.
+- Confirms the iHerb primary return from the owned orders landing only after the exact login form was submitted; the cross-document redirect can no longer destroy the proof, and a return problem cannot erase already committed cabinet data.
 - Keeps account-bound tracking screenshots with their cabinet, persists the queue head until Telegram/archive confirmation and quarantines failed delivery after bounded retries.
 - Excludes real screenshot-drain time from the parser stage budget without hiding a genuine parser stall.
 - iHerb Press & Hold stops the run with preserved state and an operator alert; it is never solved automatically.

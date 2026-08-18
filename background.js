@@ -672,6 +672,43 @@ async function markPipelineAccountResult(shop, account, { runId, ok, reason = ''
   );
 }
 
+function applyPipelineOperationalFailure(run, shop, account, {
+  runId,
+  reason = '',
+  found = 0
+} = {}) {
+  const normalized = normalizeAccountEmail(account);
+  if (!runId || run?.id !== runId
+      || !['starting', 'running'].includes(run.status)
+      || !run.expected?.[shop]?.includes(normalized)) {
+    return null;
+  }
+  const next = structuredClone(run);
+  next.failures = Array.isArray(next.failures) ? next.failures : [];
+  if (!next.failures.some(f => f.shop === shop
+      && normalizeAccountEmail(f.account) === normalized
+      && f.reason === reason)) {
+    next.failures.push({
+      shop,
+      account: normalized,
+      reason: String(reason || 'failed').slice(0, 160),
+      found,
+      at: Date.now()
+    });
+  }
+  return next;
+}
+
+async function recordPipelineOperationalFailure(shop, account, {
+  runId,
+  reason = '',
+  found = 0
+} = {}) {
+  return updatePipelineRun(run =>
+    applyPipelineOperationalFailure(run, shop, account, { runId, reason, found }) || run
+  );
+}
+
 function markPipelineStageTimeout(shop, accounts, generation) {
   return withPipelineRunWrite(async () => {
       const state = await chrome.storage.local.get(['pipelineRun', 'pipelineStage']);
@@ -2271,6 +2308,24 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             });
         })().catch(error => sendResponse({ active: false, owned: false, error: String(error?.message || error) }));
         return true;
+    } else if (request.action === "markIherbFinalReturnLoginSubmitted") {
+        markIherbFinalReturnLoginSubmitted(
+            sender?.tab?.id || null,
+            sender?.url || sender?.tab?.url || ''
+        ).then(sendResponse).catch(error => sendResponse({
+            accepted: false,
+            reason: String(error?.message || error)
+        }));
+        return true;
+    } else if (request.action === "confirmIherbFinalReturnLanding") {
+        confirmIherbFinalReturnLanding(
+            sender?.tab?.id || null,
+            sender?.url || sender?.tab?.url || ''
+        ).then(sendResponse).catch(error => sendResponse({
+            confirmed: false,
+            reason: String(error?.message || error)
+        }));
+        return true;
     } else if (request.action === "commitIherbAttempt") {
         handleIherbAttemptCommit(request, sender?.tab?.id || null)
             .then(sendResponse)
@@ -3114,6 +3169,119 @@ function finalReturnConfirmationMatches(confirmation, finalizing) {
       === normalizeAccountEmail(finalizing.account)
     && (!finalizing.tabId || confirmation.tabId === finalizing.tabId)
     && Number.isFinite(confirmation.confirmedAt);
+}
+
+function iherbFinalReturnStateMatches(state, senderTabId) {
+  const stage = state?.pipelineStage;
+  const generation = pipelineGenerationFromStage(stage);
+  const marker = state?.iherbStageFinalizing;
+  const pending = state?.pendingIherbSwitch;
+  const dispatch = state?.iherbSwitchDispatch;
+  const account = normalizeAccountEmail(marker?.account);
+  return Number.isInteger(senderTabId)
+    && ['starting', 'running'].includes(state?.pipelineRun?.status)
+    && state.pipelineRun.id === generation?.runId
+    && stage?.active === true
+    && stage.stages?.[stage.currentIndex] === 'iherb'
+    && state.iherbParserTabId === senderTabId
+    && state.iherbFinalReturn === true
+    && marker?.shop === 'iherb'
+    && marker?.returnStatus === 'prepared'
+    && marker?.tabId === senderTabId
+    && pipelineGenerationMatches(marker, generation)
+    && pending?.runId === generation.runId
+    && normalizeAccountEmail(pending?.email) === account
+    && dispatch?.kind === 'final-return'
+    && dispatch?.tabId === senderTabId
+    && pipelineGenerationMatches(dispatch, generation)
+    && normalizeAccountEmail(dispatch?.account) === account;
+}
+
+function iherbFinalReturnLoginSubmitMatches(state, senderTabId, senderUrl) {
+  let loginUrl;
+  try {
+    loginUrl = new URL(String(senderUrl || ''));
+  } catch (_) {
+    return false;
+  }
+  const exactLoginPage = (loginUrl.hostname === 'checkout.iherb.com'
+      && /^\/auth\/ui\/account\/login(?:\/|$)/i.test(loginUrl.pathname))
+    || (loginUrl.hostname === 'secure.iherb.com'
+      && /^\/account\/sign-in(?:\/|$)/i.test(loginUrl.pathname));
+  return loginUrl.protocol === 'https:'
+    && exactLoginPage
+    && iherbFinalReturnStateMatches(state, senderTabId)
+    && ['dispatched', 'login-submitted'].includes(state.iherbSwitchDispatch?.phase);
+}
+
+function iherbFinalReturnLandingMatches(state, senderTabId, senderUrl) {
+  let landingUrl;
+  try {
+    landingUrl = new URL(String(senderUrl || ''));
+  } catch (_) {
+    return false;
+  }
+  return landingUrl.protocol === 'https:'
+    && landingUrl.hostname === 'secure.iherb.com'
+    && /^\/myaccount\/orders(?:\/|$)/i.test(landingUrl.pathname)
+    && iherbFinalReturnStateMatches(state, senderTabId)
+    && state.iherbSwitchDispatch?.phase === 'login-submitted';
+}
+
+async function markIherbFinalReturnLoginSubmitted(senderTabId, senderUrl) {
+  const keys = [
+    'pipelineRun', 'pipelineStage', 'iherbParserTabId', 'iherbStageFinalizing',
+    'pendingIherbSwitch', 'iherbSwitchDispatch', 'iherbFinalReturn'
+  ];
+  let state = await chrome.storage.local.get(keys);
+  if (!iherbFinalReturnLoginSubmitMatches(state, senderTabId, senderUrl)) {
+    return { accepted: false, reason: 'stale_or_foreign_login' };
+  }
+  if (state.iherbSwitchDispatch.phase === 'login-submitted') {
+    return { accepted: true, duplicate: true };
+  }
+  state = await chrome.storage.local.get(keys);
+  if (!iherbFinalReturnLoginSubmitMatches(state, senderTabId, senderUrl)
+      || state.iherbSwitchDispatch.phase !== 'dispatched') {
+    return { accepted: false, reason: 'login_generation_changed' };
+  }
+  await chrome.storage.local.set({
+    iherbSwitchDispatch: {
+      ...state.iherbSwitchDispatch,
+      phase: 'login-submitted',
+      loginSubmittedAt: Date.now()
+    }
+  });
+  return { accepted: true };
+}
+
+async function confirmIherbFinalReturnLanding(senderTabId, senderUrl) {
+  const keys = [
+    'pipelineRun', 'pipelineStage', 'iherbParserTabId', 'iherbStageFinalizing',
+    'pendingIherbSwitch', 'iherbSwitchDispatch', 'iherbFinalReturn'
+  ];
+  let state = await chrome.storage.local.get(keys);
+  if (!iherbFinalReturnLandingMatches(state, senderTabId, senderUrl)) {
+    return { confirmed: false, reason: 'stale_or_foreign_landing' };
+  }
+  // The login document is destroyed by the cross-document redirect to
+  // /myaccount/orders. Confirm from the owned landing page, but reread the
+  // exact generation immediately before the durable write so an old tab can
+  // never confirm a later run/account.
+  state = await chrome.storage.local.get(keys);
+  if (!iherbFinalReturnLandingMatches(state, senderTabId, senderUrl)) {
+    return { confirmed: false, reason: 'landing_generation_changed' };
+  }
+  const generation = pipelineGenerationFromStage(state.pipelineStage);
+  await chrome.storage.local.set({
+    iherbFinalReturnConfirmed: {
+      ...generation,
+      account: state.iherbStageFinalizing.account,
+      tabId: senderTabId,
+      confirmedAt: Date.now()
+    }
+  });
+  return { confirmed: true };
 }
 
 async function stopPipelineForScreenshotDrain(reason = 'screenshot queue did not drain', expectedGeneration = null) {
@@ -4173,9 +4341,11 @@ async function resumeIherbStageFinalization(finalizing, expectedGeneration) {
         || fresh.stages?.[fresh.currentIndex] !== 'iherb') return false;
 
     if (status === 'failed') {
-        await markPipelineAccountResult('iherb', marker.account, {
+        // Returning the browser session to primary happens after all iHerb
+        // orders were committed. A return failure degrades the run, but it must
+        // never erase the already-proven cabinet completion.
+        await recordPipelineOperationalFailure('iherb', marker.account, {
             runId: expectedGeneration.runId,
-            ok: false,
             reason: marker.reason || 'final-primary-return-failed'
         });
     }
@@ -4632,9 +4802,8 @@ async function resumeAmazonStageFinalization(finalizing, expectedGeneration) {
         || !pipelineGenerationMatches(fresh, expectedGeneration)
         || fresh.stages?.[fresh.currentIndex] !== 'amazon') return false;
     if (status === 'failed') {
-        await markPipelineAccountResult('amazon', marker.account, {
+        await recordPipelineOperationalFailure('amazon', marker.account, {
             runId: expectedGeneration.runId,
-            ok: false,
             reason: marker.reason || 'final-primary-return-failed'
         });
     }

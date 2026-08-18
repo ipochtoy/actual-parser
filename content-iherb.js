@@ -80,6 +80,14 @@ async function verifyIherbParserContext(context) {
   return true;
 }
 
+async function confirmIherbFinalReturnLanding() {
+  return chrome.runtime.sendMessage({ action: 'confirmIherbFinalReturnLanding' })
+    .catch(error => ({
+      confirmed: false,
+      reason: String(error?.message || error)
+    }));
+}
+
 async function commitIherbAttemptResult(context, orders, cancelledOrders, found) {
   const response = await chrome.runtime.sendMessage({
     action: 'commitIherbAttempt',
@@ -274,10 +282,12 @@ async function retryOnServiceUnavailable(maxRetries = 5, baseDelay = 20000) {
   // session for AutoBuy) — MUST NOT parse.
   const finalReturnCheck = await chrome.storage.local.get(['iherbFinalReturn']);
   if (finalReturnCheck.iherbFinalReturn === true) {
-    console.log('🏁 iherbFinalReturn=true — skipping parse (session restore only)');
-    // Only content-iherb-login may clear this proof, after the exact primary
-    // credentials redirected away from the login page. Clearing it here could
-    // turn an intermediate orders redirect into a false successful return.
+    const confirmation = await confirmIherbFinalReturnLanding();
+    console.log(confirmation?.confirmed
+      ? '🏁 iHerb primary landing confirmed — skipping parse (session restore only)'
+      : `🏁 iHerb final-return landing rejected (${confirmation?.reason || 'unknown'}) — skipping parse`);
+    // Background validates the exact run/account/tab/generation before writing
+    // confirmation. This page never clears the final-return proof itself.
     return;
   }
 

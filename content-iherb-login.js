@@ -51,6 +51,15 @@ async function assertFreshIherbLoginIntent(expected) {
   return fresh;
 }
 
+async function markIherbFinalReturnLoginSubmitted(expected) {
+  if (!expected?.finalReturn) return true;
+  const response = await sendMessageAsync({ action: 'markIherbFinalReturnLoginSubmitted' });
+  if (!response?.accepted) {
+    throw new Error(`final_return_login_submit_rejected:${response?.reason || 'unknown'}`);
+  }
+  return true;
+}
+
 (async function main() {
   // Внешний email captured для catch блока: чтобы при любом неожиданном
   // throw'е после данной точки мы могли позвать sendFailed → background
@@ -296,6 +305,7 @@ async function runTwoStepLogin(email, password, expectedIntent) {
   ], btn => /^sign\s*in$/i.test((btn.textContent || '').trim()));
   if (!signInBtn) throw new Error('sign_in_button_not_found');
   await assertFreshIherbLoginIntent(expectedIntent);
+  await markIherbFinalReturnLoginSubmitted(expectedIntent);
   console.log('🔐 [iHerb Login] click Sign In');
   signInBtn.click();
 }
@@ -344,6 +354,7 @@ async function runLegacyLogin(email, password, expectedIntent) {
   if (!submitBtn) submitBtn = document.querySelector('button[type="submit"], input[type="submit"], button[id*="sign" i]');
 
   await assertFreshIherbLoginIntent(expectedIntent);
+  await markIherbFinalReturnLoginSubmitted(expectedIntent);
   if (submitBtn) submitBtn.click();
   else if (form) try { form.requestSubmit(); } catch (_) { form.submit(); }
   else throw new Error('legacy_submit_method_not_available');
@@ -567,6 +578,9 @@ async function trySolveCaptcha(cap, expectedIntent) {
 
   // Применяем токен в page-world (isolated content script не видит grecaptcha).
   await assertFreshIherbLoginIntent(expectedIntent);
+  // The token callback can submit and navigate synchronously, destroying this
+  // content-script context before the manual submit fallback below runs.
+  await markIherbFinalReturnLoginSubmitted(expectedIntent);
   injectRecaptchaToken(token);
   await sleep(800);
 
@@ -577,6 +591,7 @@ async function trySolveCaptcha(cap, expectedIntent) {
   );
   if (submitBtn && submitBtn.offsetParent !== null) {
     await assertFreshIherbLoginIntent(expectedIntent);
+    await markIherbFinalReturnLoginSubmitted(expectedIntent);
     try { submitBtn.click(); } catch (_) {}
   }
 
