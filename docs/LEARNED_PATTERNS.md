@@ -18,3 +18,6 @@
 - A run is green only when the exact expected roster equals the completed roster and there are no failures.
 - Sheet export must use rows from the same run/account/time window and must stamp success only after the physical transaction completes.
 - A durable retry marker and an in-memory transaction lock solve different problems: restart recovery and same-worker concurrency.
+- Advance a durable cursor only in the same commit that records the exact pending navigation; any deliberate delay belongs after that commit.
+- Nested time budgets need one invariant test: all per-account ceilings plus switching/finalization must fit inside the shop-stage ceiling.
+- A notification is deduplicated only after every external message part is acknowledged; failed or partial delivery must remain retryable.
