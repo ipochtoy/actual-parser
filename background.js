@@ -724,6 +724,8 @@ async function clearPipelineRuntimeState(reason) {
         'ebay_should_autoparse',
         'iherb_should_autoparse',
         'amazonPaginationState',
+        'amazonNavigationGraceUntil',
+        'amazonParserTabId',
         'amazonFinalReturn',
         'amazonParsingComplete',
         'accountSwitchStartedAt',
@@ -832,6 +834,12 @@ async function logMultiAccountStep(step, detail = {}) {
         await chrome.storage.local.set({ amazonMultiAccountLog });
         console.log(`📒 [multiAccountLog] ${step}`, detail);
     } catch (e) { console.warn('logMultiAccountStep failed:', e?.message || e); }
+}
+
+function rememberAmazonParserTab(sender) {
+    const tab = sender?.tab;
+    if (!tab?.id || !/^https?:\/\/(?:[^/]+\.)?amazon\.com\//i.test(tab.url || '')) return;
+    chrome.storage.local.set({ amazonParserTabId: tab.id }).catch(() => {});
 }
 
 async function handleProgressMessage(request) {
@@ -1269,11 +1277,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             }
         });
     } else if (request.action === "progress") {
+        if (String(request.store || '').toLowerCase() === 'amazon') rememberAmazonParserTab(sender);
         handleProgressMessage(request);
     } else if (request.action === "multiAccountLog") {
         // Forwarded from content-switch-account.js / content-amazon.js —
         // persistent step-log of Amazon multi-account flow for diagnostics.
-        logMultiAccountStep(request.step, request.detail || {});
+        rememberAmazonParserTab(sender);
+        logMultiAccountStep(request.step, { ...(request.detail || {}), tabId: sender?.tab?.id || null });
         sendResponse({status: "logged"});
     } else if (request.action === "fetchEbayOrderTracking") {
         // Parser found no tracking in the list feed for this order — read it from the
@@ -1466,7 +1476,10 @@ async function switchToNextAmazonAccount() {
         currentAmazonAccount = null;
 
         // Clear state
-        await chrome.storage.local.remove(['multiAccountState', 'lastAmazonProgressAt', 'accountSwitchStartedAt', 'skipGuardAt']);
+        await chrome.storage.local.remove([
+            'multiAccountState', 'lastAmazonProgressAt', 'accountSwitchStartedAt',
+            'skipGuardAt', 'amazonNavigationGraceUntil'
+        ]);
 
         // Build per-account Telegram summary from parseReport.stores
         try {
@@ -1509,6 +1522,7 @@ async function switchToNextAmazonAccount() {
         pendingAccountSwitch: { email: nextEmail },
         amazonParsingComplete: null,
         amazonPaginationState: null,
+        amazonNavigationGraceUntil: null,
         accountSwitchStartedAt: Date.now(),
         lastAmazonProgressAt: Date.now(),
         multiAccountState: {
@@ -1518,24 +1532,28 @@ async function switchToNextAmazonAccount() {
         }
     });
 
-    // Find active tab or create new one
-    const tabs = await chrome.tabs.query({ url: 'https://www.amazon.com/*' });
+    // Reuse only the parser-owned tab (or a unique order-history tab). Never
+    // hijack an arbitrary Amazon checkout/product page from the shared Chrome.
+    const parserState = await chrome.storage.local.get(['amazonParserTabId']);
+    const parserTab = await getAmazonParserTab(parserState.amazonParserTabId);
 
     const switchUrl = 'https://www.amazon.com/ap/signin?openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.amazon.com%2F%3Fref_%3Dnav_youraccount_switchacct&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.assoc_handle=usflex&openid.mode=checkid_setup&marketPlaceId=ATVPDKIKX0DER&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&switch_account=picker&ignoreAuthState=1&_encoding=UTF8';
 
-    if (tabs.length > 0) {
-        // Navigate existing Amazon tab to switch-account page
-        await logMultiAccountStep('switchToNextAmazonAccount:redirect', { account: nextEmail, tabId: tabs[0].id, url: switchUrl.slice(0, 80) });
-        await chrome.tabs.update(tabs[0].id, {
+    if (parserTab?.id) {
+        // Navigate existing parser tab to switch-account page
+        await logMultiAccountStep('switchToNextAmazonAccount:redirect', { account: nextEmail, tabId: parserTab.id, url: switchUrl.slice(0, 80) });
+        await chrome.storage.local.set({ amazonParserTabId: parserTab.id });
+        await chrome.tabs.update(parserTab.id, {
             url: switchUrl,
             active: true
         });
     } else {
         // Create new tab
         await logMultiAccountStep('switchToNextAmazonAccount:new-tab', { account: nextEmail, url: switchUrl.slice(0, 80) });
-        await chrome.tabs.create({
+        const tab = await chrome.tabs.create({
             url: switchUrl
         });
+        if (tab?.id) await chrome.storage.local.set({ amazonParserTabId: tab.id });
     }
 }
 
@@ -1584,6 +1602,7 @@ async function startSequentialPipeline() {
     'amazonFinalReturn',
     'accountSwitchFailures',
     'amazonPaginationState',
+    'amazonNavigationGraceUntil',
     // Списки отменённых заказов — обнуляем на старте прогона, чтобы отчёт показывал
     // только отменённые ЭТОГО прогона (notifiedCancelledOrderIds НЕ трогаем — это
     // память «о чём уже сообщили оператору», должна пережить прогон).
@@ -2486,9 +2505,14 @@ async function finalReturnToPrimaryAmazon() {
 
     const switchUrl = 'https://www.amazon.com/ap/signin?openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.amazon.com%2F%3Fref_%3Dnav_youraccount_switchacct&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.assoc_handle=usflex&openid.mode=checkid_setup&marketPlaceId=ATVPDKIKX0DER&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&switch_account=picker&ignoreAuthState=1&_encoding=UTF8';
 
-    const tabs = await chrome.tabs.query({ url: 'https://www.amazon.com/*' });
-    if (tabs.length > 0) await chrome.tabs.update(tabs[0].id, { url: switchUrl, active: true });
-    else await chrome.tabs.create({ url: switchUrl });
+    const parserState = await chrome.storage.local.get(['amazonParserTabId']);
+    const parserTab = await getAmazonParserTab(parserState.amazonParserTabId);
+    if (parserTab?.id) {
+        await chrome.tabs.update(parserTab.id, { url: switchUrl, active: true });
+    } else {
+        const tab = await chrome.tabs.create({ url: switchUrl });
+        if (tab?.id) await chrome.storage.local.set({ amazonParserTabId: tab.id });
+    }
 
     // Pipeline advance: after ~45s give picker → landing page time to finish.
     setTimeout(() => advancePipelineStage().catch(() => {}), 45000);
@@ -2498,32 +2522,19 @@ async function finalReturnToPrimaryAmazon() {
 async function startMultiAccountAmazonParsing() {
     console.log('🚀 startMultiAccountAmazonParsing called');
 
-    // STEP 1: Close ALL existing Amazon tabs to avoid race conditions
-    const existingTabs = await chrome.tabs.query({ url: 'https://www.amazon.com/*' });
-    if (existingTabs.length > 0) {
-        console.log(`🧹 Closing ${existingTabs.length} existing Amazon tabs...`);
-        for (const tab of existingTabs) {
-            try {
-                await chrome.tabs.remove(tab.id);
-            } catch (e) {
-                console.log('Tab already closed:', e);
-            }
-        }
-        // Small delay to ensure tabs are closed
-        await new Promise(resolve => setTimeout(resolve, 500));
-    }
-
     const cfg = await loadAccountsConfig();
     amazonAccountsQueue = cfg.amazon.map(a => a.email);
     isMultiAccountParsing = true;
     currentAmazonAccount = null;
 
-    // STEP 2: Clear ALL related flags BEFORE proceeding (with await!)
+    // Clear all per-run flags before proceeding (with await!). Keep the exact
+    // parser tab id so a new run can reuse its own tab without touching others.
     await new Promise(resolve => {
         chrome.storage.local.set({
             stopAllParsers: false,
             amazonParsingComplete: null,
             amazonPaginationState: null,
+            amazonNavigationGraceUntil: null,
             accountSwitchStartedAt: null,
             accountSwitchFailures: {},
             multiAccountState: {
@@ -2550,8 +2561,154 @@ async function startMultiAccountAmazonParsing() {
 
 // Watchdog using chrome.alarms (reliable even when Service Worker sleeps)
 const WATCHDOG_ALARM_NAME = 'amazonCompletionWatchdog';
+const AMAZON_NAVIGATION_MAX_RETRIES = 2;
+const AMAZON_NAVIGATION_RETRY_GAP_MS = 60_000;
+const AMAZON_NAVIGATION_GRACE_MS = 5 * 60_000;
 const SCREENSHOT_RESUME_ALARM = 'screenshotResume';
 chrome.alarms.create(SCREENSHOT_RESUME_ALARM, { delayInMinutes: 1, periodInMinutes: 1 });
+
+function getAmazonNavigationRetryDecision({ paginationState, timedOut, now = Date.now() }) {
+    const navigation = paginationState?.navigation;
+    if (!timedOut || !navigation) return { retry: false, reason: 'no-open-navigation' };
+    if (navigation.targetPage !== paginationState.currentPage) {
+        return { retry: false, reason: 'page-generation-mismatch' };
+    }
+    const retryCount = Math.max(0, Number(navigation.retryCount) || 0);
+    if (retryCount >= AMAZON_NAVIGATION_MAX_RETRIES) {
+        return { retry: false, reason: 'retry-limit' };
+    }
+    if (navigation.lastRetryAt && now - navigation.lastRetryAt < AMAZON_NAVIGATION_RETRY_GAP_MS) {
+        return { retry: false, reason: 'retry-gap' };
+    }
+    try {
+        const target = new URL(navigation.targetUrl);
+        if (!/(^|\.)amazon\.com$/i.test(target.hostname)
+            || !/(?:order-history|your-orders)/i.test(target.pathname)) {
+            return { retry: false, reason: 'unsafe-target' };
+        }
+    } catch (_) {
+        return { retry: false, reason: 'invalid-target' };
+    }
+    return {
+        retry: true,
+        retryCount: retryCount + 1,
+        targetPage: navigation.targetPage,
+        targetUrl: navigation.targetUrl
+    };
+}
+
+function isAmazonHardCapExpired({ totalElapsed, hardCapMs, now = Date.now(), graceUntil }) {
+    if (totalElapsed <= hardCapMs) return false;
+    return !(Number.isFinite(graceUntil) && now < graceUntil);
+}
+
+async function getAmazonParserTab(tabId) {
+    if (tabId) {
+        try {
+            const tab = await chrome.tabs.get(tabId);
+            const url = new URL(tab?.url || '');
+            const parserPath = /^(?:\/$|\/ap\/signin|\/gp\/(?:your-account\/)?order-history|\/gp\/css\/order-history|\/your-orders)/i.test(url.pathname);
+            if (/(^|\.)amazon\.com$/i.test(url.hostname) && parserPath) return tab;
+        } catch (_) {}
+    }
+    // Never fall back to an arbitrary Amazon tab: that was the old bug which
+    // photographed whichever checkout/product tab happened to be visible.
+    const tabs = await chrome.tabs.query({
+        url: [
+            'https://www.amazon.com/gp/your-account/order-history*',
+            'https://www.amazon.com/gp/css/order-history*',
+            'https://www.amazon.com/your-orders*'
+        ]
+    });
+    return tabs.length === 1 ? tabs[0] : null;
+}
+
+async function retryAmazonPaginationNavigation(stored, now, timeoutReason) {
+    const decision = getAmazonNavigationRetryDecision({
+        paginationState: stored.amazonPaginationState,
+        timedOut: true,
+        now
+    });
+    if (!decision.retry) return false;
+
+    const tab = await getAmazonParserTab(stored.amazonParserTabId);
+    if (!tab?.id) {
+        await logMultiAccountStep('navigation-retry:failed', {
+            reason: 'exact-parser-tab-not-found',
+            targetPage: decision.targetPage,
+            timeoutReason
+        });
+        return false;
+    }
+
+    const paginationState = {
+        ...stored.amazonPaginationState,
+        navigation: {
+            ...stored.amazonPaginationState.navigation,
+            retryCount: decision.retryCount,
+            lastRetryAt: now,
+            startedAt: now,
+            timeoutReason
+        }
+    };
+    // Commit the retry generation and mutex before navigation. This survives an
+    // MV3 worker restart and prevents the 3-second alarm from issuing duplicates.
+    await chrome.storage.local.set({
+        amazonPaginationState: paginationState,
+        amazonParserTabId: tab.id,
+        amazonNavigationGraceUntil: now + AMAZON_NAVIGATION_GRACE_MS,
+        lastAmazonProgressAt: now,
+        skipGuardAt: now
+    });
+    await logMultiAccountStep('navigation-retry:start', {
+        tabId: tab.id,
+        targetPage: decision.targetPage,
+        retryCount: decision.retryCount,
+        timeoutReason,
+        targetUrl: decision.targetUrl.slice(0, 200)
+    });
+    try {
+        await chrome.tabs.update(tab.id, { url: decision.targetUrl });
+        return true;
+    } catch (e) {
+        await logMultiAccountStep('navigation-retry:failed', {
+            tabId: tab.id,
+            targetPage: decision.targetPage,
+            retryCount: decision.retryCount,
+            reason: String(e?.message || e)
+        });
+        return false;
+    }
+}
+
+async function captureAmazonTabWithDebugger(tabId) {
+    let attached = false;
+    try {
+        await new Promise((resolve, reject) => {
+            chrome.debugger.attach({ tabId }, '1.3', () => {
+                if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+                attached = true;
+                resolve();
+            });
+        });
+        const result = await new Promise((resolve, reject) => {
+            chrome.debugger.sendCommand(
+                { tabId },
+                'Page.captureScreenshot',
+                { format: 'png', fromSurface: true, captureBeyondViewport: false },
+                response => {
+                    if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+                    resolve(response);
+                }
+            );
+        });
+        return result?.data || '';
+    } finally {
+        if (attached) {
+            await new Promise(resolve => chrome.debugger.detach({ tabId }, () => resolve()));
+        }
+    }
+}
 
 // iHerb cs watchdog: проверяет каждую минуту что content-iherb.js не залип
 // (Extension context invalidated, infinite scroll стал, network 429 etc.).
@@ -2985,7 +3142,11 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 
     if (alarm.name !== WATCHDOG_ALARM_NAME) return;
 
-    const stored = await chrome.storage.local.get(['amazonParsingComplete', 'multiAccountState', 'accountSwitchStartedAt', 'lastAmazonProgressAt', 'skipGuardAt']);
+    const stored = await chrome.storage.local.get([
+        'amazonParsingComplete', 'multiAccountState', 'accountSwitchStartedAt',
+        'lastAmazonProgressAt', 'skipGuardAt', 'amazonPaginationState',
+        'amazonNavigationGraceUntil', 'amazonParserTabId'
+    ]);
 
     // Skip-guard mutex: alarm fires every 3s, but skip-path takes 5-10s
     // (screenshot + Telegram photo + log + remove + switch). Without this guard, a
@@ -3009,32 +3170,65 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
         const sinceLastProgress = now - (stored.lastAmazonProgressAt || stored.accountSwitchStartedAt);
         const HARD_CAP_MS = 1_200_000; // 20 min absolute
         const isIdleTimeout = sinceLastProgress > ACCOUNT_PARSE_TIMEOUT_MS;
-        const isHardCap = totalElapsed > HARD_CAP_MS;
+        const isHardCap = isAmazonHardCapExpired({
+            totalElapsed,
+            hardCapMs: HARD_CAP_MS,
+            now,
+            graceUntil: stored.amazonNavigationGraceUntil
+        });
         if (isIdleTimeout || isHardCap) {
+            const timeoutReason = isHardCap ? 'hard-cap 20min' : 'no progress';
+            // A page transition is recoverable: state.currentPage already points
+            // to the next page and all previous orders are durably saved. Retry
+            // the exact URL before discarding the rest of this account.
+            if (await retryAmazonPaginationNavigation(stored, now, timeoutReason)) {
+                console.warn(`[amazonWatchdog] retried pending navigation to page ${stored.amazonPaginationState?.currentPage}`);
+                return;
+            }
+
             // Set skip-guard IMMEDIATELY before any long awaits — this is the mutex
             // that prevents concurrent alarm handlers from firing duplicate timeouts.
             await chrome.storage.local.set({ skipGuardAt: Date.now() });
 
             const failedEmail = stored.multiAccountState.currentAmazonAccount || 'unknown';
-            const reason = isHardCap ? 'hard-cap 20min' : 'no progress';
+            const reason = timeoutReason;
             const idleSec = Math.round(sinceLastProgress / 1000);
             const totalSec = Math.round(totalElapsed / 1000);
             console.log(`🚫 Account ${failedEmail} timed out (${reason}, idle=${idleSec}s, total=${totalSec}s), skipping`);
             sendTelegramMessage(`🚫 Аккаунт ${failedEmail.split('@')[0]}: ${reason}, idle=${idleSec}с, total=${totalSec}с — пропускаю`);
 
-            // Screenshot the Amazon tab before skipping — shows what actually was on the
-            // page: picker, order-history, CAPTCHA, 2FA, device verification, empty.
-            // Critical for diagnosing the "photopochtoy silence" pattern.
+            // Capture the exact parser tab through CDP. captureVisibleTab(windowId)
+            // photographed whichever unrelated tab was active in that window and
+            // made the old incident frame untrustworthy.
+            let evidence = { tabId: null, tabUrl: null, tabTitle: null };
             try {
-                const amzTabs = await chrome.tabs.query({ url: '*://*.amazon.com/*' });
-                if (amzTabs[0]) {
-                    const dataUrl = await chrome.tabs.captureVisibleTab(amzTabs[0].windowId, { format: 'png' });
-                    const b64 = (dataUrl || '').replace(/^data:image\/png;base64,/, '');
-                    if (b64) await sendTelegramPhoto(b64, `🚫 Amazon timeout: ${failedEmail.split('@')[0]}\n${reason}, idle=${idleSec}s total=${totalSec}s`);
+                const tab = await getAmazonParserTab(stored.amazonParserTabId);
+                if (tab?.id) {
+                    evidence = {
+                        tabId: tab.id,
+                        tabUrl: (tab.url || '').slice(0, 300),
+                        tabTitle: (tab.title || '').slice(0, 200),
+                        tabStatus: tab.status || null,
+                        page: stored.amazonPaginationState?.currentPage || null,
+                        navigation: stored.amazonPaginationState?.navigation || null
+                    };
+                    const b64 = await captureAmazonTabWithDebugger(tab.id);
+                    if (b64) {
+                        await sendTelegramPhoto(
+                            b64,
+                            `🚫 Amazon timeout: ${failedEmail.split('@')[0]}\n${reason}, idle=${idleSec}s total=${totalSec}s\nточный tab=${tab.id}`
+                        );
+                    }
                 }
             } catch (e) { console.warn('timeout-screenshot failed:', e?.message || e); }
 
-            await logMultiAccountStep('account-parse:timeout', { account: failedEmail, reason, idleSec, totalSec });
+            await logMultiAccountStep('account-parse:timeout', {
+                account: failedEmail,
+                reason,
+                idleSec,
+                totalSec,
+                ...evidence
+            });
 
             // Populate partial parseReport.stores so final Telegram summary shows
             // partial progress instead of silently reporting zero (observed 2026-04-22:
@@ -3056,7 +3250,10 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             amazonAccountsQueue = stored.multiAccountState.amazonAccountsQueue || [];
             currentAmazonAccount = stored.multiAccountState.currentAmazonAccount;
 
-            await chrome.storage.local.remove(['accountSwitchStartedAt', 'lastAmazonProgressAt', 'amazonParsingComplete', 'amazonPaginationState']);
+            await chrome.storage.local.remove([
+                'accountSwitchStartedAt', 'lastAmazonProgressAt', 'amazonParsingComplete',
+                'amazonPaginationState', 'amazonNavigationGraceUntil'
+            ]);
             await switchToNextAmazonAccount();
             return;
         }
@@ -3076,7 +3273,11 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             }
             
             // Clear the flag so we don't process again
-            await chrome.storage.local.set({ amazonParsingComplete: null, accountSwitchStartedAt: null });
+            await chrome.storage.local.set({
+                amazonParsingComplete: null,
+                accountSwitchStartedAt: null,
+                amazonNavigationGraceUntil: null
+            });
             
             const count = stored.amazonParsingComplete.found || 0;
             const accountName = currentAmazonAccount ? currentAmazonAccount.split('@')[0] : 'current';

@@ -1105,7 +1105,35 @@
     });
   }
   
-  function clickNextPage() {
+  function getAmazonPageFromUrl(rawUrl) {
+    try {
+      const url = new URL(rawUrl, location.href);
+      const startIndex = Number(url.searchParams.get('startIndex'));
+      if (url.searchParams.has('startIndex') && Number.isFinite(startIndex) && startIndex >= 0) {
+        return Math.floor(startIndex / 10) + 1;
+      }
+      const page = Number(url.searchParams.get('page'));
+      if (url.searchParams.has('page') && Number.isFinite(page) && page >= 1) return Math.floor(page);
+      return 1;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function buildAmazonPageUrl(rawUrl, pageNumber) {
+    try {
+      const url = new URL(rawUrl, location.href);
+      if (!/(^|\.)amazon\.com$/i.test(url.hostname)) return null;
+      if (!/(?:order-history|your-orders)/i.test(url.pathname)) return null;
+      const page = Math.max(1, Math.floor(Number(pageNumber) || 1));
+      url.searchParams.set('startIndex', String((page - 1) * 10));
+      return url.href;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function findNextPageUrl(nextPageNumber) {
     const selectors = [
       'li.a-last:not(.a-disabled) a',
       '.a-pagination .a-last a',
@@ -1116,13 +1144,46 @@
     for (const sel of selectors) {
       const nextBtn = document.querySelector(sel);
       if (nextBtn && !nextBtn.closest('.a-disabled')) {
-        console.log('🔄 Кликаем Next...');
-        nextBtn.click();
-        return true;
+        const href = nextBtn.href || nextBtn.getAttribute('href');
+        try {
+          const resolved = new URL(href, location.href).href;
+          return buildAmazonPageUrl(resolved, nextPageNumber);
+        } catch (_) { /* try another known selector */ }
       }
     }
-    console.log('⚠️ Next button not found');
-    return false;
+    return null;
+  }
+
+  async function navigateToNextPage(state) {
+    const targetPage = state.currentPage;
+    const targetUrl = findNextPageUrl(targetPage);
+    if (!targetUrl) {
+      console.log('⚠️ Next URL not found');
+      return false;
+    }
+
+    // Save a durable transition marker BEFORE leaving the document. If Chrome is
+    // starved while navigating, the background watchdog can retry this exact URL
+    // without discarding the already parsed pages.
+    state.navigation = {
+      targetPage,
+      targetUrl,
+      fromUrl: location.href.slice(0, 500),
+      startedAt: Date.now(),
+      retryCount: 0
+    };
+    await savePaginationState(state);
+    try {
+      chrome.runtime.sendMessage({
+        action: 'multiAccountLog',
+        step: 'content-amazon:navigation-start',
+        detail: { targetPage, targetUrl: targetUrl.slice(0, 200) }
+      });
+    } catch (_) {}
+
+    console.log(`🔄 Переходим на страницу ${targetPage}: ${targetUrl}`);
+    location.assign(targetUrl);
+    return true;
   }
   
   async function finishPaginationParsing(state) {
@@ -1293,6 +1354,43 @@
     } else {
       console.log(`🔄 Продолжаем парсинг - страница ${state.currentPage}/${state.totalPages}`);
     }
+
+    if (state.navigation && state.navigation.targetPage === state.currentPage) {
+      const actualPage = getAmazonPageFromUrl(location.href);
+      if (actualPage !== state.currentPage) {
+        console.warn(`⚠️ Amazon navigation mismatch: expected page ${state.currentPage}, loaded ${actualPage}`);
+        try {
+          chrome.runtime.sendMessage({
+            action: 'multiAccountLog',
+            step: 'content-amazon:navigation-mismatch',
+            detail: {
+              expectedPage: state.currentPage,
+              actualPage,
+              url: location.href.slice(0, 200)
+            }
+          });
+        } catch (_) {}
+        // Do not parse the previous page under the next page number. The durable
+        // marker remains open; the background watchdog will retry targetUrl.
+        return { success: true, continuing: true, navigationPending: true };
+      }
+
+      const navigation = state.navigation;
+      delete state.navigation;
+      await savePaginationState(state);
+      try {
+        chrome.runtime.sendMessage({
+          action: 'multiAccountLog',
+          step: 'content-amazon:navigation-arrived',
+          detail: {
+            page: state.currentPage,
+            retryCount: navigation.retryCount || 0,
+            elapsedMs: Math.max(0, Date.now() - (navigation.startedAt || Date.now())),
+            url: location.href.slice(0, 200)
+          }
+        });
+      } catch (_) {}
+    }
     
     try {
       console.log(`\n📄 === СТРАНИЦА ${state.currentPage}/${state.totalPages} ===`);
@@ -1366,8 +1464,8 @@
           return await finishPaginationParsing(state);
         }
         
-        const clicked = clickNextPage();
-        if (!clicked) {
+        const navigating = await navigateToNextPage(state);
+        if (!navigating) {
           console.log('⚠️ Не удалось перейти на следующую страницу, завершаем');
           return await finishPaginationParsing(state);
         }
