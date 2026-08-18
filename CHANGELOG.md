@@ -1,5 +1,28 @@
 # Order Parser Pro - Changelog
 
+## Version 7.8.0 - Reliable Six-Cabinet Nightly Run (2026-08-18)
+
+### Night scheduler and ownership
+- Runs one sequential `iHerb → eBay → Amazon → done` pipeline at 23:00 Pittsburgh time with DST-safe one-shot alarms.
+- Requires the exact configured roster: three iHerb, one eBay and two Amazon cabinets.
+- Persists run, stage, account, tab and parse-attempt identity so a Manifest V3 restart resumes the same work instead of skipping or duplicating a cabinet.
+- Rechecks ownership after every delayed browser operation; stale timers and pages cannot navigate or write into a newer stage.
+
+### Account transitions and screenshots
+- Serializes account switches and final returns. Concurrent completion/watchdog calls share one login/navigation flow.
+- Keeps account-bound tracking screenshots with their cabinet, persists the queue head until Telegram/archive confirmation and quarantines failed delivery after bounded retries.
+- Excludes real screenshot-drain time from the parser stage budget without hiding a genuine parser stall.
+- iHerb Press & Hold stops the run with preserved state and an operator alert; it is never solved automatically.
+
+### Amazon and Google Sheets
+- Moves Amazon cursor, pagination, completion and navigation commits behind one generation-fenced background arbiter.
+- Captures timeout evidence from the exact parser tab and uses the rolling `months-3` orders view.
+- Filters final Sheet rows by exact run/account/time provenance.
+- Shares one physical Sheet transaction between the normal completion timer and the restart-safe watchdog, preventing duplicate appends.
+
+### Verification
+- Added behavioral regression coverage for restart windows, concurrent finalizers, delayed tab lookup, screenshot durability, exact roster completion and Sheet upload races.
+
 ## Version 7.5 - Multi-Account & Stability (2026-02-05)
 
 ### 🔧 Amazon Parser
