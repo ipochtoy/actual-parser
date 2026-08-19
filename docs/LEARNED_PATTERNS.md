@@ -21,3 +21,4 @@
 - Advance a durable cursor only in the same commit that records the exact pending navigation; any deliberate delay belongs after that commit.
 - Nested time budgets need one invariant test: all per-account ceilings plus switching/finalization must fit inside the shop-stage ceiling.
 - A notification is deduplicated only after every external message part is acknowledged; failed or partial delivery must remain retryable.
+- [2026-08-19] EBAY: Producer и screenshot consumer по-разному классифицировали 12/15-значный FedEx, из-за чего очередь блокировалась после eBay → Один строгий формат и поведенческий тест от DOM-карточки до shipment с exact track → `background.js`, `tests/ebay-screenshot-tracking.test.mjs` (incident night-2026-08-19-ebay-fedex, commit `67e872c`)
