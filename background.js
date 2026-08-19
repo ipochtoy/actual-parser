@@ -8485,11 +8485,23 @@ async function processScreenshotQueue() {
 // Вычисляет список crop-spec'ов для eBay order page: один spec на каждую shipment-card.
 // Каждый скрин содержит: Order info (общий) + одна shipment-card (Delivery info + Tracking details + Item info).
 // Горизонтально обрезает до левой колонки (прячет Shipping address / Payment info / рекламу справа).
+// Keep this in sync with pickBestTracking() in content-ebay.js.  The content
+// parser already accepts FedEx's bare 12/15-digit numbers; the screenshot path
+// must classify the same value or it will retain the queue head forever after
+// three archive attempts.
+const EBAY_TRACKING_PATTERN_SOURCE = String.raw`\b(1Z[0-9A-Z]{16}|9[2-6]\d{18,24}|YT\d{10,25}|[A-Z]{2}\d{9}[A-Z]{2}|\d{15}|\d{12})\b`;
+
+function extractEbayTrackingNumber(value) {
+    const match = String(value || '').toUpperCase().match(new RegExp(EBAY_TRACKING_PATTERN_SOURCE));
+    return match?.[1] || '';
+}
+
 async function computeEbayCropSpecs(tab) {
     try {
         const res = await chrome.scripting.executeScript({
             target: { tabId: tab.id },
-            func: () => {
+            args: [EBAY_TRACKING_PATTERN_SOURCE],
+            func: (trackingPatternSource) => {
                 const orderInfo = document.querySelector('.section-module.order-info');
                 const shipments = Array.from(document.querySelectorAll('.shipment-card'));
                 if (!orderInfo || shipments.length === 0) return [];
@@ -8519,9 +8531,10 @@ async function computeEbayCropSpecs(tab) {
                     let trackNum = '';
                     const dts = sc.querySelectorAll('dt.eui-label');
                     // Strict tracking formats only (mirror pickBestTracking from content-ebay.js):
-                    // UPS 1Z[A-Z0-9]{16}, USPS 9[2-6]\d{18,24}, Yanwen YT\d, UPU [A-Z]{2}\d{9}[A-Z]{2}.
+                    // UPS 1Z[A-Z0-9]{16}, USPS 9[2-6]\d{18,24}, Yanwen YT\d,
+                    // UPU [A-Z]{2}\d{9}[A-Z]{2}, FedEx bare 12/15 digits.
                     // Loose /[A-Z0-9]{10,}/ used to catch product-name text like "COCTEATWINBLACK".
-                    const TRACK_RE = /\b(1Z[0-9A-Z]{16}|9[2-6]\d{18,24}|YT\d{10,25}|[A-Z]{2}\d{9}[A-Z]{2})\b/;
+                    const TRACK_RE = new RegExp(trackingPatternSource);
                     for (const dt of dts) {
                         if (/^number$/i.test((dt.textContent || '').trim())) {
                             const dd = dt.parentElement?.querySelector('dd') || dt.nextElementSibling;
