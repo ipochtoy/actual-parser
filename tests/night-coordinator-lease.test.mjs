@@ -767,6 +767,40 @@ test('degraded Store Walk gets one exact durable catch-up resume after terminal 
   assert.deepEqual(harness.state.nightCabinetLease, degraded);
 });
 
+test('each distinct degraded Store Walk token gets one same-slot resume, never one global resume', async () => {
+  const harness = leaseTransitionHarness({ destination: 'store-walk' });
+  const tokens = Array.from({ length: 7 }, (_, index) => `catchup-budget-token-${String(index).padStart(4, '0')}`);
+  const transition = async (oldToken, newToken, index) => {
+    harness.state.nightCabinetLease = {
+      slotId: harness.slotId, owner: 'store-walk', phase: 'degraded', token: oldToken,
+      heartbeat: 100_000 + index, expires: 200_000 + index,
+    };
+    harness.state.nightCoordinatorLeaseTransitionRequest = {
+      requestId: `multi-catchup-resume-${index}`,
+      requestedAt: 999_999,
+      expected: {
+        state: 'present', slotId: harness.slotId, owner: 'store-walk', phase: 'degraded', token: oldToken,
+      },
+      desired: {
+        slotId: harness.slotId, owner: 'store-walk', phase: 'store-catchup', token: newToken,
+      },
+    };
+    delete harness.state.lastHandledNightCoordinatorLeaseTransitionId;
+    delete harness.state.nightCoordinatorLeaseTransitionResult;
+    return harness.context.handleNightCoordinatorLeaseTransitionRequest();
+  };
+
+  for (let index = 0; index < 6; index++) {
+    assert.equal((await transition(tokens[index], tokens[index + 1], index + 1)).ok, true,
+      `bounded continuation ${index + 1} must accept its distinct exact old token`);
+  }
+  assert.deepEqual(Object.keys(harness.state.nightCabinetCatchupResumeMarkers).sort(),
+    tokens.slice(0, 6).map(token => `${harness.slotId}:${token}`).sort());
+  const replay = await transition(tokens[0], 'catchup-resume-token-foreign', 3);
+  assert.equal(replay.ok, false);
+  assert.equal(replay.reason, 'catchup-resume-already-consumed');
+});
+
 test('catch-up resume refuses foreign, nonterminal and malformed durable proof', async () => {
   const configure = (harness) => {
     const oldToken = 'degraded-store-token-0001';

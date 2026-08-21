@@ -9,6 +9,13 @@
     <string>/opt/homebrew/bin/node</string>
     <string>/Users/dzianismazol/Desktop/order-parser-pro/watchdog/parser-watchdog.mjs</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PARSER_CHROME_USER_DATA_DIR</key>
+    <string>/Users/dzianismazol/Library/Application Support/Google/Chrome</string>
+    <key>PARSER_EXTENSION_PATH</key>
+    <string>/Users/dzianismazol/Desktop/order-parser-pro</string>
+  </dict>
   <key>StartInterval</key>
   <integer>900</integer>
   <key>RunAtLoad</key>

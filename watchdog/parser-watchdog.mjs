@@ -14,6 +14,9 @@
 // Флаг --dry-run: всё проверяет, но алерты печатает в stdout вместо отправки в Telegram.
 
 import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { readExtensionInstallation } from './lib/extension-installation.mjs';
 
 // ---------- конфиг ----------
 const DRY_RUN = process.argv.includes('--dry-run');
@@ -37,6 +40,9 @@ const TG_TOKEN = loadTelegramToken();
 const TG_CHAT = '-1003888176404';
 
 const PARSER_MANIFEST_NAME = 'Pochtoy Parsing';
+const PARSER_EXT_ID = 'hglkogmefkopebgipcnmfmnhflnhajbo';
+const CHROME_USER_DATA = process.env.PARSER_CHROME_USER_DATA_DIR
+  || join(homedir(), 'Library', 'Application Support', 'Google', 'Chrome');
 
 // Пороги (минуты).
 const NOT_STARTED_GRACE_MIN = 15;  // сколько ждать после слота, прежде чем считать «не запустился»
@@ -184,10 +190,21 @@ async function readParserStorage() {
     const r = await tryReadParserStorage(expr);
     if (r.storage) return { ok: true, storage: r.storage, wsUrl: r.wsUrl };
     if (r.down) return { ok: false, reason: 'cdp_down' };   // Chrome закрыт — реальное условие, не ждём
-    if (Date.now() >= deadline) return { ok: false, reason: 'ext_missing' };
+    if (Date.now() >= deadline) break;
     log(`readParserStorage: SW парсера не виден (спит?), попытка ${attempt}, жду ${STEP_MS / 1000}s и пробую снова…`);
     await sleep(STEP_MS);
   }
+  // Не открываем popup/chrome:// и не создаём вкладку: внешний сторож не имеет
+  // tab claim и не должен касаться общего браузера. После исчерпания обычных
+  // MV3-ретраев читаем только Chrome Preferences. Нечитаемый/неоднозначный файл
+  // остаётся ext_missing (ночной fail-closed), а точное отсутствие — отдельная
+  // круглосуточная тревога.
+  const configured = readExtensionInstallation({
+    userDataRoot: CHROME_USER_DATA, extensionId: PARSER_EXT_ID,
+    manifestName: PARSER_MANIFEST_NAME,
+    expectedPath: process.env.PARSER_EXTENSION_PATH || join(homedir(), 'Desktop', 'order-parser-pro'),
+  });
+  return { ok: false, reason: configured.state === 'missing' ? 'ext_not_installed' : 'ext_missing' };
 }
 
 // ---------- команда расширению (автопочинка, инцидент 2026-07-03) ----------
@@ -268,6 +285,10 @@ async function main() {
       // (handleCheck дедупит: одно сообщение, не спам). Автопочинка невозможна.
       const a = handleCheck(state, 'chrome', true,
         '❗ Сторож парсера: Chrome закрыт — ночной парс в 23:00 не сможет запуститься. Нужен оператор.');
+      if (a) alerts.push(a);
+    } else if (res.reason === 'ext_not_installed') {
+      const a = handleCheck(state, 'chrome', true,
+        '❗ Сторож парсера: расширение «Pochtoy Parsing» не установлено или выключено в Chrome — ночной парс не запустится. Нужен оператор.');
       if (a) alerts.push(a);
     } else {
       // ext_missing: почти всегда просто СПЯЩИЙ service worker (MV3 выгружает его
