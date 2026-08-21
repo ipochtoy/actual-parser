@@ -8,8 +8,24 @@ const DAILY_ALARM_DRIFT_TOLERANCE_MS = 2 * 60 * 1000;
 const DAILY_MISSED_RUN_CATCHUP_MS = 2 * 60 * 60 * 1000;
 const DAILY_DIAGNOSTICS_KEY = 'dailyAutoParseDiagnostics';
 const DAILY_DIAGNOSTICS_LIMIT = 80;
+const NIGHT_CABINET_LEASE_KEY = 'nightCabinetLease';
+const NIGHT_CABINET_RETRY_KEY = 'nightCabinetRetryState';
+const NIGHT_CABINET_RETRY_ALARM = 'nightCabinetLeaseRetry';
+const NIGHT_CABINET_RETRY_MINUTES = 10;
+const NIGHT_CABINET_RETRY_MAX = 36; // bounded six-hour recovery window
+const NIGHT_CABINET_LEASE_TTL_MS = 15 * 60_000;
+const NIGHT_CABINET_TRANSITION_REQUEST_KEY = 'nightCoordinatorLeaseTransitionRequest';
+const NIGHT_CABINET_TRANSITION_RESULT_KEY = 'nightCoordinatorLeaseTransitionResult';
+const NIGHT_CABINET_TRANSITION_HANDLED_KEY = 'lastHandledNightCoordinatorLeaseTransitionId';
+const NIGHT_CABINET_TIME_ZONE = 'America/New_York';
+const NIGHT_CABINET_OWNERS = new Set(['store-walk', 'parser']);
+const NIGHT_CABINET_PHASES = new Set([
+    'claimed', 'running', 'ready', 'store-main', 'store-catchup', 'recover',
+    'completed', 'degraded', 'blocked', 'failed'
+]);
 let dailyDiagnosticWriteQueue = Promise.resolve();
 let dailyRunStartInFlight = null;
+let nightCabinetLeaseWriteChain = Promise.resolve();
 let resolveStartupPipelineReconciled = null;
 const startupPipelineReconciled = new Promise(resolve => {
     resolveStartupPipelineReconciled = resolve;
@@ -102,6 +118,380 @@ function getLastDailyRunSlot(now = new Date()) {
     return slot;
 }
 
+function nightCabinetSlotId(now = Date.now()) {
+    return String(getLastDailyRunSlot(new Date(now)).getTime());
+}
+
+function nightCabinetSlotDay(slotId) {
+    const slot = new Date(Number(slotId));
+    if (!Number.isFinite(slot.getTime())) return null;
+    const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+        timeZone: NIGHT_CABINET_TIME_ZONE,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+    }).formatToParts(slot).map(part => [part.type, part.value]));
+    return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+/** Pure, fail-closed validation of the cross-process browser lease. */
+function inspectNightCabinetLease(raw, { now = Date.now() } = {}) {
+    if (raw == null) return { state: 'missing', lease: null };
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        return { state: 'malformed', reason: 'lease-not-object', lease: null };
+    }
+    const allowedFields = new Set([
+        'slotId', 'owner', 'phase', 'token', 'heartbeat', 'expires', 'runId'
+    ]);
+    if (Object.keys(raw).some(key => !allowedFields.has(key))) {
+        return { state: 'malformed', reason: 'lease-fields-unexpected', lease: null };
+    }
+    const exact = {
+        slotId: String(raw.slotId || ''),
+        owner: String(raw.owner || ''),
+        phase: String(raw.phase || ''),
+        token: String(raw.token || ''),
+        heartbeat: Number(raw.heartbeat),
+        expires: Number(raw.expires),
+        ...(raw.runId ? { runId: String(raw.runId) } : {})
+    };
+    if (!/^\d{10,16}$/.test(exact.slotId)
+        || !NIGHT_CABINET_OWNERS.has(exact.owner)
+        || !NIGHT_CABINET_PHASES.has(exact.phase)
+        || exact.token.length < 16 || exact.token.length > 200
+        || !Number.isFinite(exact.heartbeat)
+        || !Number.isFinite(exact.expires)
+        || exact.heartbeat <= 0
+        || exact.expires <= exact.heartbeat
+        || exact.expires - exact.heartbeat > NIGHT_CABINET_LEASE_TTL_MS * 2) {
+        return { state: 'malformed', reason: 'lease-fields-invalid', lease: null };
+    }
+    if (exact.owner === 'parser'
+        && ['running', 'completed', 'degraded', 'blocked', 'failed'].includes(exact.phase)
+        && !exact.runId) {
+        return { state: 'malformed', reason: 'parser-run-id-missing', lease: null };
+    }
+    return { state: exact.expires <= now ? 'expired' : 'active', lease: exact };
+}
+
+function withNightCabinetLeaseWrite(work) {
+    const task = nightCabinetLeaseWriteChain
+        .catch(() => {})
+        .then(work);
+    nightCabinetLeaseWriteChain = task.catch(() => {});
+    return task;
+}
+
+function nightCabinetTerminalProof(state, lease) {
+    const run = state?.pipelineRun;
+    const stage = state?.pipelineStage;
+    const queueEmpty = Array.isArray(state?.trackScreenshotQueue)
+        && state.trackScreenshotQueue.length === 0;
+    return !!lease?.runId
+        && run?.id === lease.runId
+        && run.nightRequestToken === lease.token
+        && run.nightSlotDay === nightCabinetSlotDay(lease.slotId)
+        && ['completed', 'degraded'].includes(run.status)
+        && Number.isFinite(run.finishedAt)
+        && stage?.runId === run.id
+        && stage.active === false
+        && stage.stages?.[stage.currentIndex] === 'done'
+        && stage.stageName === 'done'
+        && stage.currentIndex === stage.stages.length - 1
+        && queueEmpty
+        && !state.screenshotQueueBlocked
+        && !state.pendingSheetsUpload
+        && state.lastSheetsUploadRunId === run.id
+        && Number.isFinite(state.lastSheetsUploadOkAt)
+        && state.lastSheetsUploadOkAt >= run.finishedAt;
+}
+
+function inspectNightCabinetTransitionRequest(request, { now = Date.now() } = {}) {
+    if (!request || typeof request !== 'object' || Array.isArray(request)) {
+        return { ok: false, reason: 'transition-request-missing' };
+    }
+    const allowedTop = new Set(['requestId', 'requestedAt', 'expected', 'desired']);
+    const allowedExpected = new Set(['state', 'slotId', 'owner', 'phase', 'token', 'runId']);
+    const allowedDesired = new Set(['slotId', 'owner', 'phase', 'token']);
+    if (Object.keys(request).some(key => !allowedTop.has(key))
+        || !request.expected || typeof request.expected !== 'object'
+        || !request.desired || typeof request.desired !== 'object'
+        || Object.keys(request.expected).some(key => !allowedExpected.has(key))
+        || Object.keys(request.desired).some(key => !allowedDesired.has(key))) {
+        return { ok: false, reason: 'transition-request-fields-invalid' };
+    }
+    const exact = {
+        requestId: String(request.requestId || ''),
+        requestedAt: Number(request.requestedAt),
+        expected: {
+            state: String(request.expected.state || 'present'),
+            slotId: String(request.expected.slotId || ''),
+            owner: String(request.expected.owner || ''),
+            phase: String(request.expected.phase || ''),
+            token: String(request.expected.token || ''),
+            ...(request.expected.runId ? { runId: String(request.expected.runId) } : {})
+        },
+        desired: {
+            slotId: String(request.desired.slotId || ''),
+            owner: String(request.desired.owner || ''),
+            phase: String(request.desired.phase || ''),
+            token: String(request.desired.token || '')
+        }
+    };
+    if (exact.requestId.length < 16 || exact.requestId.length > 200
+        || !Number.isFinite(exact.requestedAt) || exact.requestedAt <= 0 || exact.requestedAt > now + 60_000
+        || !/^\d{10,16}$/.test(exact.desired.slotId)
+        || exact.desired.slotId !== nightCabinetSlotId(now)
+        || !NIGHT_CABINET_OWNERS.has(exact.desired.owner)
+        || !NIGHT_CABINET_PHASES.has(exact.desired.phase)
+        || exact.desired.token.length < 16 || exact.desired.token.length > 200) {
+        return { ok: false, reason: 'transition-request-values-invalid' };
+    }
+    if (exact.expected.state === 'missing') {
+        if (Object.keys(request.expected).some(key => key !== 'state')) {
+            return { ok: false, reason: 'transition-missing-proof-ambiguous' };
+        }
+    } else if (exact.expected.state !== 'present'
+        || !/^\d{10,16}$/.test(exact.expected.slotId)
+        || !NIGHT_CABINET_OWNERS.has(exact.expected.owner)
+        || !NIGHT_CABINET_PHASES.has(exact.expected.phase)
+        || exact.expected.token.length < 16 || exact.expected.token.length > 200) {
+        return { ok: false, reason: 'transition-expected-values-invalid' };
+    }
+    return { ok: true, request: exact };
+}
+
+function nightCabinetTransitionAllowed(current, desired, {
+    terminalProof = false,
+    currentState = 'active'
+} = {}) {
+    const storeOpenPhases = ['claimed', 'running', 'store-main', 'store-catchup', 'recover'];
+    const storeTerminalPhases = ['completed', 'degraded', 'blocked', 'failed'];
+    if (!current) {
+        return desired.owner === 'store-walk' && storeOpenPhases.includes(desired.phase)
+            ? { ok: true, reason: 'bootstrap-store-walk' }
+            : { ok: false, reason: 'transition-bootstrap-refused' };
+    }
+    const sameSlot = current.slotId === desired.slotId;
+    const sameToken = current.token === desired.token;
+    if (currentState === 'expired' && !sameSlot && !sameToken
+        && desired.owner === 'store-walk' && storeOpenPhases.includes(desired.phase)) {
+        if (current.owner === 'parser' && current.phase === 'running' && !terminalProof) {
+            return { ok: false, reason: 'parser-terminal-proof-required' };
+        }
+        return { ok: true, reason: 'expired-slot-rollover' };
+    }
+    if (current.owner === 'store-walk') {
+        if (sameSlot && sameToken && storeOpenPhases.includes(current.phase)
+            && desired.owner === 'store-walk'
+            && [...storeOpenPhases, ...storeTerminalPhases].includes(desired.phase)) {
+            return { ok: true, reason: 'store-walk-progress' };
+        }
+        if (sameSlot
+            && storeTerminalPhases.includes(current.phase)
+            && desired.owner === 'parser' && desired.phase === 'ready'
+            && !sameToken) {
+            return { ok: true, reason: 'parser-ready' };
+        }
+        return { ok: false, reason: 'store-walk-transition-refused' };
+    }
+    if (current.owner === 'parser' && current.phase === 'running') {
+        const terminalDestination = sameSlot && !sameToken && (
+            (desired.owner === 'store-walk' && storeOpenPhases.includes(desired.phase))
+            || (desired.owner === 'parser' && desired.phase === 'ready')
+        );
+        return terminalDestination && terminalProof
+            ? { ok: true, reason: desired.owner === 'parser' ? 'parser-retry-ready' : 'terminal-store-walk-handoff' }
+            : { ok: false, reason: terminalProof ? 'parser-terminal-transition-refused' : 'parser-terminal-proof-required' };
+    }
+    return { ok: false, reason: 'transition-source-refused' };
+}
+
+async function scheduleNightCabinetRetry(slotId, reason, { now = Date.now() } = {}) {
+    const state = await chrome.storage.local.get([NIGHT_CABINET_RETRY_KEY]);
+    const previous = state[NIGHT_CABINET_RETRY_KEY];
+    if (previous?.slotId === slotId
+        && Number(previous.scheduledFor) > now
+        && Number(previous.attempts) > 0
+        && Number(previous.attempts) <= NIGHT_CABINET_RETRY_MAX) {
+        return { scheduled: false, idempotent: true, ...previous };
+    }
+    const attempts = previous?.slotId === slotId ? Number(previous.attempts || 0) + 1 : 1;
+    if (attempts > NIGHT_CABINET_RETRY_MAX) {
+        const exhausted = { slotId, attempts: NIGHT_CABINET_RETRY_MAX, exhaustedAt: now, reason };
+        await chrome.storage.local.set({ [NIGHT_CABINET_RETRY_KEY]: exhausted });
+        return { scheduled: false, exhausted: true, ...exhausted };
+    }
+    const scheduledFor = now + NIGHT_CABINET_RETRY_MINUTES * 60_000;
+    const next = { slotId, attempts, scheduledFor, reason, updatedAt: now };
+    await chrome.storage.local.set({ [NIGHT_CABINET_RETRY_KEY]: next });
+    chrome.alarms.create(NIGHT_CABINET_RETRY_ALARM, { when: scheduledFor });
+    return { scheduled: true, ...next };
+}
+
+async function clearNightCabinetRetry(slotId) {
+    const state = await chrome.storage.local.get([NIGHT_CABINET_RETRY_KEY]);
+    if (state[NIGHT_CABINET_RETRY_KEY]?.slotId === slotId) {
+        await chrome.storage.local.remove([NIGHT_CABINET_RETRY_KEY]);
+        await chrome.alarms.clear(NIGHT_CABINET_RETRY_ALARM);
+    }
+}
+
+async function prepareParserNightCabinetLease({ slotId, token = null, external = false, now = Date.now() }) {
+    let raw;
+    try {
+        raw = (await chrome.storage.local.get([NIGHT_CABINET_LEASE_KEY]))[NIGHT_CABINET_LEASE_KEY];
+    } catch (error) {
+        return { ok: false, reason: 'lease-unreadable', error: String(error?.message || error) };
+    }
+    const inspected = inspectNightCabinetLease(raw, { now });
+    if (inspected.state === 'malformed') return { ok: false, reason: inspected.reason };
+    if (inspected.state === 'active') {
+        const lease = inspected.lease;
+        if (external
+            && lease.owner === 'parser'
+            && lease.phase === 'ready'
+            && lease.slotId === slotId
+            && lease.token === token) {
+            return { ok: true, lease, existing: true };
+        }
+        return {
+            ok: false,
+            reason: lease.owner === 'store-walk' ? 'store-walk-active' : 'parser-lease-active',
+            lease
+        };
+    }
+    // chrome.storage.local has no compare-and-swap operation. An alarm-side
+    // read/mutate/write claim can therefore overwrite a Store Walk process that
+    // read the same missing or expired generation concurrently. Only the
+    // AutoBuy coordinator may create/transfer the slot owner. Parser consumes
+    // one exact active parser-ready token and otherwise defers fail-closed.
+    return {
+        ok: false,
+        reason: external ? 'external-parser-lease-missing-or-expired' : 'external-coordinator-proof-required'
+    };
+}
+
+function externalCoordinatorStartDecision(request, rawLease, {
+    pipelineActive = false,
+    alreadyTriggered = false,
+    previousRun = null,
+    now = Date.now()
+} = {}) {
+    const inspected = inspectNightCabinetLease(rawLease, { now });
+    const exact = inspected.state === 'active'
+        && inspected.lease.owner === 'parser'
+        && inspected.lease.phase === 'ready'
+        && inspected.lease.slotId === String(request?.slotId || '')
+        && inspected.lease.token === String(request?.token || '');
+    if (!exact) return { start: false, reason: 'coordinator-proof-invalid' };
+    if (pipelineActive) {
+        return { start: false, reason: 'pipeline-already-started', lease: inspected.lease };
+    }
+    if (alreadyTriggered) {
+        const previousTerminal = ['completed', 'degraded', 'blocked', 'failed_to_start', 'failed']
+            .includes(previousRun?.status);
+        const rotatedExactRetry = previousTerminal
+            && previousRun?.nightSlotDay === nightCabinetSlotDay(inspected.lease.slotId)
+            && typeof previousRun?.nightRequestToken === 'string'
+            && previousRun.nightRequestToken !== inspected.lease.token;
+        if (!rotatedExactRetry) {
+            return { start: false, reason: 'pipeline-already-started', lease: inspected.lease };
+        }
+    }
+    return { start: true, reason: 'coordinator-proof-ok', lease: inspected.lease };
+}
+
+async function handleNightCoordinatorLeaseTransitionRequest() {
+    return withNightCabinetLeaseWrite(async () => {
+        const now = Date.now();
+        const state = await chrome.storage.local.get([
+            NIGHT_CABINET_TRANSITION_REQUEST_KEY,
+            NIGHT_CABINET_TRANSITION_RESULT_KEY,
+            NIGHT_CABINET_TRANSITION_HANDLED_KEY,
+            NIGHT_CABINET_LEASE_KEY,
+            'pipelineRun', 'pipelineStage', 'trackScreenshotQueue', 'screenshotQueueBlocked',
+            'pendingSheetsUpload', 'lastSheetsUploadRunId', 'lastSheetsUploadOkAt'
+        ]);
+        const inspectedRequest = inspectNightCabinetTransitionRequest(
+            state[NIGHT_CABINET_TRANSITION_REQUEST_KEY], { now }
+        );
+        if (!inspectedRequest.ok) {
+            return { handled: false, ok: false, reason: inspectedRequest.reason };
+        }
+        const request = inspectedRequest.request;
+        if (state[NIGHT_CABINET_TRANSITION_HANDLED_KEY] === request.requestId) {
+            return {
+                handled: false,
+                ok: state[NIGHT_CABINET_TRANSITION_RESULT_KEY]?.ok === true,
+                reason: 'transition-request-already-handled',
+                result: state[NIGHT_CABINET_TRANSITION_RESULT_KEY] || null
+            };
+        }
+
+        const finish = async (ok, reason, lease = null) => {
+            const result = {
+                requestId: request.requestId,
+                ok: !!ok,
+                reason,
+                slotId: request.desired.slotId,
+                at: now,
+                ...(lease ? { lease } : {})
+            };
+            await chrome.storage.local.set({
+                ...(lease ? { [NIGHT_CABINET_LEASE_KEY]: lease } : {}),
+                [NIGHT_CABINET_TRANSITION_HANDLED_KEY]: request.requestId,
+                [NIGHT_CABINET_TRANSITION_RESULT_KEY]: result
+            });
+            return { handled: true, ok: !!ok, reason, result };
+        };
+
+        const inspectedCurrent = inspectNightCabinetLease(state[NIGHT_CABINET_LEASE_KEY], { now });
+        if (inspectedCurrent.state === 'malformed') {
+            return finish(false, inspectedCurrent.reason);
+        }
+        const current = inspectedCurrent.lease;
+        const expected = request.expected;
+        const exactCurrent = expected.state === 'missing'
+            ? inspectedCurrent.state === 'missing'
+            : ['active', 'expired'].includes(inspectedCurrent.state)
+                && current.slotId === expected.slotId
+                && current.owner === expected.owner
+                && current.phase === expected.phase
+                && current.token === expected.token
+                && (expected.runId ? current.runId === expected.runId : !current.runId);
+        if (!exactCurrent) return finish(false, 'transition-current-proof-mismatch');
+
+        const terminalProof = current?.owner === 'parser' && current.phase === 'running'
+            ? nightCabinetTerminalProof(state, current)
+            : false;
+        const decision = nightCabinetTransitionAllowed(current, request.desired, {
+            terminalProof,
+            currentState: inspectedCurrent.state
+        });
+        if (!decision.ok) return finish(false, decision.reason);
+
+        const lease = {
+            slotId: request.desired.slotId,
+            owner: request.desired.owner,
+            phase: request.desired.phase,
+            token: request.desired.token,
+            heartbeat: now,
+            expires: now + NIGHT_CABINET_LEASE_TTL_MS
+        };
+        return finish(true, decision.reason, lease);
+    });
+}
+
+async function handleNightCoordinatorLeaseTransitionWake(request) {
+    // The runtime message is deliberately parameterless. Authority lives only
+    // in the durable request and is revalidated under the lease write chain.
+    if (!request || Object.keys(request).some(key => key !== 'action')) {
+        return { handled: false, ok: false, reason: 'transition-wake-payload-refused' };
+    }
+    return handleNightCoordinatorLeaseTransitionRequest();
+}
+
 function setupDailyAlarm(reason = 'setup') {
     const now = new Date();
     const next = getNextDailyRun(now);
@@ -170,12 +560,12 @@ async function ensureDailyAlarm(reason = 'ensure') {
     return new Date(existing.scheduledTime);
 }
 
-async function runDailyAutoParse(source) {
+async function runDailyAutoParse(source, coordinator = null) {
     if (dailyRunStartInFlight) {
         await addDailyDiagnostic('run-skip', { source, skipReason: 'start-already-in-flight' });
         return dailyRunStartInFlight;
     }
-    dailyRunStartInFlight = runDailyAutoParseOnce(source);
+    dailyRunStartInFlight = runDailyAutoParseOnce(source, coordinator);
     try {
         return await dailyRunStartInFlight;
     } finally {
@@ -183,7 +573,7 @@ async function runDailyAutoParse(source) {
     }
 }
 
-async function runDailyAutoParseOnce(source) {
+async function runDailyAutoParseOnce(source, coordinator = null) {
     console.log(`⏰ Daily auto-parse started (${source})`);
     await addDailyDiagnostic('run-start', { source });
 
@@ -203,6 +593,7 @@ async function runDailyAutoParseOnce(source) {
         console.warn(`⏸ Daily auto-parse ignored (${source}): pipeline already active`);
         return false;
     }
+
     if (beforeStart.iherbHumanChallenge?.status === 'awaiting-human') {
         await chrome.storage.local.set({
             lastDailyAutoParseAttemptedAt: Date.now(),
@@ -239,12 +630,43 @@ async function runDailyAutoParseOnce(source) {
         return false;
     }
 
+    const slotId = coordinator?.slotId || nightCabinetSlotId();
+    const externalCoordinator = coordinator?.external === true;
+    if (!/^\d{10,16}$/.test(String(slotId))) {
+        await addDailyDiagnostic('run-skip', { source, skipReason: 'coordinator-slot-invalid' });
+        return false;
+    }
+    const leaseResult = await prepareParserNightCabinetLease({
+        slotId: String(slotId),
+        token: coordinator?.token || null,
+        external: externalCoordinator
+    });
+    if (!leaseResult.ok) {
+        const retry = await scheduleNightCabinetRetry(String(slotId), leaseResult.reason);
+        await chrome.storage.local.set({
+            lastDailyAutoParseAttemptedAt: Date.now(),
+            lastDailyAutoParseSource: source,
+            lastDailyAutoParseStatus: 'deferred-night-lease',
+            lastDailyAutoParseError: leaseResult.reason
+        });
+        await addDailyDiagnostic('run-skip', {
+            source,
+            skipReason: leaseResult.reason,
+            slotId: String(slotId),
+            retryAttempt: retry.attempts || null,
+            retryExhausted: !!retry.exhausted
+        });
+        return false;
+    }
+    const nightLease = leaseResult.lease;
+    await clearNightCabinetRetry(String(slotId));
+
     // Sequential pipeline avoids active-tab races between shop flows. Await the
     // durable start commit: otherwise a storage/navigation error leaves status
     // "started" forever while no pipeline exists.
     let pipelineRun = null;
     try {
-        pipelineRun = await createPipelineRun(source);
+        pipelineRun = await createPipelineRun(source, nightLease);
         await chrome.storage.local.set({
             lastDailyAutoParseAttemptedAt: pipelineRun.attemptedAt,
             lastDailyAutoParseSource: source,
@@ -634,25 +1056,54 @@ function applyPipelineAccountResult(run, shop, account, {
   return next;
 }
 
-async function createPipelineRun(source) {
+async function createPipelineRun(source, nightLease) {
   const config = await loadAccountsConfig();
   const expected = buildExpectedPipelineRoster(config);
-  const now = Date.now();
-  const slotAt = getLastDailyRunSlot(new Date(now)).getTime();
-  const pipelineRun = {
-    id: `${slotAt}-${now}-${Math.random().toString(36).slice(2, 8)}`,
-    slotAt,
-    source,
-    status: 'starting',
-    attemptedAt: now,
-    startedAt: null,
-    finishedAt: null,
-    expected,
-    completed: { iherb: [], ebay: [], amazon: [] },
-    failures: []
-  };
-  await chrome.storage.local.set({ pipelineRun });
-  return pipelineRun;
+  return withNightCabinetLeaseWrite(async () => {
+    const now = Date.now();
+    const currentLease = inspectNightCabinetLease(
+      (await chrome.storage.local.get([NIGHT_CABINET_LEASE_KEY]))[NIGHT_CABINET_LEASE_KEY],
+      { now }
+    );
+    if (currentLease.state !== 'active'
+        || currentLease.lease.owner !== 'parser'
+        || currentLease.lease.phase !== 'ready'
+        || currentLease.lease.slotId !== nightLease?.slotId
+        || currentLease.lease.token !== nightLease?.token) {
+      throw new Error('night parser lease lost before pipeline run claim');
+    }
+    const slotAt = Number(currentLease.lease.slotId);
+    const nightSlotDay = nightCabinetSlotDay(currentLease.lease.slotId);
+    if (!nightSlotDay) throw new Error('night parser slot day is invalid');
+    const pipelineRun = {
+      id: `${slotAt}-${now}-${Math.random().toString(36).slice(2, 8)}`,
+      slotAt,
+      nightRequestToken: currentLease.lease.token,
+      nightSlotDay,
+      source,
+      status: 'starting',
+      attemptedAt: now,
+      startedAt: null,
+      finishedAt: null,
+      expected,
+      completed: { iherb: [], ebay: [], amazon: [] },
+      failures: []
+    };
+    // One durable commit consumes the exact coordinator generation and records
+    // its runId. The same chain serializes coordinator handoffs, so a delayed
+    // Store Walk heartbeat can never land between the exact read and this set.
+    await chrome.storage.local.set({
+      pipelineRun,
+      [NIGHT_CABINET_LEASE_KEY]: {
+        ...currentLease.lease,
+        phase: 'running',
+        runId: pipelineRun.id,
+        heartbeat: now,
+        expires: now + NIGHT_CABINET_LEASE_TTL_MS
+      }
+    });
+    return pipelineRun;
+  });
 }
 
 function updatePipelineRun(mutator) {
@@ -1571,6 +2022,26 @@ async function logMultiAccountStep(step, detail = {}) {
     } catch (e) { console.warn('logMultiAccountStep failed:', e?.message || e); }
 }
 
+/** Exact ownership gate for every iHerb progress ping, not just Done/Error. */
+function iherbProgressOwnsActiveAttempt(request, senderTabId, state) {
+    const expectedAccount = normalizeAccountEmail(
+        state?.multiAccountIherbState?.currentIherbAccount
+    );
+    return !!request?.runId
+        && !!request?.attemptId
+        && Number.isInteger(senderTabId)
+        && ['starting', 'running'].includes(state?.pipelineRun?.status)
+        && request.runId === state.pipelineRun.id
+        && state.pipelineStage?.active === true
+        && state.pipelineStage.runId === state.pipelineRun.id
+        && state.pipelineStage.stages?.[state.pipelineStage.currentIndex] === 'iherb'
+        && normalizeAccountEmail(request.account) === expectedAccount
+        && request.attemptId === state.iherbParseAttemptId
+        && senderTabId === state.iherbParserTabId
+        && state.iherbStageFinalizing?.runId !== state.pipelineRun.id
+        && !iherbTimeoutAttemptMatchesRuntime(state.iherbTimeoutAttempt, state);
+}
+
 async function handleProgressMessage(request, sender = null) {
     // Legacy parsingProgress wrapper ({page, totalOrders}, no store) reaches here
     // via the converter below — without a store there is nothing to track.
@@ -1596,6 +2067,14 @@ async function handleProgressMessage(request, sender = null) {
         currentIherbAccount = stored.multiAccountIherbState.currentIherbAccount;
     }
 
+    const activeRun = ['starting', 'running'].includes(stored.pipelineRun?.status);
+    if (storeKey === 'iherb'
+        && activeRun
+        && !iherbProgressOwnsActiveAttempt(request, sender?.tab?.id || null, stored)) {
+        console.warn('⏭ Ignoring iHerb progress from a stale run/account/attempt/tab');
+        return;
+    }
+
     // Any Amazon progress can extend the idle watchdog, so even non-completion
     // pings must come from the tab explicitly created/owned by this run.
     if (storeKey === 'amazon' && ['starting', 'running'].includes(stored.pipelineRun?.status)) {
@@ -1608,7 +2087,6 @@ async function handleProgressMessage(request, sender = null) {
 
     // Update completion status
     const isCompleted = request.status === 'Done ✅' || request.status === 'Error';
-    const activeRun = ['starting', 'running'].includes(stored.pipelineRun?.status);
     if (isCompleted && activeRun) {
         const expectedAccount = storeKey === 'iherb'
             ? stored.multiAccountIherbState?.currentIherbAccount
@@ -2098,6 +2576,24 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         processNextInQueue();
     } else if (request.action === "resetSheetMarks") {
         resetSheetMarks(request.options).then(()=>sendResponse({status:'ok'})).catch(e=>sendResponse({status:'error', message:String(e)}));
+    } else if (request.action === 'nightCoordinatorLeaseTransitionWake') {
+        handleNightCoordinatorLeaseTransitionWake(request)
+            .then(sendResponse)
+            .catch(error => sendResponse({
+                ok: false,
+                reason: 'transition-wake-failed',
+                error: String(error?.message || error)
+            }));
+        return true;
+    } else if (request.action === 'nightCoordinatorControlWake') {
+        handleNightCoordinatorControlWake(request)
+            .then(sendResponse)
+            .catch(error => sendResponse({
+                ok: false,
+                reason: 'wake-failed',
+                error: String(error?.message || error)
+            }));
+        return true;
     } else if (request.action === "startParsingAllStores") {
         runDailyAutoParse('popup-legacy-all')
             .then(started => sendResponse({ status: started ? 'started' : 'refused' }))
@@ -4955,7 +5451,28 @@ const AMAZON_NAVIGATION_RETRY_GAP_MS = 60_000;
 const AMAZON_NAVIGATION_GRACE_MS = 5 * 60_000;
 let amazonNavigationRetryInFlight = null;
 const SCREENSHOT_RESUME_ALARM = 'screenshotResume';
-chrome.alarms.create(SCREENSHOT_RESUME_ALARM, { delayInMinutes: 1, periodInMinutes: 1 });
+
+/**
+ * Keep a periodic alarm without moving its next tick on every MV3 worker start.
+ * `chrome.alarms.create()` replaces an alarm with the same name, so calling it
+ * unconditionally at module load can postpone a one-minute watchdog forever.
+ */
+async function ensurePeriodicAlarm(name, periodInMinutes) {
+  const existing = await chrome.alarms.get(name);
+  if (existing && Number(existing.periodInMinutes) === Number(periodInMinutes)) {
+    return { created: false, alarm: existing };
+  }
+  chrome.alarms.create(name, { delayInMinutes: periodInMinutes, periodInMinutes });
+  return { created: true, alarm: null };
+}
+
+function keepPeriodicAlarm(name, periodInMinutes) {
+  ensurePeriodicAlarm(name, periodInMinutes).catch(error => {
+    console.warn(`[alarms] failed to ensure ${name}:`, error?.message || error);
+  });
+}
+
+keepPeriodicAlarm(SCREENSHOT_RESUME_ALARM, 1);
 
 function getAmazonNavigationRetryDecision({ paginationState, recovery, timedOut, now = Date.now() }) {
     const navigation = paginationState?.navigation;
@@ -5654,12 +6171,13 @@ async function captureAmazonTabWithDebugger(tabId) {
 // Если cs не отвечает >IHERB_PARSE_TIMEOUT_MS — retry tab.update (one shot), потом fail.
 const IHERB_WATCHDOG_ALARM = 'iherbParseWatchdog';
 const IHERB_PARSE_TIMEOUT_MS = 240_000; // 4 min hard cap для самого парсинга
+const IHERB_HEARTBEAT_STALE_MS = 90_000;
 // Отдельный таймаут на стадию переключения аккаунта (sign-out → login → /orders).
 // 5 минут хватает на: 4с settle + login form fill + OAuth redirect + iherb page load.
 // Если за это время iherbSwitchInProgress=true но iherbParseStartedAt так и не
 // выставился — switch застрял (SW заснул, login страница не загрузилась и т.п.).
 const IHERB_SWITCH_TIMEOUT_MS = 5 * 60_000;
-chrome.alarms.create(IHERB_WATCHDOG_ALARM, { delayInMinutes: 1, periodInMinutes: 1 });
+keepPeriodicAlarm(IHERB_WATCHDOG_ALARM, 1);
 
 // ─── Pipeline stage watchdog ──────────────────────────────────────────────
 // Every stage EXCEPT eBay already had a safety-net (iHerb: 45s advance + iherbParseWatchdog;
@@ -5686,7 +6204,7 @@ const PIPELINE_STAGE_MAX_MS = {
 // stage cap. Кредит всё равно ограничен: сломанная/вечная очередь не сможет
 // скрывать зависшую стадию бесконечно.
 const SCREENSHOT_STAGE_BUDGET_MAX_MS = 6 * 60 * 60_000;
-chrome.alarms.create(PIPELINE_WATCHDOG_ALARM, { delayInMinutes: 1, periodInMinutes: 1 });
+keepPeriodicAlarm(PIPELINE_WATCHDOG_ALARM, 1);
 
 function getScreenshotStageBudgetCreditMs({
   budget,
@@ -5858,7 +6376,7 @@ async function handlePipelineWatchdog() {
 // pendingSheetsUpload. Тик раз в 2 минуты, до 12 попыток (~24 мин), потом — алерт оператору.
 const SHEETS_UPLOAD_WATCHDOG_ALARM = 'sheetsUploadWatchdog';
 const SHEETS_UPLOAD_MAX_RETRIES = 12;
-chrome.alarms.create(SHEETS_UPLOAD_WATCHDOG_ALARM, { delayInMinutes: 2, periodInMinutes: 2 });
+keepPeriodicAlarm(SHEETS_UPLOAD_WATCHDOG_ALARM, 2);
 
 // The durable pending marker lets an MV3 restart resume an upload, but it does
 // not serialize two callbacks inside the same service-worker lifetime. Keep a
@@ -5969,14 +6487,22 @@ async function markSheetsUploadSuccess(runId) {
 async function handleExternalControlRequest() {
     const s = await chrome.storage.local.get([
         'externalControlRequest', 'lastHandledControlAt',
+        'externalControlResult',
         'pendingSheetsUpload', 'lastSheetsUploadOkAt', 'lastDailyAutoParseFinishedAt',
-        'pipelineStage', 'lastDailyAutoParseTriggeredAt'
+        'pipelineStage', 'pipelineRun', 'lastDailyAutoParseTriggeredAt',
+        NIGHT_CABINET_LEASE_KEY
     ]);
     const req = s.externalControlRequest;
-    if (!req || !req.action || !req.requestedAt) return;
+    if (!req || !req.action || !req.requestedAt) {
+        return { handled: false, reason: 'no-request', result: s.externalControlResult || null };
+    }
     // Уже обработали эту команду — не переисполняем.
-    if (req.requestedAt <= (s.lastHandledControlAt || 0)) return;
+    if (req.requestedAt <= (s.lastHandledControlAt || 0)) {
+        return { handled: false, reason: 'request-already-handled', result: s.externalControlResult || null };
+    }
 
+    let controlOk = true;
+    let controlReason = 'handled';
     if (req.action === 'reupload_sheets') {
         // Пинок заглохшему ретраю: если выгрузка ещё не подтверждена — сбрасываем
         // счётчик и флаг «сдался», фактическую выгрузку выполнит sheetsUploadWatchdog-тик.
@@ -5986,21 +6512,68 @@ async function handleExternalControlRequest() {
             await chrome.storage.local.set({ sheetsRetryCount: 0, sheetsRetryGaveUp: false });
         }
     } else if (req.action === 'start_pipeline') {
-        // Защита от двойных прогонов: только если пайплайн не активен, прогон в этот
-        // слот ещё не запускался и с момента слота 23:00 прошло < 3 ч.
+        // Coordinator mode is generation-fenced and remains valid beyond the
+        // old three-hour watchdog window. A partial slot/token request never
+        // falls back to the legacy permissive path.
         const slot = getLastDailyRunSlot(new Date()).getTime();
         const alreadyTriggered = s.lastDailyAutoParseTriggeredAt && s.lastDailyAutoParseTriggeredAt >= slot;
         const sinceSlotMs = Date.now() - slot;
-        if (!s.pipelineStage?.active && !alreadyTriggered && sinceSlotMs < 3 * 60 * 60 * 1000) {
-            runDailyAutoParse('watchdog-control');
+        const hasCoordinatorProof = Object.prototype.hasOwnProperty.call(req, 'slotId')
+            || Object.prototype.hasOwnProperty.call(req, 'token');
+        if (hasCoordinatorProof) {
+            const decision = externalCoordinatorStartDecision(req, s[NIGHT_CABINET_LEASE_KEY], {
+                pipelineActive: !!s.pipelineStage?.active,
+                alreadyTriggered,
+                previousRun: s.pipelineRun
+            });
+            if (!decision.start) {
+                controlOk = false;
+                controlReason = decision.reason;
+            } else {
+                controlOk = await runDailyAutoParse('coordinator-control', {
+                    external: true,
+                    slotId: decision.lease.slotId,
+                    token: decision.lease.token
+                });
+                controlReason = controlOk ? 'pipeline-started' : 'pipeline-start-refused';
+            }
+        } else if (!s.pipelineStage?.active && !alreadyTriggered && sinceSlotMs < 3 * 60 * 60 * 1000) {
+            controlOk = await runDailyAutoParse('watchdog-control');
+            controlReason = controlOk ? 'legacy-pipeline-started' : 'legacy-pipeline-start-refused';
+        } else {
+            controlOk = false;
+            controlReason = 'legacy-window-or-state-refused';
         }
     }
 
+    const externalControlResult = {
+        action: req.action,
+        ok: !!controlOk,
+        reason: controlReason,
+        slotId: req.slotId || null,
+        at: Date.now()
+    };
     await chrome.storage.local.set({
         lastHandledControlAt: req.requestedAt,
         externalControlRequest: null,
-        externalControlResult: { action: req.action, ok: true, at: Date.now() }
+        externalControlResult
     });
+    return { handled: true, reason: controlReason, result: externalControlResult };
+}
+
+async function handleNightCoordinatorControlWake(request) {
+    // The wake message carries no authority. Slot/token/start intent must
+    // already exist in durable storage and pass handleExternalControlRequest.
+    if (!request || Object.keys(request).some(key => key !== 'action')) {
+        return { ok: false, handled: false, reason: 'wake-payload-refused', externalControlResult: null };
+    }
+    const handled = await handleExternalControlRequest();
+    return {
+        ok: true,
+        handled: handled?.handled === true,
+        reason: handled?.reason || 'no-request',
+        externalControlResult: handled?.result || null
+    };
 }
 
 async function handleSheetsUploadWatchdog() {
@@ -6085,6 +6658,7 @@ function iherbWatchdogAttemptFromState(state) {
         stageStartedAt: state?.pipelineStage?.stageStartedAt || null,
         account: normalizeAccountEmail(state?.multiAccountIherbState?.currentIherbAccount),
         parserTabId: state?.iherbParserTabId || null,
+        attemptId: state?.iherbParseAttemptId || null,
         parseStartedAt: state?.iherbParseStartedAt ?? null,
         retried: state?.iherbWatchdogRetried ?? null,
         switchStartedAt: state?.iherbSwitchStartedAt ?? null,
@@ -6092,6 +6666,23 @@ function iherbWatchdogAttemptFromState(state) {
         pendingRunId: state?.pendingIherbSwitch?.runId || null,
         pendingAccount: normalizeAccountEmail(state?.pendingIherbSwitch?.email)
     };
+}
+
+function iherbHeartbeatMatchesAttempt(heartbeat, attempt) {
+    return !!heartbeat
+        && !!attempt?.runId
+        && !!attempt?.account
+        && !!attempt?.attemptId
+        && heartbeat.runId === attempt.runId
+        && normalizeAccountEmail(heartbeat.account) === attempt.account
+        && heartbeat.attemptId === attempt.attemptId;
+}
+
+function iherbHeartbeatIsFresh(heartbeat, { now = Date.now() } = {}) {
+    const timestamp = Number(heartbeat?.ts);
+    if (!Number.isFinite(timestamp)) return false;
+    const age = now - timestamp;
+    return age >= 0 && age <= IHERB_HEARTBEAT_STALE_MS;
 }
 
 function iherbWatchdogAttemptMatches(state, attempt) {
@@ -6178,7 +6769,7 @@ async function handleIherbWatchdog() {
                     try { return JSON.parse(window.localStorage.getItem('parser_iherb_heartbeat') || 'null'); } catch { return null; }
                 }
             });
-            heartbeat = result;
+            heartbeat = iherbHeartbeatMatchesAttempt(result, attempt) ? result : null;
         } catch (e) {
             console.warn('[iherbWatchdog] executeScript failed:', e?.message || e);
         }
@@ -6189,6 +6780,10 @@ async function handleIherbWatchdog() {
     const afterHeartbeat = await readIherbWatchdogState();
     if (!iherbWatchdogAttemptMatches(afterHeartbeat, attempt)) {
         console.warn('⏭ iHerb watchdog attempt changed while reading heartbeat');
+        return;
+    }
+    if (iherbHeartbeatIsFresh(heartbeat)) {
+        console.log(`[iherbWatchdog] exact attempt is still progressing; defer recovery (hbAge=${heartbeatAge})`);
         return;
     }
 
@@ -6272,6 +6867,25 @@ async function handleIherbWatchdog() {
 
 // Alarm listener - this fires even when Service Worker wakes up
 chrome.alarms.onAlarm.addListener(async (alarm) => {
+    if (alarm.name === NIGHT_CABINET_RETRY_ALARM) {
+        const state = await chrome.storage.local.get([NIGHT_CABINET_RETRY_KEY]);
+        const retry = state[NIGHT_CABINET_RETRY_KEY];
+        if (!retry?.slotId || retry.slotId !== nightCabinetSlotId()) {
+            if (retry) await chrome.storage.local.remove([NIGHT_CABINET_RETRY_KEY]);
+            return;
+        }
+        if (Number(retry.attempts) < 1 || Number(retry.attempts) > NIGHT_CABINET_RETRY_MAX) {
+            return;
+        }
+        // Mark this one-shot as consumed before running. If the lease is still
+        // busy, scheduleNightCabinetRetry advances exactly one bounded attempt.
+        await chrome.storage.local.set({
+            [NIGHT_CABINET_RETRY_KEY]: { ...retry, scheduledFor: 0, firedAt: Date.now() }
+        });
+        await runDailyAutoParse('coordinator-retry', { slotId: retry.slotId });
+        return;
+    }
+
     // Handle daily auto-parse
     if (alarm.name === DAILY_ALARM_NAME) {
         console.log('⏰ Daily auto-parse alarm triggered!');

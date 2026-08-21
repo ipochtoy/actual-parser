@@ -535,9 +535,17 @@ async function slowProgressiveScroll(limit = 150) {
     // Heartbeat: пишем в localStorage каждую итерацию — переживёт даже Extension context invalidated.
     // bg-watchdog (chrome.scripting.executeScript) сможет прочитать и понять прогресс.
     const HEARTBEAT_KEY = 'parser_iherb_heartbeat';
+    // Snapshot once: a later account transition must not relabel an old loop.
+    const provenance = Object.freeze({
+        runId: window.__iherbRunId || null,
+        account: window.__iherbCurrentAccountName || null,
+        attemptId: window.__iherbParseAttemptId || null
+    });
     const writeHeartbeat = (count, attempt, status) => {
         try {
-            window.localStorage.setItem(HEARTBEAT_KEY, JSON.stringify({ ts: Date.now(), count, attempt, status, limit }));
+            window.localStorage.setItem(HEARTBEAT_KEY, JSON.stringify({
+                ts: Date.now(), count, attempt, status, limit, ...provenance
+            }));
         } catch {}
     };
 
@@ -569,7 +577,8 @@ async function slowProgressiveScroll(limit = 150) {
             store: 'iHerb',
             current: 0,
             total: limit,
-            status: 'Starting scroll...'
+            status: 'Starting scroll...',
+            ...provenance
         }
     });
 
@@ -633,7 +642,8 @@ async function slowProgressiveScroll(limit = 150) {
                 current: currentUniqueCount,
                 total: limit,
                 status: `Loading orders ${currentUniqueCount}/${limit}...`,
-                found: currentUniqueCount
+                found: currentUniqueCount,
+                ...provenance
             }
         });
 

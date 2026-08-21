@@ -27,7 +27,7 @@ test('legacy iHerb progress wrapper invokes the completion handler exactly once'
 
 test('daily run awaits a durable pipeline start and refuses a second active run', () => {
   const source = read('background.js');
-  const daily = between(source, 'async function runDailyAutoParse(source)', 'async function runMissedDailyAutoParseIfNeeded');
+  const daily = between(source, 'async function runDailyAutoParse(source', 'async function runMissedDailyAutoParseIfNeeded');
   assert.match(daily, /pipelineStage\?\.active/);
   assert.match(daily, /await startSequentialPipeline\(\)/);
   assert.match(daily, /lastDailyAutoParseStatus: 'failed-to-start'/);
