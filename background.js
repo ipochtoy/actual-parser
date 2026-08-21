@@ -395,7 +395,14 @@ function externalCoordinatorStartDecision(request, rawLease, {
             && previousRun?.nightSlotDay === nightCabinetSlotDay(inspected.lease.slotId)
             && typeof previousRun?.nightRequestToken === 'string'
             && previousRun.nightRequestToken !== inspected.lease.token;
-        if (!rotatedExactRetry) {
+        // One-time adoption of a terminal run created by the pre-coordinator
+        // scheduler in this exact slot. It has no request token/slot-day yet;
+        // the active parser-ready lease is the only authority for the first
+        // coordinated retry. Every subsequent run is token-bound above.
+        const legacyTerminalSameSlot = previousTerminal
+            && !previousRun?.nightRequestToken
+            && Number(previousRun?.slotAt) === Number(inspected.lease.slotId);
+        if (!rotatedExactRetry && !legacyTerminalSameSlot) {
             return { start: false, reason: 'pipeline-already-started', lease: inspected.lease };
         }
     }

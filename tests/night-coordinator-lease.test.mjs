@@ -222,6 +222,30 @@ test('a terminal same-slot run permits one rotated exact coordinator token only'
   }).start, false, 'a terminal run from another slot is not retry proof');
 });
 
+test('a terminal legacy run in the exact slot can be adopted once by the coordinator', () => {
+  const ready = {
+    ...storeWalkLease(), owner: 'parser', phase: 'ready', token: 'parser-token-first-0001',
+  };
+  const { context } = leaseContext(ready);
+  const request = { slotId: ready.slotId, token: ready.token };
+
+  assert.equal(context.externalCoordinatorStartDecision(request, ready, {
+    now: 1_100_000,
+    alreadyTriggered: true,
+    previousRun: { id: 'legacy-terminal', status: 'degraded', slotAt: Number(ready.slotId) },
+  }).start, true);
+  assert.equal(context.externalCoordinatorStartDecision(request, ready, {
+    now: 1_100_000,
+    alreadyTriggered: true,
+    previousRun: { id: 'legacy-foreign', status: 'degraded', slotAt: Number(ready.slotId) - 86_400_000 },
+  }).start, false);
+  assert.equal(context.externalCoordinatorStartDecision(request, ready, {
+    now: 1_100_000,
+    alreadyTriggered: true,
+    previousRun: { id: 'legacy-active', status: 'running', slotAt: Number(ready.slotId) },
+  }).start, false);
+});
+
 test('slot day and coordinator adoption fields are deterministic and atomically stored', () => {
   const context = {
     Date,
