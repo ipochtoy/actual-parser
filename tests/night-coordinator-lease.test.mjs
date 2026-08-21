@@ -565,6 +565,7 @@ function leaseTransitionHarness({ destination = 'store-walk', blockTransitionSet
       id: lease.runId,
       status: 'completed',
       finishedAt: now - 10_000,
+      slotAt: Number(slotId),
       nightRequestToken: oldToken,
       nightSlotDay: '2026-08-20',
     },
@@ -586,6 +587,7 @@ function leaseTransitionHarness({ destination = 'store-walk', blockTransitionSet
   const setEntered = new Promise(resolve => { transitionSetEntered = resolve; });
   const setRelease = new Promise(resolve => { releaseSet = resolve; });
   let blocked = false;
+  const writes = [];
   const context = {
     Date: class extends Date { static now() { return now; } },
     Math,
@@ -607,6 +609,7 @@ function leaseTransitionHarness({ destination = 'store-walk', blockTransitionSet
     NIGHT_CABINET_TRANSITION_REQUEST_KEY: 'nightCoordinatorLeaseTransitionRequest',
     NIGHT_CABINET_TRANSITION_RESULT_KEY: 'nightCoordinatorLeaseTransitionResult',
     NIGHT_CABINET_TRANSITION_HANDLED_KEY: 'lastHandledNightCoordinatorLeaseTransitionId',
+    NIGHT_CABINET_CATCHUP_RESUME_KEY: 'nightCabinetCatchupResumeMarkers',
     nightCabinetSlotId() { return slotId; },
     nightCabinetSlotDay() { return '2026-08-20'; },
     async loadAccountsConfig() { return {}; },
@@ -626,6 +629,7 @@ function leaseTransitionHarness({ destination = 'store-walk', blockTransitionSet
               transitionSetEntered();
               await setRelease;
             }
+            writes.push(clone(mutation));
             Object.assign(state, clone(mutation));
           },
         },
@@ -637,6 +641,7 @@ function leaseTransitionHarness({ destination = 'store-walk', blockTransitionSet
     'inspectNightCabinetLease',
     'withNightCabinetLeaseWrite',
     'nightCabinetTerminalProof',
+    'nightCabinetTerminalSlotProof',
     'inspectNightCabinetTransitionRequest',
     'nightCabinetTransitionAllowed',
     'handleNightCoordinatorLeaseTransitionRequest',
@@ -644,7 +649,7 @@ function leaseTransitionHarness({ destination = 'store-walk', blockTransitionSet
     'createPipelineRun',
   ]) vm.runInContext(extractFunction(name), context);
   return {
-    context, state, lease, slotId, nextToken,
+    context, state, lease, slotId, nextToken, writes,
     setEntered, releaseSet,
   };
 }
@@ -702,6 +707,105 @@ test('terminal proof hands exact Parser ownership to Store Walk and refuses fals
     assert.equal(rejected.ok, false);
     assert.equal(rejected.reason, 'parser-terminal-proof-required');
     assert.deepEqual(invalid.state.nightCabinetLease, invalid.lease);
+  }
+});
+
+test('degraded Store Walk gets one exact durable catch-up resume after terminal Parser proof', async () => {
+  const harness = leaseTransitionHarness({ destination: 'store-walk' });
+  const oldToken = 'degraded-store-token-0001';
+  const newToken = 'catchup-resume-token-0002';
+  const degraded = {
+    slotId: harness.slotId,
+    owner: 'store-walk',
+    phase: 'degraded',
+    token: oldToken,
+    heartbeat: 100_000,
+    expires: 200_000,
+  };
+  harness.state.nightCabinetLease = clone(degraded);
+  harness.state.nightCoordinatorLeaseTransitionRequest = {
+    requestId: 'catchup-resume-request-0001',
+    requestedAt: 999_999,
+    expected: {
+      state: 'present', slotId: harness.slotId, owner: 'store-walk', phase: 'degraded',
+      token: oldToken,
+    },
+    desired: {
+      slotId: harness.slotId, owner: 'store-walk', phase: 'store-catchup', token: newToken,
+    },
+  };
+  delete harness.state.lastHandledNightCoordinatorLeaseTransitionId;
+  delete harness.state.nightCoordinatorLeaseTransitionResult;
+
+  const first = await harness.context.handleNightCoordinatorLeaseTransitionRequest();
+  assert.equal(first.ok, true);
+  assert.equal(first.reason, 'catchup-resume-one-shot');
+  assert.equal(harness.state.nightCabinetLease.phase, 'store-catchup');
+  assert.equal(harness.state.nightCabinetLease.token, newToken);
+  const markerKey = `${harness.slotId}:${oldToken}`;
+  assert.deepEqual(harness.state.nightCabinetCatchupResumeMarkers[markerKey], {
+    slotId: harness.slotId,
+    oldToken,
+    newToken,
+    parserRunId: harness.state.pipelineRun.id,
+    consumedAt: 1_000_000,
+  });
+  const atomic = harness.writes.find(write => write.nightCoordinatorLeaseTransitionResult?.requestId
+    === 'catchup-resume-request-0001');
+  assert.equal(atomic.nightCabinetLease.token, newToken);
+  assert.equal(atomic.nightCabinetCatchupResumeMarkers[markerKey].newToken, newToken,
+    'lease and one-shot marker must share one storage.set');
+
+  harness.state.nightCabinetLease = clone(degraded);
+  harness.state.nightCoordinatorLeaseTransitionRequest = {
+    ...harness.state.nightCoordinatorLeaseTransitionRequest,
+    requestId: 'catchup-resume-request-0002',
+  };
+  const repeat = await harness.context.handleNightCoordinatorLeaseTransitionRequest();
+  assert.equal(repeat.ok, false);
+  assert.equal(repeat.reason, 'catchup-resume-already-consumed');
+  assert.deepEqual(harness.state.nightCabinetLease, degraded);
+});
+
+test('catch-up resume refuses foreign, nonterminal and malformed durable proof', async () => {
+  const configure = (harness) => {
+    const oldToken = 'degraded-store-token-0001';
+    harness.state.nightCabinetLease = {
+      slotId: harness.slotId, owner: 'store-walk', phase: 'degraded', token: oldToken,
+      heartbeat: 100_000, expires: 200_000,
+    };
+    harness.state.nightCoordinatorLeaseTransitionRequest = {
+      requestId: 'catchup-resume-refusal-0001',
+      requestedAt: 999_999,
+      expected: {
+        state: 'present', slotId: harness.slotId, owner: 'store-walk', phase: 'degraded',
+        token: oldToken,
+      },
+      desired: {
+        slotId: harness.slotId, owner: 'store-walk', phase: 'store-catchup',
+        token: 'catchup-resume-token-0002',
+      },
+    };
+    delete harness.state.lastHandledNightCoordinatorLeaseTransitionId;
+    delete harness.state.nightCoordinatorLeaseTransitionResult;
+  };
+
+  for (const [label, breakProof, reason] of [
+    ['foreign slot', state => { state.pipelineRun.slotAt -= 86_400_000; }, 'catchup-resume-terminal-proof-required'],
+    ['nonterminal run', state => { state.pipelineRun.status = 'running'; }, 'catchup-resume-terminal-proof-required'],
+    ['nonempty queue', state => { state.trackScreenshotQueue.push({ track: 'pending' }); }, 'catchup-resume-terminal-proof-required'],
+    ['foreign Sheets run', state => { state.lastSheetsUploadRunId = 'foreign-run'; }, 'catchup-resume-terminal-proof-required'],
+    ['malformed marker', state => { state.nightCabinetCatchupResumeMarkers = []; }, 'catchup-resume-marker-malformed'],
+  ]) {
+    const harness = leaseTransitionHarness({ destination: 'store-walk' });
+    configure(harness);
+    const before = clone(harness.state.nightCabinetLease);
+    breakProof(harness.state);
+    const result = await harness.context.handleNightCoordinatorLeaseTransitionRequest();
+    assert.equal(result.ok, false, label);
+    assert.equal(result.reason, reason, label);
+    assert.deepEqual(harness.state.nightCabinetLease, before, label);
+    assert.equal(harness.state.nightCabinetCatchupResumeMarkers?.[`${harness.slotId}:${before.token}`], undefined, label);
   }
 });
 

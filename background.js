@@ -17,6 +17,7 @@ const NIGHT_CABINET_LEASE_TTL_MS = 15 * 60_000;
 const NIGHT_CABINET_TRANSITION_REQUEST_KEY = 'nightCoordinatorLeaseTransitionRequest';
 const NIGHT_CABINET_TRANSITION_RESULT_KEY = 'nightCoordinatorLeaseTransitionResult';
 const NIGHT_CABINET_TRANSITION_HANDLED_KEY = 'lastHandledNightCoordinatorLeaseTransitionId';
+const NIGHT_CABINET_CATCHUP_RESUME_KEY = 'nightCabinetCatchupResumeMarkers';
 const NIGHT_CABINET_TIME_ZONE = 'America/New_York';
 const NIGHT_CABINET_OWNERS = new Set(['store-walk', 'parser']);
 const NIGHT_CABINET_PHASES = new Set([
@@ -206,6 +207,22 @@ function nightCabinetTerminalProof(state, lease) {
         && state.lastSheetsUploadOkAt >= run.finishedAt;
 }
 
+function nightCabinetTerminalSlotProof(state, slotId) {
+    const run = state?.pipelineRun;
+    if (!run?.id
+        || typeof run.nightRequestToken !== 'string'
+        || !run.nightRequestToken
+        || String(run.slotAt) !== String(slotId)
+        || run.nightSlotDay !== nightCabinetSlotDay(slotId)) {
+        return false;
+    }
+    return nightCabinetTerminalProof(state, {
+        slotId: String(slotId),
+        runId: run.id,
+        token: run.nightRequestToken
+    });
+}
+
 function inspectNightCabinetTransitionRequest(request, { now = Date.now() } = {}) {
     if (!request || typeof request !== 'object' || Array.isArray(request)) {
         return { ok: false, reason: 'transition-request-missing' };
@@ -263,7 +280,9 @@ function inspectNightCabinetTransitionRequest(request, { now = Date.now() } = {}
 
 function nightCabinetTransitionAllowed(current, desired, {
     terminalProof = false,
-    currentState = 'active'
+    currentState = 'active',
+    catchupResumeProof = false,
+    catchupResumeConsumed = false
 } = {}) {
     const storeOpenPhases = ['claimed', 'running', 'store-main', 'store-catchup', 'recover'];
     const storeTerminalPhases = ['completed', 'degraded', 'blocked', 'failed'];
@@ -292,6 +311,18 @@ function nightCabinetTransitionAllowed(current, desired, {
             && desired.owner === 'parser' && desired.phase === 'ready'
             && !sameToken) {
             return { ok: true, reason: 'parser-ready' };
+        }
+        if (sameSlot
+            && current.phase === 'degraded'
+            && desired.owner === 'store-walk'
+            && desired.phase === 'store-catchup'
+            && !sameToken) {
+            if (!catchupResumeProof) {
+                return { ok: false, reason: 'catchup-resume-terminal-proof-required' };
+            }
+            return catchupResumeConsumed
+                ? { ok: false, reason: 'catchup-resume-already-consumed' }
+                : { ok: true, reason: 'catchup-resume-one-shot' };
         }
         return { ok: false, reason: 'store-walk-transition-refused' };
     }
@@ -416,6 +447,7 @@ async function handleNightCoordinatorLeaseTransitionRequest() {
             NIGHT_CABINET_TRANSITION_REQUEST_KEY,
             NIGHT_CABINET_TRANSITION_RESULT_KEY,
             NIGHT_CABINET_TRANSITION_HANDLED_KEY,
+            NIGHT_CABINET_CATCHUP_RESUME_KEY,
             NIGHT_CABINET_LEASE_KEY,
             'pipelineRun', 'pipelineStage', 'trackScreenshotQueue', 'screenshotQueueBlocked',
             'pendingSheetsUpload', 'lastSheetsUploadRunId', 'lastSheetsUploadOkAt'
@@ -436,7 +468,7 @@ async function handleNightCoordinatorLeaseTransitionRequest() {
             };
         }
 
-        const finish = async (ok, reason, lease = null) => {
+        const finish = async (ok, reason, lease = null, extraMutation = {}) => {
             const result = {
                 requestId: request.requestId,
                 ok: !!ok,
@@ -447,6 +479,7 @@ async function handleNightCoordinatorLeaseTransitionRequest() {
             };
             await chrome.storage.local.set({
                 ...(lease ? { [NIGHT_CABINET_LEASE_KEY]: lease } : {}),
+                ...extraMutation,
                 [NIGHT_CABINET_TRANSITION_HANDLED_KEY]: request.requestId,
                 [NIGHT_CABINET_TRANSITION_RESULT_KEY]: result
             });
@@ -472,9 +505,32 @@ async function handleNightCoordinatorLeaseTransitionRequest() {
         const terminalProof = current?.owner === 'parser' && current.phase === 'running'
             ? nightCabinetTerminalProof(state, current)
             : false;
+        const catchupResumeCandidate = current?.owner === 'store-walk'
+            && current.phase === 'degraded'
+            && current.slotId === request.desired.slotId
+            && request.desired.owner === 'store-walk'
+            && request.desired.phase === 'store-catchup'
+            && current.token !== request.desired.token;
+        const rawResumeMarkers = state[NIGHT_CABINET_CATCHUP_RESUME_KEY];
+        const resumeMarkersValid = rawResumeMarkers == null
+            || (typeof rawResumeMarkers === 'object' && !Array.isArray(rawResumeMarkers));
+        if (catchupResumeCandidate && !resumeMarkersValid) {
+            return finish(false, 'catchup-resume-marker-malformed');
+        }
+        const resumeMarkerKey = catchupResumeCandidate
+            ? `${current.slotId}:${current.token}`
+            : null;
+        const catchupResumeConsumed = resumeMarkerKey
+            ? Object.prototype.hasOwnProperty.call(rawResumeMarkers || {}, resumeMarkerKey)
+            : false;
+        const catchupResumeProof = catchupResumeCandidate
+            ? nightCabinetTerminalSlotProof(state, current.slotId)
+            : false;
         const decision = nightCabinetTransitionAllowed(current, request.desired, {
             terminalProof,
-            currentState: inspectedCurrent.state
+            currentState: inspectedCurrent.state,
+            catchupResumeProof,
+            catchupResumeConsumed
         });
         if (!decision.ok) return finish(false, decision.reason);
 
@@ -486,7 +542,21 @@ async function handleNightCoordinatorLeaseTransitionRequest() {
             heartbeat: now,
             expires: now + NIGHT_CABINET_LEASE_TTL_MS
         };
-        return finish(true, decision.reason, lease);
+        const resumeMarkerMutation = decision.reason === 'catchup-resume-one-shot'
+            ? {
+                [NIGHT_CABINET_CATCHUP_RESUME_KEY]: {
+                    ...(rawResumeMarkers || {}),
+                    [resumeMarkerKey]: {
+                        slotId: current.slotId,
+                        oldToken: current.token,
+                        newToken: request.desired.token,
+                        parserRunId: state.pipelineRun.id,
+                        consumedAt: now
+                    }
+                }
+            }
+            : {};
+        return finish(true, decision.reason, lease, resumeMarkerMutation);
     });
 }
 
