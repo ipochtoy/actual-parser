@@ -3187,7 +3187,7 @@ function runParserOperationSingleFlight(slot, key, work) {
 }
 
 function getAmazonSwitchAccountUrl() {
-    return 'https://www.amazon.com/ap/signin?openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.amazon.com%2F%3Fref_%3Dnav_youraccount_switchacct&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.assoc_handle=usflex&openid.mode=checkid_setup&marketPlaceId=ATVPDKIKX0DER&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&switch_account=picker&ignoreAuthState=1&_encoding=UTF8';
+    return 'https://www.amazon.com/ap/signin?openid.return_to=https%3A%2F%2Fwww.amazon.com%2F%3Fref_%3Dnav_youraccount_switchacct&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.assoc_handle=usflex&openid.mode=checkid_setup&marketPlaceId=ATVPDKIKX0DER&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&switch_account=picker&_encoding=UTF8';
 }
 
 function dispatchCurrentAmazonAccountSwitch(email, expectedGeneration, kind = 'account-switch') {
@@ -9310,9 +9310,15 @@ async function captureEbayShipments(tab) {
     }
 
     // Все карточки с трек-номером уже были сняты ранее, ничего нового не осталось.
+    // Оставшиеся в out карточки БЕЗ трека (продавец ещё не отправил коробку) —
+    // это тоже «нечего слать»: снимать их нельзя (чужой трек утечёт на соседа),
+    // а держать заказ в очереди бессмысленно — он падает три раза подряд с
+    // «no screenshot was archived» и карантинит ВСЮ очередь вместе с прогоном
+    // (заказ 11-15104-24625, ночь 31.08→01.09.2026: Amazon и выгрузка не пошли).
+    // Когда продавец отправит коробку, её настоящий трек придёт новым item'ом.
     const skippedAllSent = specsWithTrack.length > 0 &&
                            alreadySentCount === specsWithTrack.length &&
-                           out.length === 0;
+                           out.every(s => !s.trackNum);
     return { shipments: out, skippedAllSent };
 }
 
@@ -9908,11 +9914,17 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                         // one real USPS for sneakers got stamped onto two Cocteau Twins shirts that
                         // were still "Paid / Tracking available" pending). Skip such packets — when the
                         // seller actually ships, next parser run will pick the real track up.
-                        if (!s.trackNum) {
+                        // Исключение — единственная коробка заказа: если на странице заказа
+                        // номер не распознан, а список заказов его дал, то принадлежать он может
+                        // только этой коробке — соседей, на кого могла бы утечь чужая отправка, физически нет.
+                        // Без этого заказ 18-15068-94670 (VU500995147GB) три раза подряд
+                        // ронял всю очередь скринов и хоронил ночной прогон целиком (ночь 29→30.08.2026).
+                        const track = s.trackNum
+                            || ((s.shipmentTotal === 1 && expectedTracks.length === 1) ? expectedTracks[0] : '');
+                        if (!track) {
                             console.log(`⏭  skip shipment ${s.shipmentIdx}/${s.shipmentTotal} for ${orderId} — no tracking yet`);
                             continue;
                         }
-                        const track = s.trackNum;
                         const trackLine = '🚚 ' + esc(track);
                         const shipTag = s.shipmentTotal > 1 ? ` • коробка ${s.shipmentIdx} из ${s.shipmentTotal}` : '';
                         // Полный состав коробки из собранных строк; если их нет — хотя бы
@@ -9925,8 +9937,8 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                         capturedTracks.add(track);
                         if (archive.link) {
                             if (!firstPageLink) firstPageLink = archive.link;
-                            try { await writeScreenshotLinkToSheet(s.trackNum, archive.link); }
-                            catch (e) { console.warn(`⚠️ writeScreenshotLinkToSheet ${s.trackNum}:`, e?.message || e); }
+                            try { await writeScreenshotLinkToSheet(track, archive.link); }
+                            catch (e) { console.warn(`⚠️ writeScreenshotLinkToSheet ${track}:`, e?.message || e); }
                         }
                         screenshotsTaken++;
                     }
