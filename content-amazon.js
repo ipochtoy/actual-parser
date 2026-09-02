@@ -1,7 +1,18 @@
-/* content-amazon.js — v7.8.0 (generation-fenced pagination and account ownership) */
+/* content-amazon.js — v7.9.0 (одна отправка = все её товары) */
 
 (function () {
-  console.log("🚀 Amazon Parser v7.8.0 loaded");
+  console.log("🚀 Amazon Parser v7.9.0 loaded");
+
+  // Разбор состава отправки живёт в отдельном файле shipment-scope.js: его же читает
+  // офлайн-тест в AutoBuy, поэтому правило «одна отправка = все её товары» проверяется
+  // на настоящем коде, а не на копии. Файл подключён в manifest.json ПЕРЕД этим.
+  // Нет файла — Chrome вообще не поднимет расширение, так что молча работать по-старому
+  // (одна строка вместо четырёх) парсер уже не может.
+  const SHIPMENT = (typeof globalThis !== 'undefined' ? globalThis : window).PPShipmentScope;
+  if (!SHIPMENT) {
+    console.error('❌ shipment-scope.js не загружен — состав отправки разбирать нечем. Скопируйте файл в папку расширения.');
+    throw new Error('shipment-scope.js missing');
+  }
   
   // Get current Amazon account name for logs
   function getAmazonAccountName() {
@@ -275,7 +286,11 @@
   }
 
   // v7.3: Extract quantity from product card (badge on image or text)
-  function extractQuantityFromDOM(scope) {
+  // v7.9: два новых аргумента — рамка отправки и число позиций в ней. Нужны, чтобы
+  // отличить «посмотрели рамку товара, значка нет» (у Amazon это ровно одна штука)
+  // от «рамку товара найти не удалось». Во втором случае цифру НЕ выдумываем: пустой
+  // qty поднимает в листе пометку «состав не разобран».
+  function extractQuantityFromDOM(scope, shipmentBox, positionsInShipment) {
     // 1. ПЕРВЫМ ДЕЛОМ: Ищем span.product-image__qty (точный селектор Amazon)
     const qtySpan = scope.querySelector('span.product-image__qty, .product-image__qty');
     if (qtySpan) {
@@ -380,8 +395,32 @@
       }
     }
     
-    console.log('  📊 Quantity not found, defaulting to 1');
-    return "1"; // default
+    // Значок отправки: у посылки из ОДНОЙ позиции цифра иногда висит не внутри рамки
+    // товара, а рядом с ней. Берём её только когда позиция в отправке одна и значок
+    // в отправке один — иначе легко утащить цифру соседнего товара.
+    if (shipmentBox && positionsInShipment === 1 && shipmentBox.querySelectorAll) {
+      const badges = shipmentBox.querySelectorAll('span.product-image__qty, .product-image__qty');
+      if (badges.length === 1) {
+        const badgeText = badges[0].textContent?.trim();
+        if (badgeText && /^\d+$/.test(badgeText)) {
+          console.log(`  📊 QTY found via shipment badge: ${badgeText}`);
+          return badgeText;
+        }
+      }
+    }
+
+    // Рамка товара опознана (это карточка позиции с картинкой), значка на ней нет —
+    // у Amazon значок появляется только от двух штук, поэтому одна штука.
+    const looksLikeItemCard = !!(scope && scope.matches
+      && scope.matches(SHIPMENT.ITEM_SCOPE_SELECTOR)
+      && scope.querySelector && scope.querySelector('img'));
+    if (looksLikeItemCard) {
+      console.log('  📊 Quantity badge absent on item card → 1');
+      return "1";
+    }
+
+    console.log('  📊 Рамку товара опознать не удалось — qty оставляем пустым');
+    return null;
   }
 
   function extractASINFromLink(href) {
@@ -531,7 +570,11 @@
     }
   }
 
-  async function parseIndividualItemSimpleByTrackUrl(card, productLink, orderId, trackUrl, parserAccount) {
+  // composition — разбор состава отправки из главного цикла:
+  //   { parsed: true|false, reason: '', box: Element, positions: number }
+  // parsed=false значит «состав отправки разобрать не удалось»: строка уедет в лист
+  // с пометкой, а робот описи вместо «В посылке N товаров» напишет предупреждение.
+  async function parseIndividualItemSimpleByTrackUrl(card, productLink, orderId, trackUrl, parserAccount, composition) {
     const scope = closestItemScope(productLink || card);
     
     // PRODUCT NAME - keep the good v6.6 logic
@@ -566,11 +609,16 @@
           console.log("  📦 Title from nearby img alt");
         }
       }
-      // Try to find ANY product link in delivery-box with text
+      // Ищем название по ДРУГИМ ссылкам ТОГО ЖЕ товара (картинка и название дают две
+      // ссылки с одним ASIN). Соседние позиции не трогаем: до v7.9 отсюда бралась
+      // первая ссылка рамки доставки, и в отправке из четырёх кукол все четыре строки
+      // могли получить имя первой.
       if (!title) {
         const deliveryBox = productLink.closest('.delivery-box, .a-box');
+        const ownAsin = extractASINFromLink(productLink.getAttribute('href') || productLink.href);
         if (deliveryBox) {
-          const allLinks = deliveryBox.querySelectorAll('a[href*="/dp/"], a[href*="/gp/product/"]');
+          const allLinks = Array.from(deliveryBox.querySelectorAll('a[href*="/dp/"], a[href*="/gp/product/"]'))
+            .filter(l => !ownAsin || extractASINFromLink(l.getAttribute('href') || l.href) === ownAsin);
           for (const link of allLinks) {
             const txt = link.textContent?.trim();
             if (txt && txt.length > 5 && txt.length < 300) {
@@ -650,8 +698,8 @@
     console.log(`  ✅ TRACK: ${trackNumber}`);
 
     // v7.1: Extract actual quantity
-    const qty = extractQuantityFromDOM(scope);
-    console.log(`  📊 QTY: ${qty}`);
+    const qty = extractQuantityFromDOM(scope, composition && composition.box, composition && composition.positions);
+    console.log(`  📊 QTY: ${qty === null ? '— (не нашли)' : qty}`);
 
     // Anti-rate-limit: skip скрин если order > 14 дней. Дата ищется в order card
     // (ближайший родитель с [data-order-id]) по паттерну "Order placed Month DD, YYYY".
@@ -686,7 +734,11 @@
       qty: qty,
       color: isMultiOrderShipment ? "⚠️ РАЗНЫЕ ЗАКАЗЫ" : "",
       size: "",
-      account_name: accountName
+      account_name: accountName,
+      // Разобрали ли состав отправки целиком. false → лист получит пометку, а робот
+      // описи не напечатает число позиций.
+      composition_parsed: composition ? composition.parsed !== false : false,
+      composition_reason: (composition && composition.reason) || (composition ? '' : 'no-composition')
     };
   }
 
@@ -946,102 +998,74 @@
             
             console.log(`\n--- Посылка ${j + 1} ---`);
             
-            // SMART FIX v6.7.2: Use itemId from track button URL to find correct product
-            // Extract itemId from track button URL
+            // v7.9: ОДНА ОТПРАВКА = ВСЕ ЕЁ ТОВАРЫ.
+            // Сначала рамка отправки и весь её состав, и только потом — itemId из
+            // ссылки кнопки. Раньше было наоборот: itemId находил один товар и
+            // отключал разбор рамки (`if (!productLink)`), поэтому заказ из четырёх
+            // кукол уехал в лист одной строкой (114-4364449-9800232, 02.09.2026).
+            const shipment = SHIPMENT.shipmentScope(trackBtn, card);
+            let productsToProcess = shipment.box ? SHIPMENT.collectShipmentProducts(shipment.box) : [];
+            const compositionReasons = [];
+            if (!shipment.isolated) compositionReasons.push(shipment.reason || 'scope-multi-track');
+            console.log(`  📦 Рамка отправки: ${shipment.box ? (shipment.box.className || shipment.box.tagName) : '—'}, товаров в ней: ${productsToProcess.length}`);
+
+            // itemId из ссылки кнопки — теперь только ПРОВЕРКА, а не поиск: если в
+            // рамке нет товара с этим itemId, значит рамку взяли не ту.
             const itemIdMatch = trackUrl.match(/itemId=([^&]+)/);
             const itemId = itemIdMatch ? itemIdMatch[1] : null;
-            
-            let productLink = null;
-            
-            if (itemId) {
-              // Try to find product link with this itemId in its href
-              console.log(`  🔍 Ищем товар с itemId: ${itemId}`);
-              const allProductLinks = card.querySelectorAll('a[href*="/dp/"], a[href*="/gp/product/"]');
-              
-              for (const link of allProductLinks) {
-                if (link.href.includes(itemId)) {
-                  productLink = link;
-                  console.log(`  ✅ Найден товар по itemId!`);
-                  break;
-                }
+            if (itemId && productsToProcess.length) {
+              const hit = productsToProcess.some(link => String(link.getAttribute('href') || link.href || '').includes(itemId));
+              if (!hit) {
+                console.log(`  ⚠️ В рамке отправки нет товара с itemId ${itemId}`);
+                compositionReasons.push('itemId-not-in-box');
               }
             }
-            
-            // Fallback 1: Search products in the SAME delivery box (не пересекать границы доставок!)
-            if (!productLink) {
-              console.log(`  🔍 itemId не помог, ищем в том же блоке доставки`);
-              
-              // Find the closest delivery container
-              const deliveryBox = trackBtn.closest('.delivery-box, .a-box, .shipment, [class*="delivery"]');
-              
-              if (deliveryBox) {
-                console.log(`  📦 Нашли контейнер доставки: ${deliveryBox.className}`);
-                const nearbyProducts = deliveryBox.querySelectorAll('a[href*="/dp/"], a[href*="/gp/product/"]');
-                console.log(`  📦 В контейнере ${nearbyProducts.length} товар(ов)`);
-                
-                if (nearbyProducts.length > 0) {
-                  // v6.7.4 FIX: Collect ALL unique products from delivery-box
-                  const uniqueProducts = [];
-                  const seenASINs = new Set();
-                  
-                  for (const product of nearbyProducts) {
-                    const asin = product.href.match(/\/(?:dp|product)\/([A-Z0-9]{10})/)?.[1];
-                    if (asin && !seenASINs.has(asin)) {
-                      seenASINs.add(asin);
-                      uniqueProducts.push(product);
-                    }
-                  }
-                  
-                  console.log(`  📦 Найдено ${uniqueProducts.length} уникальных товаров в контейнере`);
-                  
-                  if (uniqueProducts.length > 0) {
-                    // Take first unique product (will process all in loop below)
-                    productLink = uniqueProducts[0];
-                    console.log(`  ✅ Взяли первый товар для обработки`);
-                    
-                    // Store all products for this shipment
-                    trackBtn._allProducts = uniqueProducts;
-                  }
-                } else {
-                  console.log(`  ⚠️ В контейнере доставки нет товаров!`);
-                }
-              } else {
-                console.log(`  ⚠️ Не нашли контейнер доставки, пробуем старый метод (7 уровней вверх)`);
-                // Старый fallback на случай если структура страницы другая
-                let parent = trackBtn;
-                for (let level = 0; level < 7 && parent; level++) {
-                  parent = parent.parentElement;
-                }
-                
-                if (parent) {
-                  const nearbyProducts = parent.querySelectorAll('a[href*="/dp/"], a[href*="/gp/product/"]');
-                  if (nearbyProducts.length > 0) {
-                    productLink = nearbyProducts[0];
-                    console.log(`  ✅ Взяли первый товар (старый метод)`);
-                  }
-                }
+
+            // Запасная дорога 1: рамка пуста — ищем товар по itemId во всей карточке.
+            if (!productsToProcess.length && itemId) {
+              const byItemId = Array.from(card.querySelectorAll(SHIPMENT.PRODUCT_LINK_SELECTOR))
+                .filter(link => String(link.getAttribute('href') || link.href || '').includes(itemId));
+              if (byItemId.length) {
+                productsToProcess = [byItemId[0]];
+                compositionReasons.push('a-fallback');
+                console.log(`  ⚠️ Взяли товар по itemId — состав отправки не разобран`);
               }
             }
-            
-            // Fallback 2: Take first product from card (old behavior)
-            if (!productLink) {
-              console.log(`  ⚠️ Не нашли товар по itemId или рядом, берём первый из карточки (старое поведение)`);
-              productLink = card.querySelector('a[href*="/dp/"], a[href*="/gp/product/"]');
+
+            // Запасная дорога 2: не нашли ничего — первый товар карточки, С ПОМЕТКОЙ.
+            if (!productsToProcess.length) {
+              const first = card.querySelector(SHIPMENT.PRODUCT_LINK_SELECTOR);
+              if (first) {
+                productsToProcess = [first];
+                compositionReasons.push('d-fallback');
+                console.log(`  ⚠️ Взяли первый товар карточки — состав отправки не разобран`);
+              }
             }
-            
-            if (!productLink) {
+
+            if (!productsToProcess.length) {
               console.log(`  ❌ Товар не найден вообще, пропускаем`);
               continue;
             }
-                        
-            // v6.7.4: Process ALL products from this shipment
-            const productsToProcess = trackBtn._allProducts || [productLink];
-            console.log(`  🔄 Обрабатываем ${productsToProcess.length} товар(ов) из этой посылки`);
+
+            // Состав отправки всегда живёт массивом — даже когда товар один.
+            trackBtn._allProducts = productsToProcess;
+
+            const composition = {
+              parsed: compositionReasons.length === 0,
+              reason: compositionReasons.join('+'),
+              box: shipment.box,
+              positions: productsToProcess.length
+            };
+            console.log(`  🔄 Обрабатываем ${productsToProcess.length} товар(ов) из этой посылки${composition.parsed ? '' : ' (состав не разобран: ' + composition.reason + ')'}`);
             
+            let shipmentTrack = '';
+            let emptyQtySeen = false;
             for (let prodIdx = 0; prodIdx < productsToProcess.length; prodIdx++) {
               const prod = productsToProcess[prodIdx];
-              const order = await parseIndividualItemSimpleByTrackUrl(card, prod, orderId, trackUrl, parserAccount);
+              const order = await parseIndividualItemSimpleByTrackUrl(card, prod, orderId, trackUrl, parserAccount, composition);
               if (order) {
+                if (!shipmentTrack) shipmentTrack = order.track_number || '';
+                if (order.qty === null || order.qty === undefined || order.qty === '') emptyQtySeen = true;
                 // --- FINANCIAL MERGE ---
                 if (PARSE_MODE === 'financial') {
                     order.financial = financialData;
@@ -1056,6 +1080,13 @@
                 // Log success
                 sendLog(order.order_id, order.track_number, '✅ Found', order.product_name.substring(0, 80));
               }
+            }
+
+            // Состав отправки разобрать не смогли — говорим об этом вслух, один раз на
+            // отправку. Молчаливая одна строка вместо четырёх стоила складу трёх кукол.
+            if (!composition.parsed || emptyQtySeen) {
+              const reason = composition.parsed ? 'empty-qty' : composition.reason;
+              sendLog(orderId, shipmentTrack || '-', '⚠️ Состав не разобран', `причина=${reason}`);
             }
           } catch (itemError) {
             console.error(`❌ Ошибка обработки посылки ${j + 1}:`, itemError);

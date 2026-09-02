@@ -1,5 +1,22 @@
 # Order Parser Pro - Changelog
 
+## Version 7.9.0 - One Shipment Means All Its Items (2026-09-02)
+
+### Amazon shipment composition
+- New `shipment-scope.js` (loaded before `content-amazon.js`): `shipmentScope()` returns the smallest ancestor of a Track button that holds exactly one track button plus products; `collectShipmentProducts()` returns one entry per item scope instead of one per ASIN, so five identical cans in five delivery boxes stay five positions.
+- The shipment container is now parsed FIRST and always; `trackBtn._allProducts` is always an array. The track-button `itemId` became a check, not a lookup, the seven-levels-up fallback is gone and `.a-box` was dropped from the container selector.
+- Unparsed composition is stated out loud: `sendLog('⚠️ Состав не разобран', reason)` plus `composition_parsed` / `composition_reason` on the parsed row. Reasons: `scope-multi-track`, `itemId-not-in-box`, `a-fallback`, `d-fallback`, `empty-qty`.
+- `extractQuantityFromDOM` no longer invents `"1"`: a recognised item card without a badge means one unit, an unrecognised scope yields `null` (empty qty).
+
+### Sheet and warehouse description
+- Warehouse rows gained columns **J** (`parser|<ISO time>`) and **K** (`состав не разобран`). Column F is left alone — `markRowsDone` overwrites it.
+- Dedup no longer heals an empty qty into `1`.
+- The description robot prints a warning instead of the item count when any row of a track is marked or has an empty qty, and `content-pochtoy.js` compares against the previous description: it appends «(состав уточнён: было N, стало M)» when the count grows and «⚠️ расхождение с прошлой описью: было N» when it shrinks.
+
+### Incident
+- Amazon order 114-4364449-9800232: one shipment with four dolls became one sheet row and a warehouse description saying «В посылке 1 товар»; the warehouse accepted one item out of four.
+
+
 ## Version 7.8.0 - Reliable Six-Cabinet Nightly Run (2026-08-18)
 
 ### Night scheduler and ownership

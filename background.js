@@ -946,7 +946,9 @@ async function writeDataToSheet(spreadsheetId, sheetName, values) {
         throw new Error("Authentication failed. Cannot write to sheet.");
     }
 
-    const range = `${sheetName}!A1`;
+    // Дописываем до колонки K: с 7.9.0 в строке есть J (когда снято) и K (пометка
+    // про состав отправки).
+    const range = `${sheetName}!A:K`;
     const valueInputOption = 'USER_ENTERED';
     const insertDataOption = 'INSERT_ROWS';
 
@@ -7645,20 +7647,33 @@ async function uploadToSheets(runId = null) {
                 ];
             });
         } else {
-            // Warehouse Mode: 9 columns A-I.
+            // Warehouse Mode: 11 columns A-K.
             // A store | B order_id | C track | D product | E qty | F color | G size |
-            // H screenshot_link (written separately by writeScreenshotLinkToSheet) | I account_name
-            values = allOrders.map(o => [
-                o.store_name || '',
-                o.order_id || '',
-                o.track_number || '',
-                o.product_name || '',
-                o.qty || '',
-                o.color || '',
-                o.size || '',
-                '',                        // H screenshot_link placeholder
-                o.account_name || ''       // I account_name
-            ]);
+            // H screenshot_link (written separately by writeScreenshotLinkToSheet) | I account_name |
+            // J кто и когда снял строку | K пометка про состав отправки.
+            //
+            // Колонку F не занимаем: её затирает markRowsDone («DONE …») и читает
+            // skipProcessed. Пометка про состав обязана пережить работу робота, поэтому
+            // живёт в K. Пустой qty — тоже повод для пометки: значит цифру не нашли,
+            // а не «одна штука» (02.09.2026, заказ 114-4364449-9800232).
+            const stampedAt = new Date().toISOString();
+            values = allOrders.map(o => {
+                const qty = (o.qty === null || o.qty === undefined) ? '' : String(o.qty);
+                const compositionBad = o.composition_parsed === false || qty === '';
+                return [
+                    o.store_name || '',
+                    o.order_id || '',
+                    o.track_number || '',
+                    o.product_name || '',
+                    qty,
+                    o.color || '',
+                    o.size || '',
+                    '',                        // H screenshot_link placeholder
+                    o.account_name || '',      // I account_name
+                    `parser|${stampedAt}`,     // J кто и когда снял строку
+                    compositionBad ? 'состав не разобран' : ''  // K
+                ];
+            });
         }
 
         // Idempotency: read existing rows, update qty if changed, skip exact duplicates
@@ -7680,13 +7695,13 @@ async function uploadToSheets(runId = null) {
              const existingMap = new Map();
              existingRows.forEach((r, idx) => {
                  const key = [r[0]||'', r[1]||'', r[2]||'', r[3]||'', r[8]||''].join('\u0001');
-                 const existingQty = r[4] || '1';
+                 const existingQty = r[4] ?? '';   // пустой qty остаётся пустым: «не нашли» ≠ «одна штука»
                  existingMap.set(key, { rowIndex: idx + headerOffset + 1, qty: existingQty }); // 1-based row in sheet
              });
 
              for (const r of values) {
                  const key = [r[0], r[1], r[2], r[3], r[8]||''].join('\u0001');
-                 const newQty = r[4] || '1';
+                 const newQty = r[4] ?? '';        // пустой qty остаётся пустым: «не нашли» ≠ «одна штука»
 
                  if (existingMap.has(key)) {
                      const existing = existingMap.get(key);
@@ -7880,7 +7895,8 @@ function startPochtoyAutomation(sheetData) {
     const groupedRowIndices = new Map();
     const originalTrackNumbers = new Map(); // Store original track number for each normalized key
 
-    // sheet columns: 0 store, 1 order_id, 2 track, 3 product, 4 qty, 5 status (optional)
+    // sheet columns: 0 store, 1 order_id, 2 track, 3 product, 4 qty, 5 status (optional),
+    // 9 (J) кто и когда снял строку, 10 (K) пометка «состав не разобран».
     for (let i = startIndex; i < sheetData.length; i++) {
         const row = sheetData[i];
         if (!row || row.length < 3) continue;
@@ -7903,11 +7919,15 @@ function startPochtoyAutomation(sheetData) {
                 // Store first original track number for this group
                 originalTrackNumbers.set(normalizedKey, trackNumber);
             }
+            const qtyCell = (row[4] === null || row[4] === undefined) ? '' : String(row[4]).trim();
+            const compositionCell = (row[10] === null || row[10] === undefined) ? '' : String(row[10]).trim();
             groupedByTrack.get(normalizedKey).push({
                 store: storeName,
                 order_id: orderId,
                 product_name: row[3] || '',
-                qty: row[4] || '1'
+                qty: qtyCell,
+                // Пометка скринера (K) или пустой qty (E) — состав отправки под вопросом.
+                compositionBad: !!compositionCell || qtyCell === ''
             });
             if (!groupedRowIndices.has(normalizedKey)) groupedRowIndices.set(normalizedKey, new Set());
             groupedRowIndices.get(normalizedKey).add(i+1); // 1-based row index in Sheets
@@ -7927,6 +7947,12 @@ function startPochtoyAutomation(sheetData) {
 
         const totalUnits = items.reduce((sum, it) => sum + (parseInt(it.qty, 10) || 1), 0);
 
+        // Хоть одна строка трека помечена «состав не разобран» или без qty — число
+        // позиций складу НЕ печатаем. 02.09.2026 опись «В посылке 1 товар» по заказу
+        // 114-4364449-9800232 стоила трёх кукол из четырёх: скринер записал одну строку,
+        // робот честно её пересказал, склад пришил одну вещь.
+        const compositionUnknown = items.some(it => it.compositionBad);
+
         const headerLines = [];
         if (uniqueOrderIds.size > 1) headerLines.push("‼️ ВНИМАНИЕ: РАЗНЫЕ ЗАКАЗЫ ‼️");
         const now = new Date();
@@ -7934,7 +7960,9 @@ function startPochtoyAutomation(sheetData) {
         const mm = String(now.getMinutes()).padStart(2,'0');
         headerLines.push(`ТЕСТ РОБОТА 🤖, СВЕРКА ОБЯЗАТЕЛЬНА. (обновлено ${hh}:${mm})`);
 
-        if (items.length === 1) {
+        if (compositionUnknown) {
+            headerLines.push('⚠️ Состав отправки не разобран — сверить по кабинету магазина. Известные позиции:');
+        } else if (items.length === 1) {
             const it = items[0];
             const q = parseInt(it.qty, 10) || 1;
             if (q === 1) {
@@ -7942,19 +7970,29 @@ function startPochtoyAutomation(sheetData) {
             } else {
                 headerLines.push(`Заказ из ${mainStore || 'магазина'}. В посылке ${q} шт. — ${it.product_name}.`);
             }
+            headerLines.push('Состав:');
         } else {
             headerLines.push(`Заказ из ${mainStore || 'магазина'}. В посылке ${items.length} позиций (${totalUnits} шт.).`);
+            headerLines.push('Состав:');
         }
 
-        headerLines.push('Состав:');
         items.forEach(item => {
-            headerLines.push(`- ${item.product_name} (Qty: ${item.qty}, Order: ${item.order_id})`);
+            const q = String(item.qty || '').trim() || '?';
+            headerLines.push(`- ${item.product_name} (Qty: ${q}, Order: ${item.order_id})`);
         });
 
         const note = headerLines.join('\n');
         const rowIndices = Array.from(groupedRowIndices.get(normalizedKey) || []);
         const hasWarning = uniqueOrderIds.size > 1;
-        automationQueue.push({ trackNumber, note: note.trim(), rowIndices, hasWarning });
+        // itemCount отдаём content-скрипту, чтобы он сравнил новую опись с прошлой и
+        // не понизил число позиций молча. При неразобранном составе числа нет.
+        automationQueue.push({
+            trackNumber,
+            note: note.trim(),
+            rowIndices,
+            hasWarning,
+            itemCount: compositionUnknown ? null : items.length
+        });
     }
     
     totalTasks = automationQueue.length;

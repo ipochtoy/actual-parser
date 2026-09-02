@@ -21,9 +21,29 @@ if (typeof window.pochtoyAutomationLoaded === 'undefined') {
         }
     });
     
-    function withCheckmark(baseNote, existingValue) {
-        // Возвращаем исходный текст без чекмарков и счетчиков
-        return (baseNote || '').trim();
+    // Сколько позиций было в ПРОШЛОЙ описи этой коробки.
+    // «В посылке 4 позиций» → 4; «В посылке один товар» → 1; «В посылке 3 шт. — X» →
+    // 1 (одна позиция в трёх штуках). Не нашли — null.
+    function previousItemCount(existingValue) {
+        const text = String(existingValue || '');
+        let m = text.match(/В посылке\s+(\d+)\s+позици/i);
+        if (m) return parseInt(m[1], 10);
+        if (/В посылке\s+один\s+товар/i.test(text)) return 1;
+        if (/В посылке\s+\d+\s+шт/i.test(text)) return 1;
+        return null;
+    }
+
+    // Опись переписывается целиком, но молча ПОНИЖАТЬ число позиций нельзя: 02.09.2026
+    // по заказу 114-4364449-9800232 опись «В посылке 1 товар» увела со склада три куклы
+    // из четырёх. Стало больше — пишем, что состав уточнён; стало меньше — прямо
+    // говорим о расхождении, чтобы человек сверил по кабинету магазина.
+    function withCheckmark(baseNote, existingValue, itemCount) {
+        const note = (baseNote || '').trim();
+        if (!Number.isFinite(itemCount)) return note; // состав не разобран — сравнивать нечем
+        const was = previousItemCount(existingValue);
+        if (was === null || was === itemCount) return note;
+        if (itemCount > was) return `${note}\n(состав уточнён: было ${was}, стало ${itemCount})`;
+        return `${note}\n⚠️ расхождение с прошлой описью: было ${was}`;
     }
 
     async function saveWithRetry(noteInput, saveButton, finalNote) {
@@ -77,7 +97,7 @@ if (typeof window.pochtoyAutomationLoaded === 'undefined') {
             console.log('🛑 Stopped before task start');
             return { status: "stopped" };
         }
-        const { trackNumber, note } = task;
+        const { trackNumber, note, itemCount } = task;
         console.log(`--- Starting task for track: ${trackNumber} ---`);
 
         try {
@@ -133,7 +153,7 @@ if (typeof window.pochtoyAutomationLoaded === 'undefined') {
             if (!noteInput) throw new Error("Note textarea not found.");
 
             const existing = noteInput.value || '';
-            const finalNote = withCheckmark(note, existing);
+            const finalNote = withCheckmark(note, existing, itemCount);
             console.log('Existing note:', existing.substring(0, 120));
             console.log('New note:', finalNote.substring(0, 120));
 
