@@ -10108,8 +10108,9 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
 
 /**
  * Write Telegram deep-link to Sheet column H for all rows matching given tracking number.
- * Sheet columns: A=store, B=order_id, C=tracking, D=name, E=qty, F=color, G=size, H=screenshot_link.
- * Parser usually writes only A-G at append time, so H is safe to set independently.
+ * Sheet columns: A=store, B=order_id, C=tracking, D=name, E=qty, F=color, G=size, H=screenshot_link,
+ * I=account, J=parser stamp, K=composition mark (v7.9.0).
+ * Parser leaves H empty at append time, so H is safe to set independently.
  */
 async function writeScreenshotLinkToSheet(trackNumber, link) {
     if (!trackNumber || !link) return;
