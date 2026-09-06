@@ -123,6 +123,16 @@ function nightCabinetSlotId(now = Date.now()) {
     return String(getLastDailyRunSlot(new Date(now)).getTime());
 }
 
+// The coordinator starts Store Walk at 21:00, before the standalone Parser
+// alarm at 23:00. Both readers must share the upcoming 23:00 slot from 21:00;
+// ownership/CAS and terminal-proof checks still govern every transition.
+function nightCabinetLeaseSlotIds(now = Date.now()) {
+    const slots = [nightCabinetSlotId(now)];
+    const next = getNextDailyRun(new Date(now)).getTime();
+    if (next - Number(now) <= 2 * 60 * 60_000) slots.push(String(next));
+    return slots;
+}
+
 function nightCabinetSlotDay(slotId) {
     const slot = new Date(Number(slotId));
     if (!Number.isFinite(slot.getTime())) return null;
@@ -258,7 +268,7 @@ function inspectNightCabinetTransitionRequest(request, { now = Date.now() } = {}
     if (exact.requestId.length < 16 || exact.requestId.length > 200
         || !Number.isFinite(exact.requestedAt) || exact.requestedAt <= 0 || exact.requestedAt > now + 60_000
         || !/^\d{10,16}$/.test(exact.desired.slotId)
-        || exact.desired.slotId !== nightCabinetSlotId(now)
+        || !nightCabinetLeaseSlotIds(now).includes(exact.desired.slotId)
         || !NIGHT_CABINET_OWNERS.has(exact.desired.owner)
         || !NIGHT_CABINET_PHASES.has(exact.desired.phase)
         || exact.desired.token.length < 16 || exact.desired.token.length > 200) {
@@ -6692,7 +6702,11 @@ async function handleExternalControlRequest() {
         if (hasCoordinatorProof) {
             const decision = externalCoordinatorStartDecision(req, s[NIGHT_CABINET_LEASE_KEY], {
                 pipelineActive: !!s.pipelineStage?.active,
-                alreadyTriggered,
+                // A coordinated run may begin before its nominal 23:00 slot.
+                // Yesterday's trigger must not suppress today's ready token.
+                alreadyTriggered: Number(s.pipelineRun?.slotAt) === Number(req.slotId)
+                    || !!(s.lastDailyAutoParseTriggeredAt
+                        && s.lastDailyAutoParseTriggeredAt >= Number(req.slotId)),
                 previousRun: s.pipelineRun
             });
             if (!decision.start) {

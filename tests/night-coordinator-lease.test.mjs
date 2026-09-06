@@ -444,7 +444,7 @@ function controlWakeHarness({ request, lastHandledControlAt = 0, result = null }
         local: {
           async get(keys) {
             const out = {};
-            for (const key of keys) out[key] = clone(state[key]);
+            for (const key of (typeof keys === 'string' ? [keys] : keys)) out[key] = clone(state[key]);
             return out;
           },
           async set(mutation) { Object.assign(state, clone(mutation)); },
@@ -611,6 +611,7 @@ function leaseTransitionHarness({ destination = 'store-walk', blockTransitionSet
     NIGHT_CABINET_TRANSITION_HANDLED_KEY: 'lastHandledNightCoordinatorLeaseTransitionId',
     NIGHT_CABINET_CATCHUP_RESUME_KEY: 'nightCabinetCatchupResumeMarkers',
     nightCabinetSlotId() { return slotId; },
+    nightCabinetLeaseSlotIds() { return [slotId]; },
     nightCabinetSlotDay() { return '2026-08-20'; },
     async loadAccountsConfig() { return {}; },
     buildExpectedPipelineRoster() { return { iherb: [], ebay: [], amazon: [] }; },
@@ -619,7 +620,7 @@ function leaseTransitionHarness({ destination = 'store-walk', blockTransitionSet
         local: {
           async get(keys) {
             const out = {};
-            for (const key of keys) out[key] = clone(state[key]);
+            for (const key of (typeof keys === 'string' ? [keys] : keys)) out[key] = clone(state[key]);
             return out;
           },
           async set(mutation) {
@@ -897,4 +898,214 @@ test('a delayed Store Walk heartbeat cannot overwrite Parser running ownership',
   });
   assert.equal(injected.ok, false);
   assert.equal(injected.reason, 'transition-wake-payload-refused');
+});
+
+
+// Protocol fixture copied from AutoBuy f5bddeafa defaultUpdateNightLease.
+// Execute the peer's complete expression against the real Parser handlers.
+function autoBuyLeaseExpression(desired, requestId, now) {
+  const expression = `(async()=>{try{const desired=${JSON.stringify(desired)};const requestId=${JSON.stringify(requestId)};const requestedAt=${Number(now)};const дверь=typeof nightCabinetLeaseSlotIds==='function'?nightCabinetLeaseSlotIds(Date.now()):null;const открытые=Array.isArray(дверь)?дверь.map(String):(typeof nightCabinetSlotId==='function'?[String(nightCabinetSlotId(Date.now()))]:null);if(открытые&&!открытые.includes(String(desired.slotId)))return JSON.stringify({error:'slot-not-open-yet',openSlotIds:открытые,wantSlotId:String(desired.slotId)});const first=await chrome.storage.local.get('nightCabinetLease');const current=first.nightCabinetLease||null;const expected=current?{state:'present',slotId:String(current.slotId),owner:String(current.owner),phase:String(current.phase),token:String(current.token),...(current.runId?{runId:String(current.runId)}:{})}:{state:'missing'};const request={requestId,requestedAt,expected,desired};await chrome.storage.local.set({nightCoordinatorLeaseTransitionRequest:request});try{if(typeof handleNightCoordinatorLeaseTransitionRequest==='function'){await handleNightCoordinatorLeaseTransitionRequest()}else{await chrome.runtime.sendMessage({action:'nightCoordinatorLeaseTransitionWake'})}}catch{}for(let i=0;i<120;i++){const s=await chrome.storage.local.get(['nightCoordinatorLeaseTransitionResult','nightCabinetLease']);const result=s.nightCoordinatorLeaseTransitionResult;if(result&&result.requestId===requestId){return JSON.stringify({request,result,lease:s.nightCabinetLease||null})}await new Promise(r=>setTimeout(r,250))}return JSON.stringify({request,error:'lease-transition-result-timeout'})}catch(e){return JSON.stringify({error:String(e)})}})()`;
+  return expression;
+}
+
+function earlyNightHarness(iso, { beforeRequest } = {}) {
+  process.env.TZ = 'America/New_York';
+  const now = Date.parse(iso);
+  const h = leaseTransitionHarness();
+  for (const key of Object.keys(h.state)) delete h.state[key];
+  h.context.Date = class extends Date {
+    constructor(...args) { super(...(args.length ? args : [now])); }
+    static now() { return now; }
+  };
+  h.context.DAILY_PARSE_HOUR = 23;
+  h.context.DAILY_PARSE_MINUTE = 0;
+  for (const name of [
+    'getNextDailyRun', 'getLastDailyRunSlot', 'nightCabinetSlotId',
+    'nightCabinetLeaseSlotIds', 'nightCabinetSlotDay',
+    'prepareParserNightCabinetLease', 'externalCoordinatorStartDecision',
+    'handleExternalControlRequest',
+  ]) vm.runInContext(extractFunction(name), h.context);
+  const set = h.context.chrome.storage.local.set;
+  h.context.chrome.storage.local.set = async mutation => {
+    if (mutation.nightCoordinatorLeaseTransitionRequest) beforeRequest?.(h.state);
+    return set(mutation);
+  };
+  let request = 0;
+  let starts = 0;
+  h.context.runDailyAutoParse = async (source, proof) => {
+    const prepared = await h.context.prepareParserNightCabinetLease(proof);
+    if (!prepared.ok) return false;
+    await h.context.createPipelineRun(source, prepared.lease);
+    starts++;
+    return true;
+  };
+  return {
+    ...h, now, starts: () => starts,
+    async transition(desired) {
+      return JSON.parse(await vm.runInContext(autoBuyLeaseExpression(
+        desired, `autobuy-integration-request-${++request}`, now
+      ), h.context));
+    },
+    async start(slotId, token) {
+      h.state.externalControlRequest = {
+        action: 'start_pipeline', requestedAt: now + ++request, slotId, token,
+      };
+      return h.context.handleExternalControlRequest();
+    },
+  };
+}
+
+const earlyStoreToken = 'early-store-walk-token-0001';
+const earlyParserToken = 'early-parser-ready-token-0002';
+const desiredStore = slotId => ({ slotId, owner: 'store-walk', phase: 'claimed', token: earlyStoreToken });
+
+test('actual AutoBuy lease expression opens the next 23:00 slot only from 21:00, including DST', async () => {
+  for (const [iso, slotIso, allowed] of [
+    ['2026-09-05T20:59:59-04:00', '2026-09-05T23:00:00-04:00', false],
+    ['2026-09-05T21:00:00-04:00', '2026-09-05T23:00:00-04:00', true],
+    ['2026-09-05T22:59:59-04:00', '2026-09-05T23:00:00-04:00', true],
+    ['2026-09-05T23:00:00-04:00', '2026-09-05T23:00:00-04:00', true],
+    ['2026-09-06T00:10:00-04:00', '2026-09-05T23:00:00-04:00', true],
+    ['2026-09-05T21:00:00-04:00', '2026-09-06T23:00:00-04:00', false],
+    ['2026-03-08T21:00:00-04:00', '2026-03-08T23:00:00-04:00', true],
+    ['2026-11-01T21:00:00-05:00', '2026-11-01T23:00:00-05:00', true],
+    ['2026-03-08T00:10:00-05:00', '2026-03-07T23:00:00-05:00', true],
+    ['2026-11-01T00:10:00-04:00', '2026-10-31T23:00:00-04:00', true],
+  ]) {
+    const h = earlyNightHarness(iso);
+    const slotId = String(Date.parse(slotIso));
+    const result = await h.transition(desiredStore(slotId));
+    if (allowed) {
+      assert.equal(result.result?.ok, true, iso);
+      assert.equal(h.state.nightCabinetLease.slotId, slotId);
+    } else {
+      assert.equal(result.error, 'slot-not-open-yet', iso);
+      assert.equal(h.writes.length, 0);
+    }
+  }
+});
+
+test('early slot permission preserves CAS and cannot take live or unproven Parser ownership', async () => {
+  const slotId = String(Date.parse('2026-09-05T23:00:00-04:00'));
+  const iso = '2026-09-05T21:30:00-04:00';
+  const live = (h, owner = 'store-walk') => ({
+    slotId, owner, phase: 'running', token: 'foreign-live-owner-token-0001',
+    heartbeat: h.now - 1000, expires: h.now + 60_000,
+    ...(owner === 'parser' ? { runId: 'foreign-live-run' } : {}),
+  });
+  for (const owner of ['store-walk', 'parser']) {
+    const h = earlyNightHarness(iso);
+    h.state.nightCabinetLease = live(h, owner);
+    const before = clone(h.state.nightCabinetLease);
+    const result = await h.transition(desiredStore(slotId));
+    assert.equal(result.result.ok, false, owner);
+    assert.deepEqual(h.state.nightCabinetLease, before);
+  }
+  const expired = earlyNightHarness(iso);
+  expired.state.nightCabinetLease = {
+    ...live(expired, 'parser'), slotId: String(Date.parse('2026-09-04T23:00:00-04:00')),
+    heartbeat: expired.now - 120_000, expires: expired.now - 60_000,
+  };
+  assert.equal((await expired.transition(desiredStore(slotId))).result.reason, 'parser-terminal-proof-required');
+  const cas = earlyNightHarness(iso, { beforeRequest(state) {
+    state.nightCabinetLease.token = 'racing-new-owner-token-0002';
+  } });
+  cas.state.nightCabinetLease = { ...live(cas), token: earlyStoreToken };
+  const result = await cas.transition({ ...desiredStore(slotId), phase: 'completed' });
+  assert.equal(result.result.reason, 'transition-current-proof-mismatch');
+  assert.equal(cas.state.nightCabinetLease.token, 'racing-new-owner-token-0002');
+  assert.equal(cas.state.nightCabinetLease.phase, 'running');
+});
+
+test('early Store Walk to Parser handoff starts today despite yesterday trigger and binds exact run generation', async () => {
+  const h = earlyNightHarness('2026-09-05T22:00:00-04:00');
+  const slotId = String(Date.parse('2026-09-05T23:00:00-04:00'));
+  h.state.lastDailyAutoParseTriggeredAt = Date.parse('2026-09-04T23:10:00-04:00');
+  h.state.pipelineRun = {
+    id: 'yesterday-run', slotAt: Date.parse('2026-09-04T23:00:00-04:00'),
+    nightSlotDay: '2026-09-04', nightRequestToken: 'yesterday-parser-token-0001', status: 'completed',
+  };
+  assert.equal((await h.transition(desiredStore(slotId))).result.ok, true);
+  assert.equal((await h.transition({ ...desiredStore(slotId), phase: 'completed' })).result.ok, true);
+  assert.equal((await h.transition({ slotId, owner: 'parser', phase: 'ready', token: earlyParserToken })).result.ok, true);
+  const result = await h.start(slotId, earlyParserToken);
+  assert.equal(result.result.ok, true);
+  assert.equal(h.starts(), 1);
+  assert.equal(h.state.pipelineRun.slotAt, Number(slotId));
+  assert.equal(h.state.pipelineRun.nightSlotDay, '2026-09-05');
+  assert.equal(h.state.pipelineRun.nightRequestToken, earlyParserToken);
+  assert.equal(h.state.nightCabinetLease.runId, h.state.pipelineRun.id);
+  assert.equal(h.state.nightCabinetLease.phase, 'running');
+  assert.equal((await h.start(slotId, earlyParserToken)).result.ok, false);
+  assert.equal(h.starts(), 1);
+});
+
+test('early explicit start refuses wrong token, active pipeline and already-consumed same-slot generation', async () => {
+  const slotId = String(Date.parse('2026-09-05T23:00:00-04:00'));
+  for (const scenario of ['wrong-token', 'active', 'same-slot-starting', 'same-slot-terminal']) {
+    const h = earlyNightHarness('2026-09-05T22:00:00-04:00');
+    h.state.nightCabinetLease = {
+      slotId, owner: 'parser', phase: 'ready', token: earlyParserToken,
+      heartbeat: h.now, expires: h.now + 60_000,
+    };
+    h.state.lastDailyAutoParseTriggeredAt = h.now - 60_000;
+    if (scenario === 'active') h.state.pipelineStage = { active: true };
+    if (scenario.startsWith('same-slot')) h.state.pipelineRun = {
+      slotAt: Number(slotId), nightSlotDay: '2026-09-05', nightRequestToken: earlyParserToken,
+      status: scenario === 'same-slot-terminal' ? 'completed' : 'starting',
+    };
+    const result = await h.start(slotId, scenario === 'wrong-token' ? 'wrong-parser-token-0002' : earlyParserToken);
+    assert.equal(result.result.ok, false, scenario);
+    assert.equal(h.starts(), 0, scenario);
+    assert.equal(h.state.nightCabinetLease.phase, 'ready', scenario);
+  }
+});
+
+test('actual 23:00 alarm cannot repeat a completed early run after coordinator terminal cleanup', async () => {
+  const slotId = String(Date.parse('2026-09-05T23:00:00-04:00'));
+  const earlyFinished = Date.parse('2026-09-05T21:45:00-04:00');
+  const branch = source.slice(
+    source.indexOf('if (alarm.name === DAILY_ALARM_NAME)'),
+    source.indexOf('if (alarm.name === SCREENSHOT_RESUME_ALARM)'),
+  );
+  for (const leaseState of ['active-terminal', 'expired-terminal', 'missing']) {
+    const h = earlyNightHarness('2026-09-05T23:00:01-04:00');
+    h.state.pipelineRun = {
+      id: 'completed-early-run', status: 'completed', slotAt: Number(slotId),
+      nightSlotDay: '2026-09-05', nightRequestToken: earlyParserToken,
+      startedAt: earlyFinished - 60_000, finishedAt: earlyFinished,
+    };
+    h.state.pipelineStage = { active: false, runId: 'completed-early-run', stageName: 'done' };
+    h.state.lastDailyAutoParseTriggeredAt = earlyFinished - 60_000;
+    h.state.lastSheetsUploadRunId = 'completed-early-run';
+    h.state.lastSheetsUploadOkAt = earlyFinished + 1000;
+    if (leaseState !== 'missing') h.state.nightCabinetLease = {
+      slotId, owner: 'store-walk', phase: 'completed', token: 'terminal-coordinator-token-0003',
+      heartbeat: leaseState === 'active-terminal' ? h.now - 1000 : earlyFinished,
+      expires: leaseState === 'active-terminal' ? h.now + 60_000 : earlyFinished + 60_000,
+    };
+    const beforeRun = clone(h.state.pipelineRun);
+    const beforeLease = clone(h.state.nightCabinetLease);
+    let shopStarts = 0;
+    let retries = 0;
+    Object.assign(h.context, {
+      alarm: { name: 'dailyAutoParse', scheduledTime: Number(slotId) },
+      DAILY_ALARM_NAME: 'dailyAutoParse', DAILY_ALARM_DRIFT_TOLERANCE_MS: 60_000,
+      DAILY_MISSED_RUN_CATCHUP_MS: 3 * 60 * 60_000, dailyRunStartInFlight: null,
+      console: { log() {}, warn() {} },
+      async addDailyDiagnostic() {}, async ensureDailyAlarm() {},
+      async scheduleNightCabinetRetry() { retries++; return { attempts: 1 }; },
+      async startSequentialPipeline() { shopStarts++; throw new Error('duplicate shop start'); },
+    });
+    for (const name of ['runDailyAutoParse', 'runDailyAutoParseOnce']) {
+      vm.runInContext(extractFunction(name), h.context);
+    }
+    await vm.runInContext(`(async () => { ${branch} })()`, h.context);
+    assert.equal(shopStarts, 0, leaseState);
+    assert.equal(retries, 1, leaseState);
+    assert.equal(h.state.lastDailyAutoParseStatus, 'deferred-night-lease', leaseState);
+    assert.deepEqual(h.state.pipelineRun, beforeRun, leaseState);
+    assert.deepEqual(h.state.nightCabinetLease, beforeLease, leaseState);
+    assert.equal(h.state.lastSheetsUploadRunId, 'completed-early-run', leaseState);
+  }
 });
