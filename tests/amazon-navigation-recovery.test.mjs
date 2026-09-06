@@ -226,7 +226,7 @@ test('timeout evidence is captured from the exact parser tab, never the active w
   assert.match(capture, /'Page\.captureScreenshot'/);
   assert.doesNotMatch(capture, /captureVisibleTab/);
 
-  const timeoutStart = background.indexOf('let evidence = { tabId: null');
+  const timeoutStart = background.indexOf('let evidence = await readAmazonTimeoutTabEvidence(');
   const timeoutEnd = background.indexOf("await logMultiAccountStep('account-parse:timeout'", timeoutStart);
   assert.ok(timeoutStart > -1 && timeoutEnd > timeoutStart);
   const timeoutEvidence = background.slice(timeoutStart, timeoutEnd);
@@ -562,4 +562,125 @@ test('missing Next, stop and parser errors cannot emit Amazon completion', () =>
   assert.doesNotMatch(fail, /amazonParsingComplete/);
   assert.match(fail, /await commitAmazonAttempt\('incomplete', state, \{/);
   assert.doesNotMatch(fail, /chrome\.storage\.local\.set/);
+});
+
+
+test('timeout diagnosis distinguishes disappearance, unexpected redirect and unreadable tabs', async () => {
+  let read;
+  const context = { URL, chrome: { tabs: { get: async id => read(id) } } };
+  vm.createContext(context);
+  vm.runInContext(extractFunction(background, 'readAmazonTimeoutTabEvidence'), context);
+  read = async id => ({ id, url: 'https://www.amazon.com/errors/validateCaptcha?token=secret', status: 'complete' });
+  let evidence = await context.readAmazonTimeoutTabEvidence(41);
+  assert.equal(evidence.expectedTabId, 41);
+  assert.equal(evidence.tabId, 41);
+  assert.equal(evidence.tabState, 'live');
+  assert.equal(evidence.tabUrl, 'https://www.amazon.com/errors/validateCaptcha');
+  read = async () => { throw new Error('No tab with id: 41.'); };
+  evidence = await context.readAmazonTimeoutTabEvidence(41);
+  assert.equal(evidence.tabState, 'missing');
+  assert.equal(evidence.expectedTabId, 41);
+  read = async () => { throw new Error('Browser temporarily unavailable'); };
+  evidence = await context.readAmazonTimeoutTabEvidence(41);
+  assert.equal(evidence.tabState, 'read-failed');
+  assert.equal((await context.readAmazonTimeoutTabEvidence(null)).tabState, 'unassigned');
+});
+
+
+test('Parser ownership protects durable exact parsing and screenshot IDs across worker restart', () => {
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(extractFunction(background, 'parserTabOwnershipReply'), context);
+  const state = {
+    pipelineRun: { id: 'run-a', status: 'running' },
+    pipelineStage: { active: true, runId: 'run-a', stageStartedAt: 123 },
+    amazonParserTabId: 41, iherbParserTabId: 42, ebayParserTabId: 43,
+    parserScreenshotReuseTab: { tabId: 44, runId: 'run-a', stageStartedAt: 123 },
+    parserScreenshotLocalTab: { tabId: 45, runId: 'old-run', stageStartedAt: 123 },
+  };
+  for (const id of [41, 42, 43, 44]) {
+    const reply = context.parserTabOwnershipReply(state, id);
+    assert.equal(reply.known, true);
+    assert.equal(reply.owned, true);
+    assert.deepEqual(Object.keys(reply).sort(), ['action', 'known', 'owned', 'tabId']);
+  }
+  assert.equal(context.parserTabOwnershipReply(state, 45).known, false);
+  // New tab exists in Chrome, but its durable ID has not yet been saved.
+  assert.equal(context.parserTabOwnershipReply(state, 99).known, false);
+  state.pipelineStage.runId = 'next-run';
+  assert.equal(context.parserTabOwnershipReply(state, 41).known, false);
+  state.pipelineStage.active = false;
+  assert.equal(context.parserTabOwnershipReply(state, 41).known, false);
+  state.pipelineRun.status = 'completed';
+  delete state.parserScreenshotReuseTab;
+  delete state.parserScreenshotLocalTab;
+  assert.equal(context.parserTabOwnershipReply(state, 41).known, true);
+  assert.equal(context.parserTabOwnershipReply(state, 41).owned, false);
+});
+
+test('ownership IPC rejects unrelated senders and exposes only an ownership decision', async () => {
+  let reads = 0, response;
+  const context = { chrome: { storage: { local: { get: async keys => {
+    reads++;
+    assert.ok(keys.every(key => /^(pipelineRun|pipelineStage|amazonParserTabId|iherbParserTabId|ebayParserTabId|parserScreenshotReuseTab|parserScreenshotLocalTab|trackScreenshotQueue|screenshotQueueBlocked|screenshotStageBudget|amazonStageFinalizing|iherbStageFinalizing|pendingAccountSwitch|pendingIherbSwitch|autoParsePending|parsingState)$/.test(key)));
+    return { pipelineRun: { id: 'a', status: 'running' }, pipelineStage: { active: true, runId: 'a', stageStartedAt: 123 }, amazonParserTabId: 41 };
+  } } } } };
+  vm.createContext(context);
+  vm.runInContext(extractFunction(background, 'parserTabOwnershipReply'), context);
+  vm.runInContext(extractFunction(background, 'handleParserTabOwnershipMessage'), context);
+  const request = { action: 'parserTabOwnershipV1', tabId: 41 };
+  assert.equal(context.handleParserTabOwnershipMessage(request, { id: 'foreign' }, () => {}), false);
+  assert.equal(reads, 0);
+  assert.equal(context.handleParserTabOwnershipMessage(request, { id: 'ppcgaihnphmgololipboonimikclclgc' }, value => { response = value; }), true);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(response.owned, true);
+  assert.equal(reads, 1);
+});
+
+test('screenshot tab ownership is persisted on creation and cleared only for matching own tab', async () => {
+  const state = { pipelineRun: { id: 'a' }, pipelineStage: { stageStartedAt: 123 } };
+  const context = { chrome: { storage: { local: {
+    get: async () => structuredClone(state),
+    set: async patch => Object.assign(state, patch),
+    remove: async key => { delete state[key]; },
+  } } } };
+  vm.createContext(context);
+  vm.runInContext(extractFunction(background, 'rememberParserScreenshotTab'), context);
+  vm.runInContext(extractFunction(background, 'forgetParserScreenshotTab'), context);
+  await context.rememberParserScreenshotTab(41, 'parserScreenshotReuseTab');
+  assert.equal(state.parserScreenshotReuseTab.tabId, 41);
+  assert.equal(state.parserScreenshotReuseTab.runId, 'a');
+  await context.forgetParserScreenshotTab(99, 'parserScreenshotReuseTab');
+  assert.equal(state.parserScreenshotReuseTab.tabId, 41);
+  await context.forgetParserScreenshotTab(41, 'parserScreenshotReuseTab');
+  assert.equal(state.parserScreenshotReuseTab, undefined);
+});
+
+
+test('terminal screenshot drain and pending finalizers never grant a false cleanup permit', () => {
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(extractFunction(background, 'parserTabOwnershipReply'), context);
+  const state = {
+    pipelineRun: { id: 'run-a', status: 'completed' },
+    pipelineStage: { active: false, runId: 'run-a', stageStartedAt: 123 },
+    trackScreenshotQueue: [{ orderId: 'test' }],
+    parserScreenshotReuseTab: { tabId: 44, runId: 'run-a', stageStartedAt: 123 },
+  };
+  assert.equal(context.parserTabOwnershipReply(state, 44).owned, true);
+  assert.equal(context.parserTabOwnershipReply(state, 99).known, false);
+  state.parserScreenshotReuseTab.runId = 'old-run';
+  assert.equal(context.parserTabOwnershipReply(state, 44).known, false);
+  delete state.parserScreenshotReuseTab;
+  state.trackScreenshotQueue = [];
+  for (const key of ['amazonStageFinalizing', 'iherbStageFinalizing', 'pendingAccountSwitch', 'pendingIherbSwitch', 'autoParsePending']) {
+    state[key] = {};
+    assert.equal(context.parserTabOwnershipReply(state, 99).known, false, key);
+    delete state[key];
+  }
+  state.screenshotStageBudget = { activeSince: 123 };
+  assert.equal(context.parserTabOwnershipReply(state, 99).known, false);
+  state.screenshotStageBudget.activeSince = null;
+  assert.equal(context.parserTabOwnershipReply(state, 99).known, true);
+  assert.equal(context.parserTabOwnershipReply(state, 99).owned, false);
 });

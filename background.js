@@ -5637,6 +5637,96 @@ async function getAmazonParserTab(tabId) {
     return null;
 }
 
+// Diagnostics must distinguish a closed owned tab from a live tab rejected by
+// the navigation guard. Never search other tabs or relax that guard for recovery.
+async function readAmazonTimeoutTabEvidence(tabId) {
+    const evidence = { expectedTabId: tabId || null, tabId: null, tabUrl: null, tabTitle: null, tabState: 'unassigned' };
+    if (!tabId) return evidence;
+    try {
+        const tab = await chrome.tabs.get(tabId);
+        evidence.tabId = tab.id;
+        evidence.tabState = 'live';
+        evidence.tabStatus = tab.status || null;
+        // An unexpected redirect may contain authentication data in its query.
+        try {
+            const url = new URL(tab.url || '');
+            evidence.tabUrl = `${url.origin}${url.pathname}`.slice(0, 300);
+        } catch (_) {}
+    } catch (error) {
+        evidence.tabState = /No tab with id/i.test(String(error?.message || error)) ? 'missing' : 'read-failed';
+    }
+    return evidence;
+}
+
+// Read-only IPC for AutoBuy cleanup. Only the installed AutoBuy extension may
+// ask about a single ID; no account, URL, order or authentication data leaves.
+function parserTabOwnershipReply(state, tabId) {
+    const reply = { action: 'parserTabOwnershipV1', tabId, known: false, owned: false };
+    if (!Number.isInteger(tabId) || tabId <= 0) return reply;
+    const run = state.pipelineRun;
+    const stage = state.pipelineStage;
+    const runActive = ['starting', 'running'].includes(run?.status);
+    const screenshotMarkers = [state.parserScreenshotReuseTab, state.parserScreenshotLocalTab];
+    const screenshotWork = screenshotMarkers.some(Boolean)
+        || !!state.screenshotQueueBlocked
+        || Number.isFinite(state.screenshotStageBudget?.activeSince)
+        || (state.trackScreenshotQueue != null
+            && (!Array.isArray(state.trackScreenshotQueue) || state.trackScreenshotQueue.length > 0));
+    const pendingWork = !!state.amazonStageFinalizing || !!state.iherbStageFinalizing
+        || !!state.pendingAccountSwitch || !!state.pendingIherbSwitch
+        || !!state.autoParsePending || state.parsingState?.isParsingAllStores === true;
+    if (!runActive && stage?.active !== true && !screenshotWork && !pendingWork) {
+        return { ...reply, known: true };
+    }
+    const coherentStage = !!run?.id && stage?.runId === run.id
+        && Number.isFinite(stage.stageStartedAt);
+    // Exact screenshot ownership survives a terminal run while its durable
+    // queue/finalizer is still draining. A mismatched generation stays unknown.
+    if (coherentStage && screenshotWork && screenshotMarkers.some(marker =>
+        marker?.tabId === tabId && marker.runId === run.id
+        && marker.stageStartedAt === stage.stageStartedAt)) {
+        return { ...reply, known: true, owned: true };
+    }
+    if (coherentStage && runActive && stage.active === true
+        && [state.amazonParserTabId, state.iherbParserTabId, state.ebayParserTabId].includes(tabId)) {
+        return { ...reply, known: true, owned: true };
+    }
+    // During work, absence from saved IDs is NOT proof of foreign ownership:
+    // tabs.create may have returned while its ID has not yet reached storage.
+    // Cleanup resumes only after the parser and its pending work are quiescent.
+    return reply;
+}
+
+function handleParserTabOwnershipMessage(request, sender, sendResponse) {
+    if (sender?.id !== 'ppcgaihnphmgololipboonimikclclgc'
+        || request?.action !== 'parserTabOwnershipV1'
+        || !Number.isInteger(request.tabId) || request.tabId <= 0) return false;
+    chrome.storage.local.get([
+        'pipelineRun', 'pipelineStage', 'amazonParserTabId', 'iherbParserTabId',
+        'ebayParserTabId', 'parserScreenshotReuseTab', 'parserScreenshotLocalTab',
+        'trackScreenshotQueue', 'screenshotQueueBlocked', 'screenshotStageBudget',
+        'amazonStageFinalizing', 'iherbStageFinalizing', 'pendingAccountSwitch',
+        'pendingIherbSwitch', 'autoParsePending', 'parsingState'
+    ]).then(state => sendResponse(parserTabOwnershipReply(state, request.tabId)))
+      .catch(() => sendResponse({ action: 'parserTabOwnershipV1', tabId: request.tabId, known: false, owned: false }));
+    return true;
+}
+chrome.runtime.onMessageExternal?.addListener(handleParserTabOwnershipMessage);
+
+async function rememberParserScreenshotTab(tabId, key) {
+    const state = await chrome.storage.local.get(['pipelineRun', 'pipelineStage']);
+    await chrome.storage.local.set({ [key]: {
+        tabId,
+        runId: state.pipelineRun?.id || null,
+        stageStartedAt: state.pipelineStage?.stageStartedAt || null
+    } });
+}
+
+async function forgetParserScreenshotTab(tabId, key) {
+    const state = await chrome.storage.local.get([key]);
+    if (state[key]?.tabId === tabId) await chrome.storage.local.remove(key);
+}
+
 function amazonWatchdogAttemptFromState(state) {
     return {
         runId: state?.pipelineRun?.id || null,
@@ -7129,12 +7219,14 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             // Capture the exact parser tab through CDP. captureVisibleTab(windowId)
             // photographed whichever unrelated tab was active in that window and
             // made the old incident frame untrustworthy.
-            let evidence = { tabId: null, tabUrl: null, tabTitle: null };
+            let evidence = await readAmazonTimeoutTabEvidence(stored.amazonParserTabId);
             let evidencePhoto = '';
             try {
                 const tab = await getAmazonParserTab(stored.amazonParserTabId);
                 if (tab?.id) {
                     evidence = {
+                        ...evidence,
+                        tabState: 'parser-page',
                         tabId: tab.id,
                         tabUrl: (tab.url || '').slice(0, 300),
                         tabTitle: (tab.title || '').slice(0, 200),
@@ -7143,6 +7235,8 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
                         navigation: stored.amazonPaginationState?.navigation || null
                     };
                     evidencePhoto = await captureAmazonTabWithDebugger(tab.id) || '';
+                } else if (evidence.tabState === 'live') {
+                    evidence.tabState = 'url-rejected';
                 }
             } catch (e) { console.warn('timeout-screenshot failed:', e?.message || e); }
 
@@ -9030,6 +9124,8 @@ async function processScreenshotQueue() {
         console.warn('⚠️ Не удалось создать reusable tab, fallback на per-item create:', e?.message || e);
     }
 
+    if (reuseTab?.id) await rememberParserScreenshotTab(reuseTab.id, 'parserScreenshotReuseTab');
+
     // Живой набор уже отправленных треков — для ПОштучного дедупа прямо в цикле.
     // filterAlreadySent (выше) фильтрует очередь ОДИН раз, батчем, до цикла. Но
     // queueTrackScreenshot доливает items в очередь ПОКА идёт парсинг, а слив
@@ -9185,7 +9281,10 @@ async function processScreenshotQueue() {
 
     // Закрыть переиспользуемую вкладку (если не оставлена для решения капчи)
     if (reuseTab && !captchaPaused) {
-        try { await chrome.tabs.remove(reuseTab.id); } catch (_) {}
+        try {
+            await chrome.tabs.remove(reuseTab.id);
+            await forgetParserScreenshotTab(reuseTab.id, 'parserScreenshotReuseTab');
+        } catch (_) {}
     }
 
     await persistScreenshotQueue();
@@ -9797,6 +9896,8 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
             createdLocally = true;
         }
 
+        if (createdLocally && tab?.id) await rememberParserScreenshotTab(tab.id, 'parserScreenshotLocalTab');
+
         await new Promise(resolve => {
             function onUpdated(tabId, info) {
                 if (tabId === tab.id && info.status === 'complete') {
@@ -10097,7 +10198,10 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
         // Закрываем только если сами создали локальную вкладку (без reuseTabId).
         // reuse-таб закроет processScreenshotQueue после всего цикла.
         if (tab && createdLocally && !keepTabOpen) {
-            try { await chrome.tabs.remove(tab.id); } catch (_) {}
+            try {
+                await chrome.tabs.remove(tab.id);
+                await forgetParserScreenshotTab(tab.id, 'parserScreenshotLocalTab');
+            } catch (_) {}
         }
     }
     if (capturedTracks.size === 0 && expectedTracks.length > 0) {

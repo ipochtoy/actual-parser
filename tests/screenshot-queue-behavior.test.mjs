@@ -132,6 +132,7 @@ function makeProcessHarness({ queue, activeIherb = 'questburgh@gmail.com', activ
           return Object.fromEntries(list.map(key => [key, storage[key]]));
         },
         set: async value => Object.assign(storage, clone(value)),
+        remove: async key => { delete storage[key]; },
       } },
       tabs: {
         create: async () => ({ id: 91 }),
@@ -144,6 +145,8 @@ function makeProcessHarness({ queue, activeIherb = 'questburgh@gmail.com', activ
   vm.runInContext(`
     ${extractFunction('screenshotQueueKey')}
     ${extractFunction('mergePersistedScreenshotQueue')}
+    ${extractFunction('rememberParserScreenshotTab')}
+    ${extractFunction('forgetParserScreenshotTab')}
     ${extractFunction('processScreenshotQueue')}
   `, context);
   return { context, storage, writes, markCalls, tabUpdates, run: () => context.processScreenshotQueue() };
