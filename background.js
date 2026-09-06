@@ -7793,39 +7793,118 @@ async function uploadToSheets(runId = null) {
         const existing = await readSheetData(spreadsheetId, sheetName) || [];
 
         let newValues = [];
-        let rowsToUpdate = []; // {row: 1-based index, qty: new qty value}
+        let rowsToUpdate = []; // exact warehouse observations, including all equivalent copies
+        const warehouseKey = r => [r[0]||'', r[1]||'', r[2]||'', r[3]||'', r[8]||''].join('\u0001');
+        const warehouseCells = r => Array.from({ length: 11 }, (_, i) => String(r?.[i] ?? ''));
+        const warehouseGroups = rows => {
+            const groups = new Map();
+            rows.forEach((cells, index) => {
+                const key = warehouseKey(cells);
+                if (!groups.has(key)) groups.set(key, []);
+                groups.get(key).push({ row: index + 1, cells: warehouseCells(cells) });
+            });
+            return groups;
+        };
+        const warehouseSnapshots = new Map();
         
         if (parseMode === 'financial') {
              const existingKeys = new Set(existing.map(r => (r[0]||'') + '_' + (r[1]||'')));
              newValues = values.filter(r => !existingKeys.has(r[0] + '_' + r[1]));
         } else {
-             const headerOffset = existing.length > 0 && existing[0].length > 1 && /store/i.test(existing[0][0] || '') ? 1 : 0;
-             const existingRows = existing.slice(headerOffset);
-
              // Key WITHOUT qty: store + order + track + product + account_name (col I = idx 8)
-             const existingMap = new Map();
-             existingRows.forEach((r, idx) => {
-                 const key = [r[0]||'', r[1]||'', r[2]||'', r[3]||'', r[8]||''].join('\u0001');
-                 const existingQty = r[4] ?? '';   // пустой qty остаётся пустым: «не нашли» ≠ «одна штука»
-                 existingMap.set(key, { rowIndex: idx + headerOffset + 1, qty: existingQty }); // 1-based row in sheet
-             });
-
-             for (const r of values) {
-                 const key = [r[0], r[1], r[2], r[3], r[8]||''].join('\u0001');
-                 const newQty = r[4] ?? '';        // пустой qty остаётся пустым: «не нашли» ≠ «одна штука»
-
-                 if (existingMap.has(key)) {
-                     const existing = existingMap.get(key);
-                     // Check if qty changed
-                     if (existing.qty !== newQty) {
-                         rowsToUpdate.push({ row: existing.rowIndex, qty: newQty }); // rowIndex already 1-based
-                         console.log(`📝 Will update row ${existing.rowIndex}: qty ${existing.qty} → ${newQty}`);
+             const existingMap = warehouseGroups(existing);
+             const incomingMap = warehouseGroups(values);
+             const incomingKeys = new Set();
+             const meaningfulColor = value => /^(?:DONE\b|⚠️ РАЗНЫЕ ЗАКАЗЫ$)/i.test(value) ? '' : value;
+             for (const [index, raw] of values.entries()) {
+                 const r = warehouseCells(raw), key = warehouseKey(r);
+                 if (incomingKeys.has(key)) continue; // the complete group was handled together
+                 incomingKeys.add(key);
+                 const copies = existingMap.get(key);
+                 const incoming = incomingMap.get(key);
+                 // Repeated input can be real separate positions (for example five
+                 // eBay hair-color items). Preserve their multiplicity, never sum.
+                 if (!copies) {
+                     newValues.push(...incoming.map(copy => values[copy.row - 1]));
+                     continue;
+                 }
+                 if (incoming.length > 1) {
+                     const multiset = group => group.map(({ cells }) => JSON.stringify([
+                         cells[4], meaningfulColor(cells[5]), cells[6], cells[10]
+                     ])).sort();
+                     if (JSON.stringify(multiset(incoming)) !== JSON.stringify(multiset(copies))) {
+                         throw new Error('Ambiguous changed or repeated Parser item in Sheets upload');
                      }
-                     // Skip adding as new (it exists)
-                 } else {
-                     newValues.push(r);
+                     // Exact unchanged positions already exist. Do not rewrite J,
+                     // variants, quantity or notes, and do not delete any copies.
+                     continue;
+                 }
+                 warehouseSnapshots.set(key, copies);
+                 const sizes = new Set(copies.map(x => x.cells[6]));
+                 const colors = new Set(copies.map(x => meaningfulColor(x.cells[5])).filter(Boolean));
+                 if (sizes.size !== 1 || !sizes.has(r[6]) || colors.size > 1
+                     || (colors.size === 1 && !colors.has(meaningfulColor(r[5])))) {
+                     throw new Error('Ambiguous variant in existing Sheets item');
+                 }
+                 const notes = new Set(copies.map(x => x.cells[10]));
+                 const managedNote = note => note === '' || note === 'состав не разобран';
+                 if (copies.length > 1 && notes.size > 1 && [...notes].some(note => !managedNote(note))) {
+                     throw new Error('Conflicting custom composition notes in Sheets copies');
+                 }
+                 const qtyConflict = new Set(copies.map(x => x.cells[4])).size > 1;
+                 const positiveQty = /^[1-9]\d*$/.test(r[4]) && Number.isSafeInteger(Number(r[4]));
+                 if (qtyConflict && (allOrders[index].composition_parsed !== true || !positiveQty)) {
+                     throw new Error('Conflicting Sheets quantities require a complete exact Parser item');
+                 }
+                 for (const copy of copies) {
+                     const parsed = allOrders[index].composition_parsed === true && positiveQty;
+                     const note = !managedNote(copy.cells[10]) ? copy.cells[10]
+                         : parsed ? '' : r[10] === 'состав не разобран' ? r[10] : copy.cells[10];
+                     if (copy.cells[4] === r[4] && copy.cells[10] === note) continue;
+                     rowsToUpdate.push({ row: copy.row, key, qty: r[4], stamp: r[9], note,
+                         qtyChanged: copy.cells[4] !== r[4], noteChanged: copy.cells[10] !== note });
                  }
              }
+        }
+
+        // Update only E/J/K. Recheck the exact copies immediately before writing:
+        // a moved row or a changed observation must never receive this update.
+        if (rowsToUpdate.length > 0) {
+            const authToken = await getAuthToken(false);
+            const fresh = warehouseGroups(await readSheetData(spreadsheetId, sheetName, { interactive: false }));
+            for (const key of new Set(rowsToUpdate.map(u => u.key))) {
+                if (JSON.stringify(fresh.get(key)) !== JSON.stringify(warehouseSnapshots.get(key))) {
+                    throw new Error('Sheets item changed before observation update');
+                }
+            }
+            const updateData = rowsToUpdate.flatMap(u => [
+                ...(u.qtyChanged ? [{ range: `${sheetName}!E${u.row}`, values: [[u.qty]] }] : []),
+                { range: `${sheetName}!J${u.row}`, values: [[u.stamp]] },
+                ...(u.noteChanged ? [{ range: `${sheetName}!K${u.row}`, values: [[u.note]] }] : [])
+            ]);
+
+            const updateResponse = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchUpdate`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${authToken}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ valueInputOption: 'RAW', data: updateData })
+            });
+            if (!updateResponse.ok) {
+                const errorText = await updateResponse.text().catch(() => '');
+                throw new Error(`Google Sheets observation update failed: ${updateResponse.status} ${errorText}`.trim());
+            }
+            const after = warehouseGroups(await readSheetData(spreadsheetId, sheetName, { interactive: false }));
+            const updates = new Map(rowsToUpdate.map(u => [u.row, u]));
+            for (const key of new Set(rowsToUpdate.map(u => u.key))) {
+                const expected = warehouseSnapshots.get(key).map(copy => {
+                    const update = updates.get(copy.row), cells = [...copy.cells];
+                    if (update) { cells[4] = update.qty; cells[9] = update.stamp; cells[10] = update.note; }
+                    return { row: copy.row, cells };
+                });
+                if (JSON.stringify(after.get(key)) !== JSON.stringify(expected)) {
+                    throw new Error('Sheets observation update readback was not confirmed');
+                }
+            }
+            console.log(`✅ Confirmed ${rowsToUpdate.length} updated Sheets observations`);
         }
 
         // 🆕 Счётчик новизны прогона — сколько РЕАЛЬНО новых строк и трек-номеров ушло
@@ -7855,35 +7934,13 @@ async function uploadToSheets(runId = null) {
                     rows: newValues.length,
                     tracks: newTrackSet.size,
                     byShop: byShopTracks,
-                    qtyUpdated: rowsToUpdate.length,
+                    qtyUpdated: rowsToUpdate.filter(row => row.qtyChanged).length,
                     at: Date.now()
                 };
                 parseReport.newUploads = newUploads;
                 await chrome.storage.local.set({ lastUpload: newUploads });
                 console.log(`🆕 Новых в листе: ${newUploads.tracks} треков / ${newUploads.rows} строк`, byShopTracks);
             } catch (e) { console.warn('newUploads counter failed:', e?.message || e); }
-        }
-
-        // Update existing rows with new qty
-        if (rowsToUpdate.length > 0) {
-            console.log(`📝 Updating ${rowsToUpdate.length} rows with new qty...`);
-            const authToken = await getAuthToken(true);
-            const updateData = rowsToUpdate.map(u => ({
-                range: `${sheetName}!E${u.row}`,
-                values: [[u.qty]]
-            }));
-            
-            const updateResponse = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchUpdate`, {
-                method: 'POST',
-                headers: { 'Authorization': `Bearer ${authToken}`, 'Content-Type': 'application/json' },
-                body: JSON.stringify({ valueInputOption: 'USER_ENTERED', data: updateData })
-            });
-            if (!updateResponse.ok) {
-                const errorText = await updateResponse.text().catch(() => '');
-                throw new Error(`Google Sheets qty update failed: ${updateResponse.status} ${errorText}`.trim());
-            }
-            console.log(`✅ Updated ${rowsToUpdate.length} qty values`);
-            console.log(`📝 Updated qty in ${rowsToUpdate.length} rows`);
         }
 
         if (newValues.length === 0 && rowsToUpdate.length === 0) {
@@ -7902,7 +7959,7 @@ async function uploadToSheets(runId = null) {
         if (newValues.length === 0) {
             // Only updates, no new rows
             if (parseMode === 'warehouse') await replayScreenshotLinks({ spreadsheetId, sheetName });
-            chrome.runtime.sendMessage({ action: 'uploadComplete', status: 'success', message: `✅ Updated qty in ${rowsToUpdate.length} rows.` });
+            chrome.runtime.sendMessage({ action: 'uploadComplete', status: 'success', message: `✅ Updated observations in ${rowsToUpdate.length} rows.` });
             
             if (parseMode === 'warehouse' && result.chainPochtoy) {
                  console.log('🔗 Chaining Pochtoy automation...');

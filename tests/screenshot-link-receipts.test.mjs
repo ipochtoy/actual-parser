@@ -54,10 +54,10 @@ function harness({ storage = {}, rows = [] } = {}) {
       calls.writes.push(clone(body));
       if (faults.sheetWrite) return { ok: false, status: 503, text: async () => 'fixture failure' };
       for (const entry of body.data) {
-        const match = /^(?:'Лист1'|Лист1)!(H|E)(\d+)$/.exec(entry.range);
-        assert.ok(match, `only H or an explicitly tested qty upload can change: ${entry.range}`);
+        const match = /^(?:'Лист1'|Лист1)!(H|E|J|K)(\d+)$/.exec(entry.range);
+        assert.ok(match, `only H or an explicitly tested observation upload can change: ${entry.range}`);
         assert.ok(match[1] === 'H' || faults.allowQtyWrites);
-        if (!faults.staleReadback) h.rows[Number(match[2]) - 1][match[1] === 'H' ? 7 : 4] = entry.values[0][0];
+        if (!faults.staleReadback) h.rows[Number(match[2]) - 1][{ H: 7, E: 4, J: 9, K: 10 }[match[1]]] = entry.values[0][0];
       }
       return { ok: true, status: 200, json: async () => ({}) };
     },
