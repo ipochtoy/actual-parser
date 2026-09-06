@@ -291,36 +291,39 @@
   // от «рамку товара найти не удалось». Во втором случае цифру НЕ выдумываем: пустой
   // qty поднимает в листе пометку «состав не разобран».
   function extractQuantityFromDOM(scope, shipmentBox, positionsInShipment) {
+    // A quantity belongs to one physical item row. Never climb to a delivery
+    // box containing siblings: a badge on item 2 otherwise becomes every qty.
+    if (!scope?.closest || !scope?.matches) return null;
+    const itemRoot = scope.closest('.yohtmlc-item, [data-test-id="item-row"]')
+      || scope.closest('.a-fixed-left-grid-inner')
+      || (scope.matches('.a-row') ? scope : null);
+    if (!itemRoot || (shipmentBox && itemRoot !== shipmentBox && !shipmentBox.contains(itemRoot))) return null;
+    const ownLinks = Array.from(itemRoot.querySelectorAll(SHIPMENT.PRODUCT_LINK_SELECTOR));
+    const ownAsins = new Set(ownLinks.map(link => String(link.getAttribute('href') || link.href || '')
+      .match(/\/(?:dp|product)\/([A-Z0-9]{8,10})/i)?.[1]?.toUpperCase()).filter(Boolean));
+    if (ownAsins.size !== 1 || itemRoot.querySelectorAll('.yohtmlc-item, [data-test-id="item-row"]').length > 1) return null;
+    scope = itemRoot;
+    const insideItem = node => node && (node === itemRoot || itemRoot.contains(node));
+    const badgeQuantity = badges => {
+      const texts = Array.from(badges).map(el => String(el.textContent || '').trim());
+      if (!texts.length) return undefined;
+      if (texts.some(text => !/^[1-9]\d*$/.test(text))) return null;
+      const values = new Set(texts.map(text => Number(text)));
+      return values.size === 1 ? String([...values][0]) : null;
+    };
     // 1. ПЕРВЫМ ДЕЛОМ: Ищем span.product-image__qty (точный селектор Amazon)
-    const qtySpan = scope.querySelector('span.product-image__qty, .product-image__qty');
-    if (qtySpan) {
-      const text = qtySpan.textContent?.trim();
-      if (text && /^\d+$/.test(text)) {
-        console.log(`  📊 QTY found via .product-image__qty: ${text}`);
-        return text;
-      }
-    }
-    
-    // 2. Ищем в родительских элементах (если scope слишком узкий)
-    let parent = scope.parentElement;
-    for (let i = 0; i < 5 && parent; i++) {
-      const qtyInParent = parent.querySelector('span.product-image__qty, .product-image__qty');
-      if (qtyInParent) {
-        const text = qtyInParent.textContent?.trim();
-        if (text && /^\d+$/.test(text)) {
-          console.log(`  📊 QTY found via parent .product-image__qty: ${text}`);
-          return text;
-        }
-      }
-      parent = parent.parentElement;
-    }
+    const itemBadgeQty = badgeQuantity(scope.querySelectorAll('span.product-image__qty, .product-image__qty'));
+    if (itemBadgeQty !== undefined) return itemBadgeQty;
+    // An unreadable explicit quantity must never fall through to a guessed 1.
+    const genericBadgeQty = badgeQuantity(scope.querySelectorAll('[class*="qty"], [class*="quantity"], [class*="count"], [class*="badge"]'));
+    if (genericBadgeQty !== undefined) return genericBadgeQty;
     
     // 3. Ищем картинку товара и число рядом с ней
     const img = scope.querySelector('img[alt]');
     if (img) {
       // Ищем в родительских элементах картинки (до 5 уровней)
       let container = img.parentElement;
-      for (let i = 0; i < 5 && container; i++) {
+      for (let i = 0; i < 5 && insideItem(container); i++) {
         // Ищем все текстовые узлы и элементы с числами
         const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null, false);
         let node;
@@ -346,7 +349,7 @@
     
     for (const sel of itemContainers) {
       const itemEl = scope.closest(sel) || scope.querySelector(sel);
-      if (itemEl) {
+      if (insideItem(itemEl)) {
         // Ищем элементы которые содержат только число
         const allElements = itemEl.querySelectorAll('span, div');
         for (const el of allElements) {
@@ -400,18 +403,13 @@
     // в отправке один — иначе легко утащить цифру соседнего товара.
     if (shipmentBox && positionsInShipment === 1 && shipmentBox.querySelectorAll) {
       const badges = shipmentBox.querySelectorAll('span.product-image__qty, .product-image__qty');
-      if (badges.length === 1) {
-        const badgeText = badges[0].textContent?.trim();
-        if (badgeText && /^\d+$/.test(badgeText)) {
-          console.log(`  📊 QTY found via shipment badge: ${badgeText}`);
-          return badgeText;
-        }
-      }
+      const shipmentQty = badgeQuantity(badges);
+      if (shipmentQty !== undefined) return shipmentQty;
     }
 
     // Рамка позиции опознана, значка на ней нет — у Amazon значок появляется только
-    // от двух штук, поэтому это честная одна штука. Значок с соседних уровней шаг 2
-    // выше уже искал, так что «нет значка» здесь означает именно единицу.
+    // от двух штук, поэтому это честная одна штука. Проверили именно свою позицию,
+    // никакой значок соседнего товара в эту проверку попасть не мог.
     // Картинку внутри рамки НЕ требуем: у Amazon рамкой позиции бывает и строка с одним
     // названием — потребуй мы картинку, пометка «состав не разобран» полезла бы на
     // обычные строки и перестала что-либо значить.
@@ -908,6 +906,55 @@
     return { cancelled: false };
   }
 
+  // itemId in Track URLs is an opaque order-line token, not an ASIN and not a
+  // required component of product hrefs. Bind the complete product set to the
+  // exact order/Track button and isolated shipment DOM instead.
+  function amazonShipmentCompositionReasons(shipment, card, trackBtn, trackUrl, orderId, products) {
+    const reasons = [];
+    const box = shipment?.box;
+    if (!shipment?.isolated) reasons.push(shipment?.reason || 'scope-multi-track');
+    if (!box || !(box === card || card?.contains(box)) || !box.contains(trackBtn)) {
+      reasons.push('shipment-outside-order');
+      return reasons;
+    }
+    try {
+      const url = new URL(trackUrl, location.href);
+      const actual = new URL(trackBtn.getAttribute('href') || trackBtn.href, location.href);
+      const orderIds = [...url.searchParams].filter(([key]) => /^orderid$/i.test(key)).map(([,value]) => value);
+      if (url.protocol !== 'https:' || !['www.amazon.com', 'amazon.com'].includes(url.hostname)
+          || !/ship-track|track-package|progress-tracker/.test(url.pathname)
+          || url.href !== actual.href || orderIds.length !== 1 || orderIds[0] !== orderId) {
+        reasons.push('track-order-context-unproven');
+      }
+    } catch (_) { reasons.push('track-order-context-unproven'); }
+    const buttons = Array.from(box.querySelectorAll(SHIPMENT.TRACK_BUTTON_SELECTOR));
+    try {
+      const target = new URL(trackUrl, location.href).href;
+      const targets = new Set(buttons.map(button => new URL(button.getAttribute('href') || button.href, location.href).href));
+      if (!buttons.includes(trackBtn) || targets.size !== 1 || !targets.has(target)) reasons.push('shipment-track-not-exclusive');
+    } catch (_) { reasons.push('shipment-track-not-exclusive'); }
+    const complete = SHIPMENT.collectShipmentProducts(box);
+    if (!products.length || complete.length !== products.length || new Set(products).size !== products.length
+        || products.some(link => !box.contains(link) || !complete.includes(link))) reasons.push('shipment-products-incomplete');
+    return [...new Set(reasons)];
+  }
+
+  function finalizeAmazonShipmentComposition(composition, orders) {
+    const reasons = String(composition.reason || '').split('+').filter(Boolean);
+    if (orders.length !== composition.positions || !orders.length) reasons.push('shipment-products-unparsed');
+    if (orders.some(row => row.qty === null || row.qty === undefined || String(row.qty).trim() === ''
+        || !Number.isInteger(Number(row.qty)) || Number(row.qty) <= 0)) reasons.push('empty-qty');
+    const tracks = orders.map(row => String(row.track_number || '').trim());
+    if (tracks.some(track => !track) || new Set(tracks).size !== 1) reasons.push('shipment-track-inconsistent');
+    composition.reason = [...new Set(reasons)].join('+');
+    composition.parsed = composition.parsed && reasons.length === 0;
+    for (const row of orders) {
+      row.composition_parsed = composition.parsed;
+      row.composition_reason = composition.reason;
+    }
+    return composition;
+  }
+
   async function parseAmazonOrders(currentPage = 1, totalPages = 1) {
     console.log(`\n📦 Запуск парсера Amazon для страницы ${currentPage}/${totalPages}`);
 
@@ -1008,21 +1055,13 @@
             // кукол уехал в лист одной строкой (114-4364449-9800232, 02.09.2026).
             const shipment = SHIPMENT.shipmentScope(trackBtn, card);
             let productsToProcess = shipment.box ? SHIPMENT.collectShipmentProducts(shipment.box) : [];
-            const compositionReasons = [];
-            if (!shipment.isolated) compositionReasons.push(shipment.reason || 'scope-multi-track');
+            const compositionReasons = amazonShipmentCompositionReasons(shipment, card, trackBtn, trackUrl, orderId, productsToProcess);
             console.log(`  📦 Рамка отправки: ${shipment.box ? (shipment.box.className || shipment.box.tagName) : '—'}, товаров в ней: ${productsToProcess.length}`);
 
-            // itemId из ссылки кнопки — теперь только ПРОВЕРКА, а не поиск: если в
-            // рамке нет товара с этим itemId, значит рамку взяли не ту.
+            // Opaque itemId is only a legacy fallback hint. Complete composition
+            // is proved above by the exact order/Track URL and shipment boundary.
             const itemIdMatch = trackUrl.match(/itemId=([^&]+)/);
             const itemId = itemIdMatch ? itemIdMatch[1] : null;
-            if (itemId && productsToProcess.length) {
-              const hit = productsToProcess.some(link => String(link.getAttribute('href') || link.href || '').includes(itemId));
-              if (!hit) {
-                console.log(`  ⚠️ В рамке отправки нет товара с itemId ${itemId}`);
-                compositionReasons.push('itemId-not-in-box');
-              }
-            }
 
             // Запасная дорога 1: рамка пуста — ищем товар по itemId во всей карточке.
             if (!productsToProcess.length && itemId) {
@@ -1063,6 +1102,7 @@
             
             let shipmentTrack = '';
             let emptyQtySeen = false;
+            const shipmentOrders = [];
             for (let prodIdx = 0; prodIdx < productsToProcess.length; prodIdx++) {
               const prod = productsToProcess[prodIdx];
               const order = await parseIndividualItemSimpleByTrackUrl(card, prod, orderId, trackUrl, parserAccount, composition);
@@ -1077,13 +1117,22 @@
                     console.log(`  💰 Order attached financial data: ${JSON.stringify(financialData)}`);
                 }
                 // -----------------------
+                // A later item may throw before the shipment loop finishes.
+                // Retain observations, but never leave earlier rows green then.
+                order.composition_parsed = false;
+                order.composition_reason = 'shipment-not-finalized';
                 allOrders.push(order);
+                shipmentOrders.push(order);
                 cardOrders++;
                 console.log(`  ✅ Товар ${prodIdx + 1}/${productsToProcess.length}: ${order.product_name.substring(0, 50)}... | Трек: ${order.track_number}`);
                 // Log success
                 sendLog(order.order_id, order.track_number, '✅ Found', order.product_name.substring(0, 80));
               }
             }
+
+            // One failed product/unknown quantity invalidates the completeness
+            // claim for every row in this shipment, while preserving observations.
+            finalizeAmazonShipmentComposition(composition, shipmentOrders);
 
             // Состав отправки разобрать не смогли — говорим об этом вслух, один раз на
             // отправку. Молчаливая одна строка вместо четырёх стоила складу трёх кукол.
