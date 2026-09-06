@@ -916,7 +916,7 @@ async function removeToken(token) {
     return new Promise(resolve => chrome.identity.removeCachedAuthToken({ token }, resolve));
 }
 
-async function readSheetData(spreadsheetId, sheetName) {
+async function readSheetData(spreadsheetId, sheetName, { interactive = true } = {}) {
     async function attemptRead(interactive) {
         const token = await getAuthToken(interactive);
         if (!token) throw new Error("Authorization failed. No token received.");
@@ -938,11 +938,11 @@ async function readSheetData(spreadsheetId, sheetName) {
     }
 
     try {
-        return await attemptRead(true);
+        return await attemptRead(interactive);
     } catch (err) {
         console.warn('First read attempt failed, retrying with fresh auth...', err);
         try {
-            return await attemptRead(true);
+            return await attemptRead(interactive);
         } catch (finalErr) {
             console.error("Error reading Google Sheet:", finalErr);
             throw finalErr;
@@ -7116,6 +7116,8 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     
     if (alarm.name === SCREENSHOT_RESUME_ALARM) {
         try {
+            // Receipt publication also survives a restart with an empty capture queue.
+            await replayScreenshotLinks();
             const { trackScreenshotQueue: stored = [] } = await chrome.storage.local.get('trackScreenshotQueue');
             if (Array.isArray(stored) && stored.length > 0 && !isProcessingScreenshots) {
                 console.log(`⏰ screenshotResume: ${stored.length} stuck in queue, resuming`);
@@ -7725,6 +7727,7 @@ async function uploadToSheets(runId = null) {
 
         if (allOrders.length === 0) {
             if (runId) throw new Error(`No parsed rows belong to pipeline run ${runId}`);
+            if (parseMode === 'warehouse') await replayScreenshotLinks({ spreadsheetId, sheetName });
             console.log('No parsed data to upload.');
             console.log('ℹ️ No data to upload');
             
@@ -7757,7 +7760,7 @@ async function uploadToSheets(runId = null) {
         } else {
             // Warehouse Mode: 11 columns A-K.
             // A store | B order_id | C track | D product | E qty | F color | G size |
-            // H screenshot_link (written separately by writeScreenshotLinkToSheet) | I account_name |
+            // H screenshot_link (published from durable screenshot receipts) | I account_name |
             // J кто и когда снял строку | K пометка про состав отправки.
             //
             // Колонку F не занимаем: её затирает markRowsDone («DONE …») и читает
@@ -7884,6 +7887,7 @@ async function uploadToSheets(runId = null) {
         }
 
         if (newValues.length === 0 && rowsToUpdate.length === 0) {
+            if (parseMode === 'warehouse') await replayScreenshotLinks({ spreadsheetId, sheetName });
             console.log('Nothing new to upload.');
             chrome.runtime.sendMessage({ action: 'uploadComplete', status: 'info', message: 'Nothing new to upload (duplicates).' });
             console.log('ℹ️ All duplicates, nothing new to upload');
@@ -7897,6 +7901,7 @@ async function uploadToSheets(runId = null) {
         
         if (newValues.length === 0) {
             // Only updates, no new rows
+            if (parseMode === 'warehouse') await replayScreenshotLinks({ spreadsheetId, sheetName });
             chrome.runtime.sendMessage({ action: 'uploadComplete', status: 'success', message: `✅ Updated qty in ${rowsToUpdate.length} rows.` });
             
             if (parseMode === 'warehouse' && result.chainPochtoy) {
@@ -7907,6 +7912,7 @@ async function uploadToSheets(runId = null) {
         }
 
         await writeDataToSheet(spreadsheetId, sheetName, newValues);
+        if (parseMode === 'warehouse') await replayScreenshotLinks({ spreadsheetId, sheetName });
 
         console.log(`✅ Uploaded ${newValues.length} new items, updated ${rowsToUpdate.length} qty.`);
         const updatedMsg = rowsToUpdate.length > 0 ? `, updated qty in ${rowsToUpdate.length}` : '';
@@ -8935,7 +8941,7 @@ async function itemsCaptionLine(orderId, trackNumber, budget = 620) {
 async function sendScreenshotToArchive(base64Data, caption) {
     if (!tgBotToken || !tgPhotoChatId) {
         console.warn('⚠️ Cannot send screenshot to archive - missing token or tgPhotoChatId');
-        return { ok: false };
+        return { ok: false, definitelyNotSent: true };
     }
 
     // Подготовка blob
@@ -8990,7 +8996,7 @@ async function sendScreenshotToArchive(base64Data, caption) {
 
         if (!res.ok || !json?.ok) {
             console.error(`❌ Archive send failed (photo+doc): photo=${JSON.stringify(photoJson)}, final=${JSON.stringify(json)}`);
-            return { ok: false };
+            return { ok: false, definitelyNotSent: json?.ok === false };
         }
 
         const messageId = json.result?.message_id;
@@ -9005,6 +9011,176 @@ async function sendScreenshotToArchive(base64Data, caption) {
         return { ok: false };
     }
 }
+
+// BEGIN DURABLE SCREENSHOT ARCHIVE RECEIPTS
+// Delivery and Sheet publication are separate acknowledgements. A sending intent
+// survives an uncertain Telegram response or a worker crash: never blindly resend.
+let screenshotArchiveWriteChain = Promise.resolve();
+let screenshotLinkReplayChain = Promise.resolve();
+
+function screenshotArchiveIdentity(value) {
+    const text = x => String(x || '').trim();
+    const store = text(value?.store).toLowerCase();
+    const tracks = [...new Set((value?.tracks || []).map(text).filter(Boolean))].sort();
+    if (!['amazon', 'ebay', 'iherb'].includes(store) || !text(value?.orderId) || !tracks.length) {
+        throw new Error('screenshot archive identity incomplete');
+    }
+    return { store, orderId: text(value.orderId), accountName: text(value.accountName).toLowerCase(),
+        tracks, page: Math.max(1, Math.floor(Number(value.page) || 1)) };
+}
+
+function screenshotArchiveKey(identity) {
+    return JSON.stringify([identity.store, identity.orderId, identity.accountName, identity.tracks, identity.page]);
+}
+
+async function readScreenshotArchiveLedger() {
+    const state = await chrome.storage.local.get('screenshotArchiveLedger');
+    const ledger = state.screenshotArchiveLedger;
+    if (ledger == null) return { schemaVersion: 1, entries: {} };
+    if (ledger.schemaVersion !== 1 || !ledger.entries || typeof ledger.entries !== 'object' || Array.isArray(ledger.entries)) {
+        throw new Error('screenshot archive ledger unreadable');
+    }
+    for (const [key, entry] of Object.entries(ledger.entries)) {
+        if (!entry || !['sending', 'delivered', 'unknown'].includes(entry.state)
+            || key !== screenshotArchiveKey(screenshotArchiveIdentity(entry.identity))
+            || typeof entry.destination?.spreadsheetId !== 'string' || !entry.destination.spreadsheetId
+            || typeof entry.destination?.sheetName !== 'string' || !entry.destination.sheetName) {
+            throw new Error('screenshot archive receipt invalid');
+        }
+        if (entry.state === 'delivered' && !validScreenshotArchiveResponse(entry.archive)) {
+            throw new Error('screenshot archive acknowledgement invalid');
+        }
+    }
+    return ledger;
+}
+
+function validScreenshotArchiveResponse(archive) {
+    const id = Number(archive?.messageId);
+    const chat = String(archive?.chatId || '');
+    return Number.isSafeInteger(id) && id > 0 && /^-100\d+$/.test(chat)
+        && archive.link === `https://t.me/c/${chat.slice(4)}/${id}`;
+}
+
+async function archiveScreenshotWithReceipt(base64, caption, identityValue) {
+    const identity = screenshotArchiveIdentity(identityValue);
+    const key = screenshotArchiveKey(identity);
+    const task = screenshotArchiveWriteChain.catch(() => {}).then(async () => {
+        const ledger = await readScreenshotArchiveLedger();
+        const existing = ledger.entries[key];
+        if (existing?.state === 'delivered') return { ok: true, ...existing.archive, reusedReceipt: true };
+        if (existing) throw new Error('archive delivery uncertain; automatic resend prohibited');
+        // A producer can merge another track while archive delivery is in flight.
+        // A different set key is not permission to resend the uncertain old track.
+        if (Object.values(ledger.entries).some(prior => prior.state !== 'delivered'
+            && prior.identity.store === identity.store && prior.identity.orderId === identity.orderId
+            && prior.identity.accountName === identity.accountName && prior.identity.page === identity.page
+            && prior.identity.tracks.some(track => identity.tracks.includes(track)))) {
+            throw new Error('archive delivery uncertain; automatic resend prohibited');
+        }
+        const settings = await chrome.storage.local.get(['spreadsheetId', 'sheetName', 'pipelineRun']);
+        const configuredSheet = String(settings.spreadsheetId || DEFAULT_SPREADSHEET_ID);
+        const spreadsheetId = configuredSheet.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/)?.[1] || configuredSheet;
+        const entry = { identity, state: 'sending', startedAt: Date.now(),
+            runId: String(settings.pipelineRun?.id || '') || null,
+            destination: { spreadsheetId, sheetName: String(settings.sheetName || 'Лист1') } };
+        ledger.entries[key] = entry;
+        // Must commit before Telegram. Failure here means no external send occurred.
+        await chrome.storage.local.set({ screenshotArchiveLedger: ledger });
+        const archive = await sendScreenshotToArchive(base64, caption);
+        if (archive?.ok === false && archive.definitelyNotSent === true) {
+            // An explicit Telegram rejection is different from a missing ACK.
+            // Preserve the existing bounded delivery retry for proven no-send.
+            delete ledger.entries[key];
+            await chrome.storage.local.set({ screenshotArchiveLedger: ledger });
+            return archive;
+        }
+        if (!archive?.ok || !validScreenshotArchiveResponse(archive)) {
+            // The sender may have lost the response after Telegram accepted it.
+            // Keep the pre-send intent rather than manufacture an unsent verdict.
+            throw new Error('archive delivery uncertain; automatic resend prohibited');
+        }
+        entry.state = 'delivered';
+        entry.deliveredAt = Date.now();
+        entry.archive = { messageId: archive.messageId, chatId: String(archive.chatId), link: archive.link };
+        await chrome.storage.local.set({ screenshotArchiveLedger: ledger });
+        return { ok: true, ...entry.archive };
+    });
+    screenshotArchiveWriteChain = task.catch(() => {});
+    return task;
+}
+
+function screenshotLinkUpdates(rows, ledger, { spreadsheetId = DEFAULT_SPREADSHEET_ID, sheetName = 'Лист1' } = {}) {
+    const candidates = new Map();
+    for (const entry of Object.values(ledger.entries)) {
+        // A carousel's first page is its canonical H link. An unknown account
+        // cannot authorize a write to another cabinet's row (including blank I).
+        if (entry.state !== 'delivered' || entry.identity.page !== 1 || !entry.identity.accountName
+            || entry.destination.spreadsheetId !== spreadsheetId || entry.destination.sheetName !== sheetName) continue;
+        for (const track of entry.identity.tracks) {
+            const identityKey = JSON.stringify([entry.identity.store, entry.identity.orderId, track, entry.identity.accountName]);
+            if (!candidates.has(identityKey)) candidates.set(identityKey, new Set());
+            candidates.get(identityKey).add(entry.archive.link);
+        }
+    }
+    const updates = [];
+    for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        if (!Array.isArray(row)) continue;
+        const str = index => String(row[index] || '').trim();
+        const key = JSON.stringify([str(0).toLowerCase(), str(1), str(2), str(8).toLowerCase()]);
+        const links = candidates.get(key);
+        if (str(7) || links?.size !== 1) continue;
+        updates.push({ row: i + 1, link: [...links][0],
+            // Protect the complete existing row from drift between reads.
+            before: JSON.stringify(row) });
+    }
+    return updates;
+}
+
+async function replayScreenshotLinks({ spreadsheetId = null, sheetName = null } = {}) {
+    const task = screenshotLinkReplayChain.catch(() => {}).then(async () => {
+        await screenshotArchiveWriteChain;
+        const ledger = await readScreenshotArchiveLedger();
+        if (!Object.values(ledger.entries).some(entry => entry.state === 'delivered')) return { updated: 0 };
+        if (!spreadsheetId || !sheetName) {
+            const settings = await chrome.storage.local.get(['spreadsheetId', 'sheetName', 'parseMode']);
+            if (settings.parseMode === 'financial') return { updated: 0 };
+            const configuredSheet = String(settings.spreadsheetId || DEFAULT_SPREADSHEET_ID);
+            spreadsheetId ||= configuredSheet.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/)?.[1] || configuredSheet;
+            sheetName ||= String(settings.sheetName || 'Лист1');
+        }
+        const rows = await readSheetData(spreadsheetId, sheetName, { interactive: false });
+        if (!Array.isArray(rows)) throw new Error('screenshot link sheet unreadable');
+        const planned = screenshotLinkUpdates(rows, ledger, { spreadsheetId, sheetName });
+        if (!planned.length) return { updated: 0 };
+        const fresh = await readSheetData(spreadsheetId, sheetName, { interactive: false });
+        if (!Array.isArray(fresh)) throw new Error('screenshot link sheet recheck unreadable');
+        const updates = planned.filter(item => JSON.stringify(fresh[item.row - 1]) === item.before);
+        if (!updates.length) return { updated: 0 };
+        const token = await getAuthToken(false);
+        if (!token) throw new Error('screenshot link authorization unavailable');
+        const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchUpdate`, {
+            method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ valueInputOption: 'RAW', data: updates.map(item => ({
+                range: `'${sheetName.replace(/'/g, "''")}'!H${item.row}`, values: [[item.link]]
+            })) })
+        });
+        if (!res.ok) throw new Error(`screenshot link sheet update failed: ${res.status}`);
+        const after = await readSheetData(spreadsheetId, sheetName, { interactive: false });
+        if (!Array.isArray(after) || updates.some(item => {
+            const row = [...(after[item.row - 1] || [])];
+            if (row[7] !== item.link) return true;
+            row[7] = fresh[item.row - 1][7];
+            return JSON.stringify(row) !== item.before;
+        })) throw new Error('screenshot link sheet update not confirmed');
+        // Keep the receipt: retries and later item rows need the same archive
+        // acknowledgement. No sentScreenshots deletion or Telegram call here.
+        return { updated: updates.length };
+    });
+    screenshotLinkReplayChain = task.catch(() => {});
+    return task;
+}
+// END DURABLE SCREENSHOT ARCHIVE RECEIPTS
 
 async function queueTrackScreenshot(orderId, trackNumber, trackUrl, accountName) {
     // A queue message can be the very first event after an MV3 worker restart.
@@ -9082,6 +9258,13 @@ async function processScreenshotQueue() {
     await screenshotQueueReady;
     if (screenshotQueueInitError) {
         console.warn('⏸ Screenshot queue unavailable:', screenshotQueueInitError.message);
+        return false;
+    }
+    // Existing queue alarms also resume H publication after a worker restart,
+    // including when every screenshot has already been acknowledged as sent.
+    try { await replayScreenshotLinks(); }
+    catch (error) {
+        console.warn('Screenshot link publication pending:', error?.message || error);
         return false;
     }
     // SW мог уснуть после queueTrackScreenshot — merge очереди из storage.
@@ -10034,7 +10217,6 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
         // Amazon: карусель карточек товаров (до 3 страниц), снимаем captureVisibleTab по странице.
         // eBay/iHerb: страница заказа целиком — делаем full-page scroll+stitch один скрин на orderId.
         let screenshotsTaken = 0;
-        let firstPageLink = null;
 
         // === Ветка eBay: по скрину на каждую shipment-card (один заказ может содержать несколько отправок) ===
         if (isEbay) {
@@ -10054,9 +10236,9 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                     const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
                     const fallbackBase64 = dataUrl.replace(/^data:image\/png;base64,/, '');
                     const captionFallback = `📦 ${orderLink(orderId)}\n🚚 ${esc(trackNumber || '—')}${accountTag}`;
-                    const archive = await sendScreenshotToArchive(fallbackBase64, captionFallback);
+                    const archive = await archiveScreenshotWithReceipt(fallbackBase64, captionFallback,
+                        { store: 'ebay', orderId, accountName, tracks: expectedTracks });
                     if (!archive?.ok) throw new Error('eBay fallback archive failed');
-                    if (archive.link) firstPageLink = archive.link;
                     expectedTracks.forEach(track => capturedTracks.add(track));
                     screenshotsTaken++;
                 } else {
@@ -10085,14 +10267,10 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                         const itemLine = (await itemsCaptionLine(orderId, track))
                             || (s.itemName ? ('\n🛒 ' + esc(s.itemName)) : '');
                         const caption = `📦 ${orderLink(orderId)}${shipTag}\n${trackLine}${itemLine}${accountTag}`;
-                        const archive = await sendScreenshotToArchive(s.base64, caption);
+                        const archive = await archiveScreenshotWithReceipt(s.base64, caption,
+                            { store: 'ebay', orderId, accountName, tracks: [track] });
                         if (!archive?.ok) throw new Error(`eBay archive failed for ${track}`);
                         capturedTracks.add(track);
-                        if (archive.link) {
-                            if (!firstPageLink) firstPageLink = archive.link;
-                            try { await writeScreenshotLinkToSheet(track, archive.link); }
-                            catch (e) { console.warn(`⚠️ writeScreenshotLinkToSheet ${track}:`, e?.message || e); }
-                        }
                         screenshotsTaken++;
                     }
                 }
@@ -10103,7 +10281,6 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
             }
         } else if (isIherb) {
             try {
-                const allTracks = [trackNumber, ...(extraTracks || [])].filter(Boolean);
                 // Кадр снимается со страницы ОДНОЙ посылки (secure.iherb.com/tr/carrierTracking),
                 // поэтому и номер в подписи должен быть ОДИН — тот, что на картинке. Раньше сюда
                 // склеивались через запятую все номера заказа, и оператор не понимал, что на кадре.
@@ -10119,26 +10296,24 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                     console.warn(`⚠️ captureIherbTrackingCard returned null for ${orderId}, fallback to visible`);
                     const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
                     const fallbackBase64 = dataUrl.replace(/^data:image\/png;base64,/, '');
-                    const archive = await sendScreenshotToArchive(fallbackBase64, captionFull);
+                    const archive = await archiveScreenshotWithReceipt(fallbackBase64, captionFull,
+                        { store: 'iherb', orderId, accountName, tracks: [trackNumber] });
                     if (!archive?.ok) throw new Error('iHerb fallback archive failed');
-                    if (archive.link) firstPageLink = archive.link;
                 } else {
-                    const archive = await sendScreenshotToArchive(cardBase64, captionFull);
+                    const archive = await archiveScreenshotWithReceipt(cardBase64, captionFull,
+                        { store: 'iherb', orderId, accountName, tracks: [trackNumber] });
                     if (!archive?.ok) throw new Error('iHerb archive failed');
-                    if (archive.link) firstPageLink = archive.link;
                 }
-                allTracks.forEach(track => capturedTracks.add(track));
+                // This card proves only its own shipment. Legacy merged extras
+                // stay unresolved in the queue until their own URL/proof exists.
+                if (trackNumber) capturedTracks.add(trackNumber);
                 screenshotsTaken++;
-                console.log(`✅ iHerb tracking card screenshot sent for ${orderId} (tracks: ${allTracks.length})`);
+                console.log(`✅ iHerb tracking card screenshot sent for ${orderId} (tracks: 1)`);
 
                 // Ссылку на кадр пишем ТОЛЬКО тому номеру посылки, который на кадре и есть.
                 // Раньше одна ссылка проставлялась всем номерам заказа — и вторая коробка
                 // навсегда считалась снятой (фильтр «уже присылали» смотрит именно эту колонку),
                 // то есть её карточка не приходила НИКОГДА.
-                if (firstPageLink && trackNumber) {
-                    try { await writeScreenshotLinkToSheet(trackNumber, firstPageLink); }
-                    catch (e) { console.warn(`⚠️ writeScreenshotLinkToSheet ${trackNumber}:`, e?.message || e); }
-                }
             } catch (capErr) {
                 console.error(`❌ Fullpage capture failed for ${orderId}:`, capErr);
                 throw capErr;
@@ -10181,9 +10356,9 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                 const itemLine = await itemsCaptionLine(orderId, trackNumber);
                 const caption = `📦 ${orderLink(orderId)}${pageLabel}\n🚚 ${esc(trackNumber)}${itemLine}${accountTag}`;
 
-                const archive = await sendScreenshotToArchive(base64, caption);
+                const archive = await archiveScreenshotWithReceipt(base64, caption,
+                    { store: isAmazon ? 'amazon' : 'other', orderId, accountName, tracks: [trackNumber], page });
                 if (!archive?.ok) throw new Error(`Amazon archive failed on carousel page ${page}`);
-                if (archive.link && !firstPageLink) firstPageLink = archive.link;
 
                 screenshotsTaken++;
                 console.log(`✅ Screenshot ${page}/${carouselPages} sent for ${orderId}`);
@@ -10201,10 +10376,6 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                     } catch (e) { console.warn('Carousel click failed:', e); break; }
                     await new Promise(r => setTimeout(r, 1200 + Math.random() * 800));
                 }
-            }
-            if (firstPageLink && trackNumber) {
-                try { await writeScreenshotLinkToSheet(trackNumber, firstPageLink); }
-                catch (e) { console.warn(`⚠️ writeScreenshotLinkToSheet ${trackNumber}:`, e?.message || e); }
             }
             if (screenshotsTaken > 0 && trackNumber) capturedTracks.add(trackNumber);
         }
@@ -10224,57 +10395,6 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
     return { status: 'sent', tracks: Array.from(capturedTracks) };
 }
 
-/**
- * Write Telegram deep-link to Sheet column H for all rows matching given tracking number.
- * Sheet columns: A=store, B=order_id, C=tracking, D=name, E=qty, F=color, G=size, H=screenshot_link,
- * I=account, J=parser stamp, K=composition mark (v7.9.0).
- * Parser leaves H empty at append time, so H is safe to set independently.
- */
-async function writeScreenshotLinkToSheet(trackNumber, link) {
-    if (!trackNumber || !link) return;
-    const spreadsheetId = DEFAULT_SPREADSHEET_ID;
-    const sheetName = 'Лист1';
-
-    const rows = await readSheetData(spreadsheetId, sheetName);
-    if (!rows || !rows.length) return;
-
-    // Header row detection (col A header like "store" or "Магазин")
-    const headerOffset = rows[0] && /store|магаз/i.test(rows[0][0] || '') ? 1 : 0;
-
-    // Find all rows where column C (tracking) matches
-    const matchedRowsSheetIndex = [];
-    for (let i = headerOffset; i < rows.length; i++) {
-        const t = (rows[i][2] || '').trim();
-        if (t && t === trackNumber) {
-            // Don't overwrite if already has a link (idempotent)
-            const existing = (rows[i][7] || '').trim();
-            if (!existing) matchedRowsSheetIndex.push(i + 1); // 1-based row
-        }
-    }
-
-    if (!matchedRowsSheetIndex.length) {
-        console.log(`ℹ️ No empty H cells to update for tracking ${trackNumber}`);
-        return;
-    }
-
-    const token = await getAuthToken(true);
-    const data = matchedRowsSheetIndex.map(r => ({
-        range: `${sheetName}!H${r}`,
-        values: [[link]]
-    }));
-
-    const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchUpdate`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ valueInputOption: 'USER_ENTERED', data })
-    });
-
-    if (!res.ok) {
-        const t = await res.text().catch(() => '');
-        throw new Error(`batchUpdate H failed: ${res.status} ${t}`);
-    }
-    console.log(`📝 Wrote screenshot link to Sheet H for ${matchedRowsSheetIndex.length} row(s) (tracking ${trackNumber})`);
-}
 // ... Google Sheets helpers use getAuthToken() defined above ...
 
 async function getSheetId(spreadsheetId, sheetName){

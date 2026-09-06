@@ -1023,7 +1023,9 @@ async function parseOrders() {
                 // Account was resolved before parseOrders. Queue through the
                 // background's acknowledged/persisted door and retain every
                 // promise: Done must not race ahead of a late storage callback.
-                const accountName = (window.__iherbCurrentAccountName || 'iherb').split('@')[0];
+                // Keep the same full account identity as Sheet column I. A mail
+                // prefix cannot authorize publication into another cabinet's row.
+                const accountName = window.__iherbCurrentAccountName || 'iherb';
                 screenshotQueueCommits.push(
                     chrome.runtime.sendMessage({
                         action: 'queueTrackScreenshot',

@@ -111,6 +111,7 @@ function makeProcessHarness({ queue, activeIherb = 'questburgh@gmail.com', activ
     parseReport: { screenshots: { sent: 0, skipped: 0, failed: 0, broken: 0, byShop: {} } },
     tgBotToken: '', tgChatId: '',
     beginScreenshotStageBudget: async () => {}, finishScreenshotStageBudget: async () => {},
+    replayScreenshotLinks: async () => ({ updated: 0 }),
     filterAlreadySent: async items => items,
     markAsSent: async tracks => {
       markCalls.push([...tracks]);
