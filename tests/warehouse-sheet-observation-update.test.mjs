@@ -11,6 +11,7 @@ const item=(overrides={})=>({store_name:'Amazon',order_id:'111-0998916-5002605',
 function harness(rows=[row()],items=[item()],options={}){
  const h={rows:clone(rows),reads:0,writes:[],messages:[],storage:{orderData:{Amazon:{orders:clone(items)}},...options.storage},appends:[]};
  const context={Date,URL,console:{log(){},warn(){},error(){}},DEFAULT_SPREADSHEET_ID:'fixture',parseReport:{},
+  normalizeAccountEmail: value=>String(value||'').trim().toLowerCase(),
   async getAuthToken(interactive){assert.equal(interactive,false);return 'fixture-token';},
   async readSheetData(){h.reads++;options.beforeRead?.(h);return clone(h.rows);},
   async replayScreenshotLinks(){},async sendTelegramMessage(){},
@@ -22,8 +23,50 @@ function harness(rows=[row()],items=[item()],options={}){
    return {ok:true};},
   chrome:{storage:{local:{async get(){return clone(h.storage);},async set(patch){Object.assign(h.storage,clone(patch));}}},runtime:{sendMessage(message){h.messages.push(message);}}},
  };
- vm.createContext(context);vm.runInContext(upload,context);h.run=()=>context.uploadToSheets();return h;
+ vm.createContext(context);vm.runInContext(upload,context);h.run=()=>context.uploadToSheets(options.runId||null);return h;
 }
+
+function coordinatedUpload(overrides={}, rowOverrides={}) {
+ const run={id:'early-night-run',status:'completed',source:'coordinator-control',
+  slotAt:Date.parse('2026-09-06T23:00:00-04:00'),attemptedAt:Date.parse('2026-09-06T22:25:03.264-04:00'),
+  startedAt:Date.parse('2026-09-06T22:25:03.314-04:00'),finishedAt:Date.parse('2026-09-06T23:08:49.270-04:00'),
+  nightSlotDay:'2026-09-06',nightRequestToken:'night:2026-09-06:1788742805351',
+  expected:{amazon:['photopochtoy@gmail.com']},...overrides};
+ const observed=item({parser_run_id:run.id,parser_account:'photopochtoy@gmail.com',
+  observed_at:new Date(run.startedAt+1000).toISOString(),...rowOverrides});
+ return harness([], [observed], {runId:run.id,storage:{pipelineRun:run}});
+}
+for(const status of ['completed','degraded']) test(`coordinated 22:25 run can publish exact rows after ${status}`,async()=>{
+ const h=coordinatedUpload({status});await h.run();assert.equal(h.appends.length,1);assert.equal(h.rows.length,1);
+ assert.equal(h.rows[0][4],'1');assert.ok(h.messages.some(m=>m.status==='success'));
+ await h.run();assert.equal(h.appends.length,1,'a retry keeps existing exact rows');
+});
+test('early same-night completion and winter New York offset also reach Sheets',async()=>{
+ for(const patch of [
+  {finishedAt:Date.parse('2026-09-06T22:45:00-04:00')},
+  {slotAt:Date.parse('2026-12-06T23:00:00-05:00'),attemptedAt:Date.parse('2026-12-06T21:00:00-05:00'),
+   startedAt:Date.parse('2026-12-06T21:00:00.100-05:00'),finishedAt:Date.parse('2026-12-06T22:45:00-05:00'),nightSlotDay:'2026-12-06'}
+ ]) {const h=coordinatedUpload(patch);await h.run();assert.equal(h.appends.length,1)}
+});
+for(const [name,patch] of [
+ ['legacy source',{source:'alarm'}],['missing token',{nightRequestToken:undefined}],['short token',{nightRequestToken:'x'}],
+ ['wrong night',{nightSlotDay:'2026-09-05'}],['wrong hour',{slotAt:Date.parse('2026-09-06T22:59:00-04:00')}],
+ ['noncanonical milliseconds',{slotAt:Date.parse('2026-09-06T23:00:00.001-04:00')}],
+ ['before admission window',{attemptedAt:Date.parse('2026-09-06T20:59:59-04:00')}],
+ ['reversed actual attempt',{attemptedAt:Date.parse('2026-09-06T22:26:00-04:00')}],
+ ['finish before actual start',{finishedAt:Date.parse('2026-09-06T22:24:00-04:00')}],
+]) test(`early upload refuses ${name} before a Sheets read or write`,async()=>{
+ const h=coordinatedUpload(patch);await assert.rejects(h.run(),/invalid pipeline timestamps/);
+ assert.equal(h.reads,0);assert.equal(h.appends.length,0);assert.equal(h.writes.length,0);
+});
+test('early admission keeps row account/time and current-run fences',async()=>{
+ for(const rowPatch of [{parser_account:'foreign@example.com'},{observed_at:'2026-09-06T20:00:00-04:00'},
+  {observed_at:'2026-09-07T06:00:00-04:00'}]) {
+  const h=coordinatedUpload({},rowPatch);await assert.rejects(h.run(),/outside the run\/account\/time fence/);assert.equal(h.reads,0);
+ }
+ const h=coordinatedUpload();h.storage.pipelineRun.id='foreign-run';
+ await assert.rejects(h.run(),/does not belong/);assert.equal(h.reads,0);
+});
 test('same item updates E and canonical K, stamps J, confirms readback, preserves F/G/H/I',async()=>{
  const before=row({4:'2',5:'DONE 123'}),h=harness([before]);await h.run();
  assert.equal(h.reads,3);assert.equal(h.rows[0][4],'1');assert.equal(h.rows[0][10],'');assert.match(h.rows[0][9],/^parser\|20/);assert.notEqual(h.rows[0][9],before[9]);

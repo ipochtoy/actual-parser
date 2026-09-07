@@ -7700,11 +7700,28 @@ async function uploadToSheets(runId = null) {
             const attemptedAt = Number(result.pipelineRun.attemptedAt);
             const startedAt = Number(result.pipelineRun.startedAt);
             const finishedAt = Number(result.pipelineRun.finishedAt);
+            // The coordinator may start today's 23:00 slot from 21:00. Keep
+            // actual attempt/start/finish ordering, and admit that nominal
+            // future slot only with the exact recorded coordinator binding.
+            let coordinatedEarlySlot = false;
+            if (Number.isFinite(slotAt) && Number.isFinite(attemptedAt)
+                && slotAt > attemptedAt && slotAt - attemptedAt <= 2 * 60 * 60_000
+                && result.pipelineRun.source === 'coordinator-control'
+                && typeof result.pipelineRun.nightRequestToken === 'string'
+                && result.pipelineRun.nightRequestToken.length >= 16
+                && result.pipelineRun.nightRequestToken.length <= 200) {
+                const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+                    timeZone: 'America/New_York', year: 'numeric', month: '2-digit',
+                    day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
+                }).formatToParts(new Date(slotAt)).map(part => [part.type, part.value]));
+                coordinatedEarlySlot = result.pipelineRun.nightSlotDay === `${parts.year}-${parts.month}-${parts.day}`
+                    && parts.hour === '23' && parts.minute === '00' && parts.second === '00' && slotAt % 1000 === 0;
+            }
             if (!Number.isFinite(slotAt)
                 || !Number.isFinite(attemptedAt)
                 || !Number.isFinite(startedAt)
                 || !Number.isFinite(finishedAt)
-                || slotAt > attemptedAt
+                || (slotAt > attemptedAt && !coordinatedEarlySlot)
                 || attemptedAt > startedAt
                 || startedAt > finishedAt) {
                 throw new Error('Sheets payload has invalid pipeline timestamps');
