@@ -3244,7 +3244,8 @@ function dispatchCurrentAmazonAccountSwitch(email, expectedGeneration, kind = 'a
 async function dispatchCurrentAmazonAccountSwitchOnce(email, expectedGeneration, kind = 'account-switch') {
     const readDispatchState = () => chrome.storage.local.get([
         'pipelineRun', 'pipelineStage', 'multiAccountState', 'pendingAccountSwitch',
-        'amazonParserTabId', 'amazonStageFinalizing', 'amazonSwitchDispatch'
+        'amazonParserTabId', 'amazonStageFinalizing', 'amazonSwitchDispatch',
+        'accountSwitchStartedAt', 'amazonMissingTabRecoveries'
     ]);
     const ownsDispatch = state => {
         const regularOwned = kind === 'account-switch'
@@ -3270,6 +3271,10 @@ async function dispatchCurrentAmazonAccountSwitchOnce(email, expectedGeneration,
         return false;
     }
 
+    const missingTabRecord = state.amazonMissingTabRecoveries ? amazonMissingTabRecord(state) : null;
+    if (kind === 'account-switch' && missingTabRecord) {
+        return dispatchAmazonMissingTabRecovery(email, expectedGeneration);
+    }
     let parserTab = await getAmazonParserTab(state.amazonParserTabId);
     // getAmazonParserTab/tabs.create are awaited browser calls. The pipeline may
     // advance while either one is pending, so ownership must be reread before
@@ -3279,8 +3284,31 @@ async function dispatchCurrentAmazonAccountSwitchOnce(email, expectedGeneration,
         console.warn('⏭ Amazon generation changed while resolving parser tab');
         return false;
     }
+    // A failed/expired recovery can leave its exact known blank tab awaiting
+    // normal final-return cleanup. Reuse only that durable create receipt; never
+    // make a second tab merely because the generic URL gate rejects about:blank.
+    if (!parserTab && afterTab.amazonMissingTabRecoveries?.runId === expectedGeneration.runId
+        && afterTab.amazonMissingTabRecoveries.attempts.some(item => item.replacementTabId === afterTab.amazonParserTabId)) {
+        const exactId = afterTab.amazonParserTabId;
+        try {
+            const exact = await chrome.tabs.get(exactId);
+            if (exact?.id !== exactId || exact.url !== 'about:blank' || exact.pendingUrl) return false;
+            parserTab = exact;
+        } catch (error) {
+            if (!amazonMissingTabErrorIsExact(error, exactId)) return false;
+        }
+        afterTab = await readDispatchState();
+        if (!ownsDispatch(afterTab) || afterTab.amazonParserTabId !== exactId) return false;
+    }
     let createdParserTab = false;
     if (!parserTab) {
+        // A lost create ACK may hide a still-live owned tab. This fence also
+        // covers final-return and later startup dispatches in the same run.
+        if (afterTab.amazonMissingTabRecoveries?.runId === expectedGeneration.runId
+            && afterTab.amazonMissingTabRecoveries.attempts.some(item => item.phase === 'creating')) {
+            console.warn('AMAZON_TAB_CREATE_UNCERTAIN: новая вкладка запрещена');
+            return false;
+        }
         parserTab = await chrome.tabs.create({ url: 'about:blank', active: false });
         if (!parserTab?.id) throw new Error('failed to create owned Amazon parser tab');
         createdParserTab = true;
@@ -5662,6 +5690,239 @@ function getAmazonAccountTimeoutDecision({
     return { isIdleTimeout, isHardCap, timedOut: isIdleTimeout || isHardCap };
 }
 
+// Missing-tab recovery is a separate, durable one-shot per cabinet. It never
+// treats a CDP timeout or a rejected live URL as evidence that a tab disappeared.
+const AMAZON_MISSING_TAB_SNAPSHOT_CAP = 4 * 1024 * 1024;
+
+function amazonMissingTabErrorIsExact(error, tabId) {
+    return Number.isInteger(tabId) && tabId > 0
+        && new RegExp(`^No tab with id: ${tabId}\\.?$`).test(String(error?.message || error).trim());
+}
+
+async function amazonOwnedTabIsMissing(tabId) {
+    if (!Number.isInteger(tabId) || tabId <= 0) return false;
+    try { await chrome.tabs.get(tabId); return false; }
+    catch (error) { return amazonMissingTabErrorIsExact(error, tabId); }
+}
+
+function amazonMissingTabRecord(state) {
+    const book = state.amazonMissingTabRecoveries;
+    if (!book || book.runId !== state.pipelineRun?.id) return null;
+    if (book.schema !== 1 || !Array.isArray(book.attempts) || book.attempts.length > 2) {
+        throw new Error('AMAZON_TAB_RECOVERY_LEDGER_INVALID');
+    }
+    const ids = new Set();
+    for (const record of book.attempts) {
+        const attempt = record?.attempt;
+        if (!attempt || attempt.runId !== book.runId || !attempt.parseId
+            || !Number.isInteger(attempt.parserTabId) || attempt.parserTabId <= 0
+            || !Number.isFinite(attempt.stageStartedAt) || attempt.stageStartedAt <= 0
+            || !Number.isFinite(attempt.accountSwitchStartedAt) || attempt.accountSwitchStartedAt <= 0
+            || !attempt.account || attempt.account !== normalizeAccountEmail(attempt.account)
+            || record.id !== JSON.stringify(attempt) || ids.has(record.id)
+            || !['claimed', 'creating', 'prepared', 'navigating', 'dispatched', 'aborted'].includes(record.phase)
+            || !amazonPaginationPayloadMatchesAttempt(record.snapshot?.pagination, attempt)
+            || !Array.isArray(record.snapshot.pagination.allOrders)
+            || !Array.isArray(record.snapshot.pagination.cancelledOrders)
+            || record.snapshotBytes !== new TextEncoder().encode(JSON.stringify(record.snapshot)).length
+            || record.snapshotBytes > AMAZON_MISSING_TAB_SNAPSHOT_CAP
+            || (['prepared', 'navigating', 'dispatched'].includes(record.phase)
+                && (!Number.isInteger(record.replacementTabId) || record.replacementTabId <= 0))) {
+            throw new Error('AMAZON_TAB_RECOVERY_LEDGER_INVALID');
+        }
+        ids.add(record.id);
+    }
+    return book.attempts.find(record => record.attempt?.stageStartedAt === state.pipelineStage?.stageStartedAt
+        && record.attempt?.account === normalizeAccountEmail(state.multiAccountState?.currentAmazonAccount)
+        && record.attempt?.accountSwitchStartedAt === state.accountSwitchStartedAt) || null;
+}
+
+function readAmazonMissingTabState() {
+    return chrome.storage.local.get([
+        'pipelineRun', 'pipelineStage', 'multiAccountState', 'amazonParserTabId',
+        'accountSwitchStartedAt', 'amazonPaginationState', 'amazonOrders',
+        'amazonCancelledOrders', 'amazonParsingComplete', 'amazonTimeoutAttempt',
+        'amazonStageFinalizing', 'amazonMissingTabRecoveries', 'pendingAccountSwitch',
+        'trackScreenshotQueue', 'screenshotQueueBlocked', 'parserScreenshotReuseTab',
+        'parserScreenshotLocalTab', 'screenshotStageBudget'
+    ]);
+}
+
+function amazonMissingTabScreenshotsIdle(state) {
+    return Array.isArray(state.trackScreenshotQueue) && state.trackScreenshotQueue.length === 0
+        && trackScreenshotQueue.length === 0 && !isProcessingScreenshots
+        && !state.screenshotQueueBlocked && !state.parserScreenshotReuseTab
+        && !state.parserScreenshotLocalTab && !Number.isFinite(state.screenshotStageBudget?.activeSince);
+}
+
+function amazonMissingTabScopeLive(state, attempt) {
+    return state.pipelineRun?.status === 'running' && state.pipelineRun.id === attempt.runId
+        && state.pipelineStage?.active === true && state.pipelineStage.runId === attempt.runId
+        && state.pipelineStage.stages?.[state.pipelineStage.currentIndex] === 'amazon'
+        && state.pipelineStage.stageStartedAt === attempt.stageStartedAt
+        && state.multiAccountState?.isMultiAccountParsing === true
+        && Array.isArray(state.pipelineRun.expected?.amazon)
+        && state.pipelineRun.expected.amazon.map(normalizeAccountEmail).includes(attempt.account)
+        && normalizeAccountEmail(state.multiAccountState?.currentAmazonAccount) === attempt.account
+        && state.accountSwitchStartedAt === attempt.accountSwitchStartedAt
+        && !pipelineRunAccountIsTerminal(state.pipelineRun, 'amazon', attempt.account)
+        && !state.amazonStageFinalizing && !state.amazonTimeoutAttempt
+        && !state.amazonParsingComplete
+        && Number.isFinite(attempt.accountSwitchStartedAt) && attempt.accountSwitchStartedAt > 0
+        && Date.now() >= attempt.accountSwitchStartedAt
+        && Date.now() < attempt.accountSwitchStartedAt + AMAZON_ACCOUNT_HARD_CAP_MS;
+}
+
+async function saveAmazonMissingTabRecord(state, record, extra = {}) {
+    const old = state.amazonMissingTabRecoveries;
+    const attempts = old?.runId === record.attempt.runId ? [...old.attempts] : [];
+    const index = attempts.findIndex(item => item.id === record.id);
+    if (index < 0) attempts.push(record); else attempts[index] = record;
+    if (attempts.length > 2) throw new Error('AMAZON_TAB_RECOVERY_LIMIT');
+    await chrome.storage.local.set({ ...extra,
+        amazonMissingTabRecoveries: { schema: 1, runId: record.attempt.runId, attempts } });
+}
+
+function recoverAmazonMissingTab(stored) {
+    return runParserOperationSingleFlight('amazon-missing-tab-recovery',
+        JSON.stringify(amazonWatchdogAttemptFromState(stored)), () => recoverAmazonMissingTabOnce(stored));
+}
+
+async function recoverAmazonMissingTabOnce(stored) {
+    const attempt = amazonWatchdogAttemptFromState(stored);
+    try {
+        const claimed = await withAmazonAttemptMutation(async () => {
+            let state = await readAmazonMissingTabState();
+            if (!amazonWatchdogAttemptMatches(state, attempt)) return { status: 'stale' };
+            if (!amazonMissingTabScopeLive(state, attempt)) return { status: 'ineligible' };
+            if (amazonMissingTabRecord(state)) return { status: 'exhausted' };
+            if (!amazonPaginationPayloadMatchesAttempt(state.amazonPaginationState, attempt)
+                || !Array.isArray(state.amazonPaginationState.allOrders)
+                || !Array.isArray(state.amazonPaginationState.cancelledOrders)
+                || state.amazonPaginationState.completedAt) return { status: 'unproven' };
+            if (!amazonMissingTabScreenshotsIdle(state)) return { status: 'screenshots-busy' };
+            if (!await amazonOwnedTabIsMissing(attempt.parserTabId)) return { status: 'not-missing' };
+            state = await readAmazonMissingTabState();
+            if (!amazonWatchdogAttemptMatches(state, attempt) || !amazonMissingTabScopeLive(state, attempt)) return { status: 'stale' };
+            if (!await amazonOwnedTabIsMissing(attempt.parserTabId)) return { status: 'not-missing' };
+            state = await readAmazonMissingTabState();
+            if (!amazonWatchdogAttemptMatches(state, attempt) || !amazonMissingTabScopeLive(state, attempt)
+                || !amazonMissingTabScreenshotsIdle(state)) return { status: 'stale' };
+            // Save the complete old attempt before replacing its cursor. Never
+            // truncate collected rows or promote this partial snapshot to final data.
+            const snapshot = { pagination: state.amazonPaginationState,
+                amazonOrders: state.amazonOrders ?? null, cancelledOrders: state.amazonCancelledOrders ?? null };
+            const bytes = new TextEncoder().encode(JSON.stringify(snapshot));
+            if (bytes.length > AMAZON_MISSING_TAB_SNAPSHOT_CAP) return { status: 'snapshot-cap' };
+            const record = { id: JSON.stringify(attempt), attempt, phase: 'claimed',
+                reason: 'EXACT_PARSER_TAB_MISSING',
+                humanReason: 'Вкладка Amazon исчезла; один повтор этого кабинета с первой страницы.',
+                claimedAt: Date.now(), snapshotBytes: bytes.length,
+                snapshot, replacementTabId: null };
+            await saveAmazonMissingTabRecord(state, record, {
+                pendingAccountSwitch: { email: attempt.account, runId: attempt.runId },
+                amazonSwitchDispatch: null
+            });
+            return { status: 'claimed', generation: pipelineGenerationFromStage(state.pipelineStage) };
+        });
+        if (claimed.status !== 'claimed') return claimed;
+        const dispatched = await dispatchCurrentAmazonAccountSwitch(attempt.account, claimed.generation, 'account-switch');
+        console.warn(`[amazonWatchdog] EXACT_PARSER_TAB_MISSING: ${dispatched ? 'RECOVERY_DISPATCHED' : 'RECOVERY_STOPPED'}`);
+        return { status: dispatched ? 'recovered' : 'refused' };
+    } catch (_) {
+        console.warn('[amazonWatchdog] AMAZON_TAB_RECOVERY_UNCERTAIN: повтор запрещён');
+        return { status: 'uncertain' };
+    }
+}
+
+// Only the ID just returned by OUR create is eligible for this cleanup.
+// An unexpected navigation or unreadable ID is never closed or searched for.
+async function cleanupCreatedAmazonRecoveryTab(record, tabId) {
+    let status = 'unknown';
+    try {
+        const tab = await chrome.tabs.get(tabId);
+        if (tab?.id === tabId && tab.url === 'about:blank' && !tab.pendingUrl) {
+            try { await chrome.tabs.remove(tabId); } catch (_) {}
+            status = await amazonOwnedTabIsMissing(tabId) ? 'closed' : 'unknown';
+        } else status = 'navigated';
+    } catch (_) {}
+    console.warn(`[amazonWatchdog] AMAZON_TAB_RECOVERY_STALE_CLEANUP: tab=${tabId}, outcome=${status}`);
+    // Retain the old attempt's outcome only while its exact ledger still exists;
+    // never overwrite a newer run's ledger or any current pipeline state.
+    const state = await readAmazonMissingTabState();
+    if (state.amazonMissingTabRecoveries?.runId === record.attempt.runId
+        && state.amazonMissingTabRecoveries.attempts?.some(item => item.id === record.id && item.phase === 'creating')) {
+        await saveAmazonMissingTabRecord(state, { ...record, replacementTabId: tabId,
+            phase: status === 'closed' ? 'aborted' : 'creating',
+            cleanup: { tabId, status, at: Date.now() } });
+    }
+    return status;
+}
+
+// Called inside the existing account-dispatch single flight, including startup.
+// A persisted `creating`/`navigating` intent is never replayed after an uncertain
+// outcome. Only a known prepared blank tab can be navigated once to the picker.
+async function dispatchAmazonMissingTabRecovery(email, generation) {
+    return withAmazonAttemptMutation(async () => {
+        let state = await readAmazonMissingTabState();
+        let record = amazonMissingTabRecord(state);
+        const owns = value => record && amazonMissingTabScopeLive(value, record.attempt)
+            && pipelineGenerationMatches(value.pipelineStage, generation)
+            && normalizeAccountEmail(email) === record.attempt.account
+            && value.pendingAccountSwitch?.runId === record.attempt.runId
+            && normalizeAccountEmail(value.pendingAccountSwitch.email) === record.attempt.account
+            && amazonMissingTabScreenshotsIdle(value);
+        if (!owns(state)) return false;
+        if (record.phase === 'claimed') {
+            if (state.amazonParserTabId !== record.attempt.parserTabId
+                || !await amazonOwnedTabIsMissing(record.attempt.parserTabId)) return false;
+            state = await readAmazonMissingTabState();
+            if (!owns(state)) return false;
+            record = { ...record, phase: 'creating', creatingAt: Date.now() };
+            // This write is the irreversible permission to create ONE tab.
+            await saveAmazonMissingTabRecord(state, record);
+            state = await readAmazonMissingTabState();
+            if (!owns(state)) return false;
+            const tab = await chrome.tabs.create({ url: 'about:blank', active: false });
+            if (!Number.isInteger(tab?.id) || tab.id <= 0) throw new Error('AMAZON_TAB_CREATE_UNCERTAIN');
+            state = await readAmazonMissingTabState();
+            if (!owns(state)) {
+                await cleanupCreatedAmazonRecoveryTab(record, tab.id);
+                return false;
+            }
+            record = { ...record, phase: 'prepared', replacementTabId: tab.id, preparedAt: Date.now() };
+            await saveAmazonMissingTabRecord(state, record, {
+                amazonParserTabId: tab.id, amazonPaginationState: null,
+                amazonNavigationRecovery: null, amazonNavigationGraceUntil: null,
+                amazonParsingIncomplete: null
+            });
+            state = await readAmazonMissingTabState();
+        }
+        if (record.phase !== 'prepared' || !owns(state)
+            || state.amazonParserTabId !== record.replacementTabId) return false;
+        let tab;
+        try { tab = await chrome.tabs.get(record.replacementTabId); }
+        catch (_) { console.warn('AMAZON_TAB_RECOVERY_PREPARED_TAB_UNAVAILABLE'); return false; }
+        if (tab?.id !== record.replacementTabId || tab.url !== 'about:blank' || tab.pendingUrl) return false;
+        state = await readAmazonMissingTabState();
+        if (!owns(state) || state.amazonParserTabId !== record.replacementTabId) return false;
+        record = { ...record, phase: 'navigating', navigatingAt: Date.now() };
+        await saveAmazonMissingTabRecord(state, record);
+        state = await readAmazonMissingTabState();
+        if (!owns(state) || state.amazonParserTabId !== record.replacementTabId) return false;
+        await chrome.tabs.update(record.replacementTabId, { url: getAmazonSwitchAccountUrl(), active: true });
+        state = await readAmazonMissingTabState();
+        if (!owns(state) || state.amazonParserTabId !== record.replacementTabId) return false;
+        record = { ...record, phase: 'dispatched', dispatchedAt: Date.now() };
+        await saveAmazonMissingTabRecord(state, record, {
+            lastAmazonProgressAt: Date.now(),
+            amazonSwitchDispatch: { ...generation, account: email, tabId: record.replacementTabId,
+                kind: 'account-switch', phase: 'dispatched', dispatchedAt: Date.now() }
+        });
+        return true;
+    });
+}
+
 async function getAmazonParserTab(tabId) {
     if (tabId) {
         try {
@@ -7178,7 +7439,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     if (alarm.name !== WATCHDOG_ALARM_NAME) return;
 
     const stored = await chrome.storage.local.get([
-        'amazonParsingComplete', 'multiAccountState', 'accountSwitchStartedAt',
+        'amazonParsingComplete', 'multiAccountState', 'accountSwitchStartedAt', 'amazonMissingTabRecoveries',
         'lastAmazonProgressAt', 'skipGuardAt', 'amazonPaginationState',
         'amazonNavigationGraceUntil', 'amazonNavigationRecovery',
         'amazonParsingIncomplete', 'amazonParserTabId', 'pipelineRun', 'pipelineStage'
@@ -7222,7 +7483,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             sinceLastProgress,
             matchingIncomplete,
             now,
-            graceUntil: stored.amazonNavigationGraceUntil,
+            graceUntil: amazonMissingTabRecord(stored) ? null : stored.amazonNavigationGraceUntil,
             idleTimeoutMs: ACCOUNT_PARSE_TIMEOUT_MS,
             hardCapMs: AMAZON_ACCOUNT_HARD_CAP_MS
         });
@@ -7235,7 +7496,11 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             // A page transition is recoverable: state.currentPage already points
             // to the next page and all previous orders are durably saved. Retry
             // the exact URL before discarding the rest of this account.
-            const recovery = await retryAmazonPaginationNavigation(stored, now, timeoutReason);
+            const missingTabRecovery = await recoverAmazonMissingTab(stored);
+            if (missingTabRecovery.status === 'recovered' || missingTabRecovery.status === 'stale') return;
+            const recovery = isHardCap && amazonMissingTabRecord(stored)
+                ? { status: 'unrecoverable' }
+                : await retryAmazonPaginationNavigation(stored, now, timeoutReason);
             if (recovery.status === 'retried' || recovery.status === 'waiting' || recovery.status === 'stale') {
                 console.warn(`[amazonWatchdog] navigation recovery ${recovery.status} for page ${stored.amazonPaginationState?.currentPage}`);
                 return;
