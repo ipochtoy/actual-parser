@@ -744,15 +744,29 @@ function parseItem(item) {
     const params = firstCard?.__myb?.actionList?.[0]?.action?.params || {};
 
     const name = firstCard?.title?.textSpans?.[0]?.text || 'Unknown';
-    let size = '', color = '';
-
-    if (firstCard?.aspectValuesList) {
-      for (const asp of firstCard.aspectValuesList) {
-        const txt = asp?.textSpans?.[0]?.text || '';
-        if (txt.toLowerCase().includes('size:')) size = txt.replace(/^size:\s*/i, '').trim();
-        else if (txt.toLowerCase().includes('color:')) color = txt.replace(/^colou?r:\s*/i, '').trim();
+    // Variants belong to one itemCard, just like its tracking below. An order
+    // may contain the same listing in several colors/sizes: firstCard values
+    // must never fill a sibling's missing variant. No order-level fallback is
+    // supported without a feed identity proving that it describes this card.
+    const cardVariants = (card) => {
+      const values = { color: new Set(), size: new Set() };
+      if (Array.isArray(card?.aspectValuesList)) {
+        for (const asp of card.aspectValuesList) {
+          const spans = asp?.textSpans;
+          if (!Array.isArray(spans) || !spans.length ||
+              !spans.every(span => typeof span?.text === 'string')) continue;
+          const match = spans.map(span => span.text).join('').trim()
+            .match(/^(color|colour|size):\s*(.*)$/i);
+          if (!match) continue;
+          const key = match[1].toLowerCase() === 'size' ? 'size' : 'color';
+          values[key].add(match[2].trim());
+        }
       }
-    }
+      return {
+        color: values.color.size === 1 ? [...values.color][0] : '',
+        size: values.size.size === 1 ? [...values.size][0] : '',
+      };
+    };
 
     const cleanName = name
       .replace(/&#x([0-9a-f]+);/gi, (m, h) => String.fromCharCode(parseInt(h, 16)))
@@ -852,6 +866,7 @@ function parseItem(item) {
     // Build entries for all items in Multiple items, each with ITS OWN tracking.
     const entries = cards.map(card => {
       const cardTracking = extractCardTracking(card);
+      const { color, size } = cardVariants(card);
 
       let quantity = 1;
       if (typeof card?.quantity === 'number') quantity = card.quantity;
