@@ -6922,6 +6922,37 @@ async function rejectedUploadDigest(text) {
     return { bytes: bytes.length, sha256: Array.from(new Uint8Array(hash), x => x.toString(16).padStart(2, '0')).join('') };
 }
 
+// Storage may reorder object keys. Compare JSON values without rewriting the
+// immutable archive bytes, changing array order, or coercing values/types.
+function rejectedUploadJsonEqual(left, right) {
+    const activeLeft = new WeakSet(), activeRight = new WeakSet();
+    const compare = (a, b, depth) => {
+        if (depth > 128 || typeof a !== typeof b) return false;
+        if (a === null || b === null) return a === b;
+        if (typeof a === 'string' || typeof a === 'boolean') return a === b;
+        if (typeof a === 'number') return Number.isFinite(a) && Number.isFinite(b) && a === b;
+        if (typeof a !== 'object' || activeLeft.has(a) || activeRight.has(b)) return false;
+        const array = Array.isArray(a);
+        if (array !== Array.isArray(b)) return false;
+        const plain = value => { const proto = Object.getPrototypeOf(value); return proto === null || Object.getPrototypeOf(proto) === null; };
+        if (!array && (!plain(a) || !plain(b))) return false;
+        const ak = Object.keys(a).sort(), bk = Object.keys(b).sort();
+        // Reject sparse arrays, hidden/symbol properties, and non-JSON objects.
+        if (Reflect.ownKeys(a).length !== ak.length + (array ? 1 : 0)
+            || Reflect.ownKeys(b).length !== bk.length + (array ? 1 : 0)
+            || ak.length !== bk.length || ak.some((key, i) => key !== bk[i])
+            || (array && (a.length !== b.length || ak.length !== a.length
+                || ak.some(key => !/^(0|[1-9][0-9]*)$/.test(key) || Number(key) >= a.length)))) return false;
+        activeLeft.add(a); activeRight.add(b);
+        try {
+            return ak.every(key => Object.getOwnPropertyDescriptor(a, key)?.get === undefined
+                && Object.getOwnPropertyDescriptor(b, key)?.get === undefined
+                && compare(a[key], b[key], depth + 1));
+        } finally { activeLeft.delete(a); activeRight.delete(b); }
+    };
+    try { return compare(left, right, 0); } catch (_) { return false; }
+}
+
 function rejectedUploadSnapshot(state) {
     const snapshot = {};
     for (const key of REJECTED_UPLOAD_KEYS) if (key !== 'parserRejectedUpload') snapshot[key] = state[key] ?? null;
@@ -6966,7 +6997,7 @@ async function readParserRejectedUploadProof({ readyRetryToken = null } = {}) {
         || data.rawRows > REJECTED_UPLOAD_MAX_ROWS
         || stores.reduce((sum, store) => sum + store.orders.length, 0) !== data.rawRows) return null;
     if (data.schema !== 1 || data.code !== outcome.code || data.runId !== run.id
-        || JSON.stringify(data.destination) !== JSON.stringify(outcome.destination)
+        || !rejectedUploadJsonEqual(data.destination, outcome.destination)
         || JSON.stringify(snap?.pipelineRun) !== JSON.stringify(run)
         || JSON.stringify(rejectedUploadCritical(snap, false, !!readyRetryToken)) !== JSON.stringify(rejectedUploadCritical(state, false, !!readyRetryToken))
         || data.rawRows !== outcome.rawRows || !Number.isSafeInteger(data.rawRows) || data.rawRows < 1) return null;
@@ -7032,7 +7063,7 @@ async function archiveRejectedSheetsUpload(runId, error) {
         await chrome.storage.local.set({ parserRejectedUpload: outcome, pendingSheetsUpload: null });
         const after = await chrome.storage.local.get(['pipelineRun','pendingSheetsUpload','parserRejectedUpload']);
         if (after.pipelineRun?.id !== runId || after.pendingSheetsUpload !== null
-            || JSON.stringify(after.parserRejectedUpload) !== JSON.stringify(outcome)) throw new Error('Rejected upload outcome readback failed');
+            || !rejectedUploadJsonEqual(after.parserRejectedUpload, outcome)) throw new Error('Rejected upload outcome readback failed');
         error.rejectedUploadArchived = true;
         return true;
     } finally {
