@@ -294,14 +294,14 @@
     // A quantity belongs to one physical item row. Never climb to a delivery
     // box containing siblings: a badge on item 2 otherwise becomes every qty.
     if (!scope?.closest || !scope?.matches) return null;
-    const itemRoot = scope.closest('.yohtmlc-item, [data-test-id="item-row"]')
+    const itemRoot = scope.closest('.yo-enhanced-flex-card, .yohtmlc-item, [data-test-id="item-row"]')
       || scope.closest('.a-fixed-left-grid-inner')
       || (scope.matches('.a-row') ? scope : null);
     if (!itemRoot || (shipmentBox && itemRoot !== shipmentBox && !shipmentBox.contains(itemRoot))) return null;
     const ownLinks = Array.from(itemRoot.querySelectorAll(SHIPMENT.PRODUCT_LINK_SELECTOR));
     const ownAsins = new Set(ownLinks.map(link => String(link.getAttribute('href') || link.href || '')
       .match(/\/(?:dp|product)\/([A-Z0-9]{8,10})/i)?.[1]?.toUpperCase()).filter(Boolean));
-    if (ownAsins.size !== 1 || itemRoot.querySelectorAll('.yohtmlc-item, [data-test-id="item-row"]').length > 1) return null;
+    if (ownAsins.size !== 1 || itemRoot.querySelectorAll('.yo-enhanced-flex-card, .yohtmlc-item, [data-test-id="item-row"]').length > 1) return null;
     scope = itemRoot;
     const insideItem = node => node && (node === itemRoot || itemRoot.contains(node));
     const badgeQuantity = badges => {
@@ -431,10 +431,27 @@
   }
 
   function closestItemScope(node) {
-    const isItem = (el) => el && el.matches && el.matches(".yohtmlc-item, [data-test-id=\"item-row\"], .a-fixed-left-grid-inner, .a-row");
-    let cur = node;
-    for (let i = 0; i < 8 && cur; i++, cur = cur.parentElement) if (isItem(cur)) return cur;
-    return node;
+    return SHIPMENT.closestItemScope(node);
+  }
+
+  function extractTitleForAmazonProduct(scope, productLink) {
+    const asin = extractASINFromLink(productLink && (productLink.getAttribute('href') || productLink.href));
+    if (!asin) return '';
+    const links = [...new Set([productLink, ...Array.from(scope?.querySelectorAll(SHIPMENT.PRODUCT_LINK_SELECTOR) || [])])]
+      .filter(link => link && extractASINFromLink(link.getAttribute('href') || link.href) === asin);
+    // Read only links of this exact ASIN, even if the fallback scope contains siblings.
+    for (const link of links) {
+      const text = String(link.textContent || '').trim();
+      if (text.length > 5 && text.length < 300) return text;
+      const title = String(link.title || '').trim();
+      if (title.length > 5 && title.length < 300) return title;
+    }
+    for (const link of links) {
+      const alt = String(link.querySelector('img[alt]')?.alt || '').trim();
+      if (alt.length > 5 && alt.length < 300) return alt;
+    }
+    // Keep the old explicit ASIN fallback without borrowing another item's title/JSON.
+    return `Product ASIN: ${asin}`;
   }
 
   function collectNearbyJSON(scope) {
@@ -578,83 +595,9 @@
   async function parseIndividualItemSimpleByTrackUrl(card, productLink, orderId, trackUrl, parserAccount, composition) {
     const scope = closestItemScope(productLink || card);
     
-    // PRODUCT NAME - keep the good v6.6 logic
-    let title = extractTitleFromDOM(scope);
-    if (!title) {
-      const blobs = collectNearbyJSON(scope);
-      const alt = pickTitleFromJSON(blobs);
-      if (alt) title = alt;
-    }
-    if (!title) {
-      const img = scope.querySelector("img[alt]");
-      if (img && img.alt && img.alt.trim().length > 10) title = img.alt.trim();
-    }
-    // Fallback: try to get title from productLink directly
-    if (!title && productLink) {
-      // Try link text
-      const linkText = productLink.textContent?.trim();
-      if (linkText && linkText.length > 5 && linkText.length < 300) {
-        title = linkText;
-        console.log("  📦 Title from link text");
-      }
-      // Try title attribute
-      if (!title && productLink.title) {
-        title = productLink.title.trim();
-        console.log("  📦 Title from link title attr");
-      }
-      // Try nearby img alt
-      if (!title) {
-        const nearbyImg = productLink.querySelector('img[alt]') || productLink.closest('div')?.querySelector('img[alt]');
-        if (nearbyImg && nearbyImg.alt && nearbyImg.alt.length > 5) {
-          title = nearbyImg.alt.trim();
-          console.log("  📦 Title from nearby img alt");
-        }
-      }
-      // Ищем название по ДРУГИМ ссылкам ТОГО ЖЕ товара (картинка и название дают две
-      // ссылки с одним ASIN). Соседние позиции не трогаем: до v7.9 отсюда бралась
-      // первая ссылка рамки доставки, и в отправке из четырёх кукол все четыре строки
-      // могли получить имя первой.
-      if (!title) {
-        const deliveryBox = productLink.closest('.delivery-box, .a-box');
-        const ownAsin = extractASINFromLink(productLink.getAttribute('href') || productLink.href);
-        if (deliveryBox) {
-          const allLinks = Array.from(deliveryBox.querySelectorAll('a[href*="/dp/"], a[href*="/gp/product/"]'))
-            .filter(l => !ownAsin || extractASINFromLink(l.getAttribute('href') || l.href) === ownAsin);
-          for (const link of allLinks) {
-            const txt = link.textContent?.trim();
-            if (txt && txt.length > 5 && txt.length < 300) {
-              title = txt;
-              console.log("  📦 Title from delivery-box link");
-              break;
-            }
-            // Also check img inside
-            const img = link.querySelector('img[alt]');
-            if (img && img.alt && img.alt.length > 5) {
-              title = img.alt.trim();
-              console.log("  📦 Title from delivery-box img alt");
-              break;
-            }
-          }
-        }
-      }
-      // Last resort: extract from URL
-      if (!title && productLink.href) {
-        // Try to extract product name from URL like /Product-Name-Here/dp/ASIN
-        const match = productLink.href.match(/amazon\.com\/([^\/]+)\/dp\/([A-Z0-9]+)/i);
-        if (match && match[1] && match[1] !== 'dp' && match[1] !== 'gp') {
-          title = decodeURIComponent(match[1].replace(/-/g, ' ').replace(/_/g, ' '));
-          console.log("  📦 Title from URL path:", title.substring(0, 50));
-        }
-        // Also try /dp/ASIN format (no name in URL) - use ASIN as last resort
-        if (!title) {
-          const asinMatch = productLink.href.match(/\/dp\/([A-Z0-9]+)/i);
-          if (asinMatch) {
-            title = `Product ASIN: ${asinMatch[1]}`;
-            console.log("  📦 Title from ASIN (fallback)");
-          }
-        }
-      }
-    }
+    // A shipment may contain several products. Name must follow this link's ASIN,
+    // never the first link or JSON payload in a shared shipment container.
+    let title = extractTitleForAmazonProduct(scope, productLink);
     if (!title) {
       console.log("  ❌ No product name found, productLink:", productLink?.href);
       sendLog(orderId, '-', '❌ No name', 'Не найдено название товара');
