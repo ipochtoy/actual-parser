@@ -843,6 +843,7 @@ async function runMissedDailyAutoParseIfNeeded(reason = 'startup') {
     const state = await chrome.storage.local.get([
         'dailyAutoParseEnabled',
         'lastDailyAutoParseTriggeredAt',
+        'pipelineRun',
         'pipelineStage',
         'parsingState'
     ]);
@@ -857,6 +858,34 @@ async function runMissedDailyAutoParseIfNeeded(reason = 'startup') {
             skipReason: 'already-triggered-for-slot',
             lastSlot: lastSlot.getTime(),
             lastTriggeredAt: state.lastDailyAutoParseTriggeredAt
+        });
+        return false;
+    }
+    // The coordinator can start this exact 23:00 slot up to two hours early.
+    // Its atomic run/stage/trigger receipt already consumed the slot even when
+    // the worker restarts after 23:00 with a terminal run awaiting Sheets.
+    const run = state.pipelineRun;
+    const earlyCoordinatorSlotStarted = run?.source === 'coordinator-control'
+        && typeof run.id === 'string' && run.id.length > 0
+        && run.slotAt === lastSlot.getTime()
+        && run.nightSlotDay === nightCabinetSlotDay(String(run.slotAt))
+        && typeof run.nightRequestToken === 'string'
+        && run.nightRequestToken.length >= 16 && run.nightRequestToken.length <= 200
+        && Number.isFinite(run.attemptedAt) && Number.isFinite(run.startedAt)
+        && run.attemptedAt >= run.slotAt - 2 * 60 * 60 * 1000
+        && run.attemptedAt <= run.startedAt && run.startedAt < run.slotAt
+        && state.lastDailyAutoParseTriggeredAt === run.startedAt
+        && state.pipelineStage?.runId === run.id
+        && ((run.status === 'running' && state.pipelineStage.active === true)
+            || (['completed', 'degraded'].includes(run.status)
+                && state.pipelineStage.active === false
+                && state.pipelineStage.stages?.[state.pipelineStage.currentIndex] === 'done'
+                && Number.isFinite(run.finishedAt)
+                && run.finishedAt >= run.startedAt && run.finishedAt <= now.getTime()));
+    if (earlyCoordinatorSlotStarted) {
+        await addDailyDiagnostic('catchup-skip', {
+            reason, skipReason: 'exact-coordinator-slot-already-started',
+            lastSlot: lastSlot.getTime(), runId: run.id
         });
         return false;
     }
@@ -6764,16 +6793,18 @@ async function handleSheetsUploadWatchdog() {
     await handleExternalControlRequest().catch(e => console.warn('[sheetsUploadWatchdog] control error:', e?.message || e));
 
     const s = await chrome.storage.local.get([
-        'lastDailyAutoParseStatus', 'lastDailyAutoParseFinishedAt', 'lastSheetsUploadOkAt',
+        'lastSheetsUploadOkAt',
         'pendingSheetsUpload', 'sheetsRetryCount', 'sheetsRetryGaveUp', 'pipelineStage',
         'pipelineRun', 'lastSheetsUploadRunId'
     ]);
 
-    // Никаких гонок с активной выгрузкой: не трогаем при свежем прогоне или
-    // не-completed статусе.
-    if (s.pipelineStage?.active) return;
-    if (!['completed', 'degraded'].includes(s.lastDailyAutoParseStatus)) return;
-    if (!s.lastDailyAutoParseFinishedAt) return;
+    // A refused new launch can set the legacy status to blocked-pending-sheets.
+    // The durable run still owns its unfinished upload. Read that exact terminal
+    // generation, not the status of a later attempt to start another run.
+    if (s.pipelineStage?.active !== false
+        || s.pipelineStage.stages?.[s.pipelineStage.currentIndex] !== 'done') return;
+    if (!['completed', 'degraded'].includes(s.pipelineRun?.status)) return;
+    if (!Number.isFinite(s.pipelineRun.finishedAt)) return;
 
     const pending = s.pendingSheetsUpload;
     if (!pending) return;
@@ -6784,8 +6815,8 @@ async function handleSheetsUploadWatchdog() {
 
     // Уже залито (штатным путём или прошлым тиком) — гасим маркер, no-op дальше.
     if (s.lastSheetsUploadRunId === pending.runId
-        && s.lastSheetsUploadOkAt
-        && s.lastSheetsUploadOkAt >= s.lastDailyAutoParseFinishedAt) {
+        && Number.isFinite(s.lastSheetsUploadOkAt)
+        && s.lastSheetsUploadOkAt >= s.pipelineRun.finishedAt) {
         await chrome.storage.local.set({ pendingSheetsUpload: null, sheetsRetryCount: 0, sheetsRetryGaveUp: false });
         return;
     }

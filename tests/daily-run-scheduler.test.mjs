@@ -94,6 +94,68 @@ test('startup reconciliation always finishes before missed-run catch-up', () => 
   assert.match(init, /resolveStartupPipelineReconciled\?\.\(\)/);
 });
 
+function makeEarlyCatchupHarness() {
+  const slotAt = Date.parse('2026-09-07T03:00:00Z');
+  const startedAt = slotAt - 35 * 60_000;
+  const state = {
+    lastDailyAutoParseTriggeredAt: startedAt,
+    lastDailyAutoParseStatus: 'degraded',
+    pipelineRun: { id: 'early-run', source: 'coordinator-control', slotAt,
+      nightSlotDay: '2026-09-06', nightRequestToken: 'fixture-coordinator-token',
+      attemptedAt: startedAt - 50, startedAt, finishedAt: slotAt + 8 * 60_000,
+      status: 'degraded' },
+    pipelineStage: { runId: 'early-run', active: false, stages: ['amazon', 'done'], currentIndex: 1 },
+    parsingState: { isParsingAllStores: false },
+    pendingSheetsUpload: { runId: 'early-run' },
+  };
+  const calls = { starts: 0, notifications: 0, writes: 0, diagnostics: [] };
+  class FixedDate extends Date {
+    constructor(...args) { super(...(args.length ? args : [slotAt + 40 * 60_000])); }
+    static now() { return slotAt + 40 * 60_000; }
+  }
+  const context = { Date: FixedDate, DAILY_MISSED_RUN_CATCHUP_MS: 4 * 60 * 60_000,
+    getLastDailyRunSlot: () => new Date(slotAt),
+    nightCabinetSlotDay: value => value === String(slotAt) ? '2026-09-06' : 'different-day',
+    chrome: { storage: { local: {
+      async get(keys) { return Object.fromEntries(keys.map(key => [key, structuredClone(state[key])])); },
+      async set(change) { calls.writes++; Object.assign(state, structuredClone(change)); },
+    } } },
+    async addDailyDiagnostic(event, detail) { calls.diagnostics.push({ event, ...detail }); },
+    sendTelegramMessage() { calls.notifications++; return Promise.resolve(); },
+    async runDailyAutoParse() { calls.starts++; return false; },
+  };
+  vm.createContext(context);
+  vm.runInContext(extractFunction('runMissedDailyAutoParseIfNeeded'), context);
+  return { state, calls, context };
+}
+
+for (const status of ['completed', 'degraded']) test(`worker restarts preserve an early exact ${status} coordinator run`, async () => {
+  const h = makeEarlyCatchupHarness(); h.state.pipelineRun.status = status;
+  const before = structuredClone(h.state);
+  for (let startup = 0; startup < 2; startup++) {
+    assert.equal(await h.context.runMissedDailyAutoParseIfNeeded('service-worker-start'), false);
+  }
+  assert.equal(h.calls.starts, 0); assert.equal(h.calls.notifications, 0); assert.equal(h.calls.writes, 0);
+  assert.equal(h.calls.diagnostics[0].skipReason, 'exact-coordinator-slot-already-started');
+  assert.deepEqual(h.state, before);
+});
+
+test('early slot suppression requires exact consumed coordinator generation', async () => {
+  const cases = [s => s.pipelineRun.slotAt -= 86_400_000,
+    s => s.pipelineRun.source = 'manual', s => s.pipelineRun.nightSlotDay = '2026-09-05',
+    s => s.pipelineRun.nightRequestToken = '', s => s.pipelineStage.runId = 'another-run',
+    s => s.pipelineRun.status = 'failed_to_start', s => s.lastDailyAutoParseTriggeredAt = null,
+    s => s.pipelineRun.startedAt = null, s => s.pipelineRun.finishedAt = Infinity,
+    s => s.pipelineRun.attemptedAt = s.pipelineRun.slotAt - 3 * 60 * 60_000,
+    s => s.pipelineRun.attemptedAt = s.pipelineRun.startedAt + 1,
+    s => s.pipelineStage.currentIndex = 0];
+  for (const mutate of cases) {
+    const h = makeEarlyCatchupHarness(); mutate(h.state);
+    await h.context.runMissedDailyAutoParseIfNeeded('service-worker-start');
+    assert.equal(h.calls.starts, 1, String(mutate));
+  }
+});
+
 test('every service-worker crash window around done resumes finalization or Sheets', () => {
   const resume = extractFunction('resumePreparedPipelineStageAfterRestart');
   assert.match(resume, /stage === 'done'/);

@@ -203,3 +203,56 @@ test('both final upload doors use the shared transaction helper', () => {
   assert.match(scheduler, /getOrStartFinalSheetsUpload\(runId/);
   assert.doesNotMatch(scheduler, /await uploadToSheets\(/);
 });
+
+for (const status of ['completed', 'degraded']) test(`refused new start cannot disable the exact ${status} run upload`, async () => {
+  const h = makeHarness();
+  h.state.pipelineRun.status = status;
+  h.state.lastDailyAutoParseStatus = 'blocked-pending-sheets';
+  h.state.lastDailyAutoParseFinishedAt = undefined;
+  h.resolveUpload();
+  await h.context.handleSheetsUploadWatchdog();
+  assert.equal(h.calls.uploads, 1);
+  assert.equal(h.calls.retryWrites, 1);
+  assert.equal(h.calls.stamps, 1);
+  assert.equal(h.state.pendingSheetsUpload, null);
+  assert.equal(h.state.pipelineRun.status, status);
+  assert.equal(h.state.lastDailyAutoParseStatus, 'blocked-pending-sheets');
+});
+
+test('terminal-run upload still refuses foreign pending, active/unknown stage and nonterminal run', async () => {
+  for (const mutate of [s => s.pendingSheetsUpload.runId = 'other', s => s.pipelineRun.status = 'running',
+    s => s.pipelineStage.active = true, s => delete s.pipelineStage.active,
+    s => s.pipelineStage.runId = 'other', s => delete s.pipelineRun.finishedAt,
+    s => s.pipelineStage.currentIndex = 2]) {
+    const h = makeHarness(); mutate(h.state); h.resolveUpload();
+    await h.context.handleSheetsUploadWatchdog();
+    assert.equal(h.calls.uploads, 0); assert.equal(h.calls.retryWrites, 0); assert.equal(h.calls.stamps, 0);
+  }
+});
+
+test('unknown receipt timestamps cannot clear pending without a real upload', async () => {
+  for (const timestamp of [Infinity, '2100', NaN, null]) {
+    const h = makeHarness();
+    h.state.lastSheetsUploadRunId = 'run-1'; h.state.lastSheetsUploadOkAt = timestamp;
+    h.resolveUpload(); await h.context.handleSheetsUploadWatchdog();
+    assert.equal(h.calls.uploads, 1); assert.equal(h.calls.stamps, 1);
+  }
+});
+
+test('a receipt cannot clear pending while the canonical stage is not done', async () => {
+  const h = makeHarness(); h.state.pipelineStage.currentIndex = 2;
+  h.state.lastSheetsUploadRunId = 'run-1'; h.state.lastSheetsUploadOkAt = 2100;
+  h.resolveUpload(); await h.context.handleSheetsUploadWatchdog();
+  assert.equal(h.calls.uploads, 0); assert.equal(h.calls.retryWrites, 0);
+  assert.equal(h.state.pendingSheetsUpload.runId, 'run-1');
+});
+
+test('legacy timestamp cannot clear an unconfirmed exact-run upload', async () => {
+  const h = makeHarness();
+  h.state.lastSheetsUploadRunId = 'run-1';
+  h.state.lastSheetsUploadOkAt = 1500;
+  h.state.lastDailyAutoParseFinishedAt = 1000;
+  h.resolveUpload();
+  await h.context.handleSheetsUploadWatchdog();
+  assert.equal(h.calls.uploads, 1); assert.equal(h.calls.stamps, 1);
+});
