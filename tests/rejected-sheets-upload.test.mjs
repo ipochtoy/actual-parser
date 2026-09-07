@@ -1,0 +1,103 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+import {webcrypto,createHash} from 'node:crypto';
+const source=fs.readFileSync(new URL('../background.js',import.meta.url),'utf8');
+const take=(a,b)=>source.slice(source.indexOf(a),source.indexOf(b,source.indexOf(a)));
+const protocol=take('// BEGIN REJECTED SHEETS UPLOAD ARCHIVE','// END REJECTED SHEETS UPLOAD ARCHIVE');
+const upload=take('async function uploadToSheets(','async function triggerPochtoyAutoStart(');
+const flight=take('function getOrStartFinalSheetsUpload(','// Приём внешних команд');
+const RUN='1788750000000-1788747903264-w0ec7e';
+const started=Date.parse('2026-09-07T02:25:03.314Z'),finished=Date.parse('2026-09-07T03:08:49.270Z');
+const archiveKey=`parserRejectedUploadArchive:${RUN}`;
+function harness(options={}) {
+ const item={store_name:'Amazon',order_id:'111-8440692-1955402',track_number:'TBA334181350127',product_name:'Cruel Paradise (Beautifully Cruel)',qty:null,color:'',size:'',account_name:'ipochtoy@gmail.com',composition_parsed:false,composition_reason:'empty-qty',parser_run_id:RUN,parser_account:'ipochtoy@gmail.com',observed_at:'2026-09-07T02:48:30.172Z'};
+ const run={id:RUN,status:'degraded',source:'coordinator-control',slotAt:Date.parse('2026-09-07T03:00:00Z'),attemptedAt:started-50,startedAt:started,finishedAt:finished,nightSlotDay:'2026-09-06',nightRequestToken:'night:2026-09-06:fixture-request',expected:{amazon:['ipochtoy@gmail.com']},completed:{amazon:['ipochtoy@gmail.com']},failures:[{shop:'amazon',account:'missing@example.com'}]};
+ const state={spreadsheetId:'fixture',sheetName:'Лист1',pipelineRun:run,pipelineStage:{active:false,runId:RUN,stages:['iherb','ebay','amazon','done'],stageName:'done',currentIndex:3},parsingState:{isParsingAllStores:false},pendingSheetsUpload:{runId:RUN,forSlot:run.slotAt,savedAt:finished+1},trackScreenshotQueue:[],orderData:{Amazon:{orders:[item,...Array.from({length:1246},(_,i)=>({...item,order_id:`historical-${i}`,qty:1,composition_parsed:true}))]}},amazonPaginationState:{allOrders:[{...item,order_id:'partial-cabinet'}]},screenshotArchiveLedger:{schemaVersion:1,entries:{one:{state:'delivered',archive:{link:'https://t.me/c/3888176404/36540',messageId:36540}}}},sentScreenshots:['known-ack-key'],telegramToken:'NEVER_ARCHIVE_THIS'};
+ state.nightCabinetLease={owner:'parser',phase:'running',runId:RUN,token:run.nightRequestToken,slotId:String(run.slotAt)};
+ const copies=[1,1,1,1,''].map(q=>['Amazon',item.order_id,item.track_number,item.product_name,String(q),'','','existing-archive','ipochtoy@gmail.com','','']);
+ const h={state,writes:[],post:0,append:0,success:0,reads:0};
+ const ctx={Date:class extends Date{static now(){return finished+60000}},TextEncoder,crypto:webcrypto,structuredClone,Uint8Array,URL,console:{log(){},error(){},warn(){}},DEFAULT_SPREADSHEET_ID:'fixture',parseReport:{},nightCabinetSlotDay:()=>run.nightSlotDay,normalizeAccountEmail:x=>String(x||'').trim().toLowerCase(),async uploadLogsToSheet(){throw new Error('must not upload logs after rejection')},async replayScreenshotLinks(){},async sendTelegramMessage(){},async getAuthToken(){if(options.authError)throw options.authError;return 'fake'},async readSheetData(){if(options.readError)throw options.readError;return structuredClone(copies)},async fetch(){h.post++;throw options.postError||new Error('unexpected POST')},async writeDataToSheet(){h.append++;},chrome:{runtime:{sendMessage(x){if(x.status==='success')h.success++}},storage:{local:{async get(keys){assert.notEqual(keys,null);h.reads++;options.beforeGet?.(h,keys);const out={};for(const k of Array.isArray(keys)?keys:[keys])if(k in state)out[k]=structuredClone(state[k]);return out},async set(patch){options.beforeSet?.(h,patch);h.writes.push(structuredClone(patch));Object.assign(state,structuredClone(patch));options.afterSet?.(h,patch)}}}}};
+ vm.createContext(ctx);vm.runInContext(`let finalSheetsUploadInFlight=null;let isParsingAllStores=false;let isProcessingScreenshots=false;\n${protocol}\n${flight}\n${upload}`,ctx);
+ h.ctx=ctx;h.run=()=>ctx.getOrStartFinalSheetsUpload(RUN).promise;return h;
+}
+
+test('actual prewrite refusal seals all1247 raw rows/intermediate/ACK, releases only pending, restart verifies archive',async()=>{
+ const h=harness(),before=structuredClone(h.state);await assert.rejects(h.run(),e=>e.code==='PARSER_SHEETS_QTY_CONFLICT'&&e.rejectedUploadArchived===true);
+ assert.equal(h.post+h.append+h.success,0);assert.equal(h.state.pendingSheetsUpload,null);
+ assert.deepEqual(h.state.pipelineRun,before.pipelineRun);assert.deepEqual(h.state.orderData,before.orderData);assert.deepEqual(h.state.sentScreenshots,before.sentScreenshots);
+ const saved=h.state[archiveKey],payload=JSON.parse(saved.json),receipt=h.state.parserRejectedUpload;
+ assert.equal(payload.rawRows,1247);assert.deepEqual(payload.snapshot.orderData,before.orderData);assert.deepEqual(payload.snapshot.amazonPaginationState,before.amazonPaginationState);assert.deepEqual(payload.snapshot.screenshotArchiveLedger,before.screenshotArchiveLedger);
+ assert.equal(saved.json.includes('NEVER_ARCHIVE_THIS'),false);assert.equal(receipt.sha256,createHash('sha256').update(saved.json).digest('hex'));assert.equal(receipt.bytes,Buffer.byteLength(saved.json));
+ for(const k of ['lastSheetsUploadOkAt','lastSheetsUploadRunId','lastSuccessfulDailyRunAt'])assert.equal(h.state[k],undefined);
+ assert.equal((await h.ctx.readParserRejectedUploadProof()).archiveVerified,true);
+ const restarted=harness();Object.assign(restarted.state,structuredClone(h.state));assert.equal((await restarted.ctx.readParserRejectedUploadProof()).runId,RUN);
+ await assert.rejects(restarted.run(),/no matching durable pending/);assert.equal(restarted.post,0);
+});
+for(const [name,options] of [
+ ['quota failure',{beforeSet(h,p){if(p[archiveKey])throw new Error('QUOTA_BYTES quota exceeded')}}],
+ ['readback corruption',{afterSet(h,p){if(p[archiveKey])h.state[archiveKey].json+='corrupt'}}],
+ ['raw generation race',{afterSet(h,p){if(p[archiveKey])h.state.pipelineRun.id='foreign'}}],
+ ['raw data race',{afterSet(h,p){if(p[archiveKey])h.state.orderData.Amazon.orders[0].qty=42}}],
+ ['ACK race',{afterSet(h,p){if(p[archiveKey])h.state.sentScreenshots.push('concurrent')}}],
+ ['forged network type',{readError:Object.assign(new Error('network'),{code:'PARSER_SHEETS_QTY_CONFLICT'})}],
+ ['OAuth',{authError:new Error('OAuth unavailable')}],
+])test(`${name} cannot release pending or claim Sheets success`,async()=>{
+ const h=harness(options);if(options.authError)for(const row of h.state.orderData.Amazon.orders){row.qty=2;row.composition_parsed=true}await assert.rejects(h.run());assert.equal(h.state.pendingSheetsUpload?.runId,RUN);assert.equal(h.state.parserRejectedUpload,undefined);assert.equal(h.success,0);
+});
+test('whole byte cap refuses without truncating/writing archive',async()=>{const h=harness();h.state.amazonPaginationState.large='x'.repeat(16*1024*1024);await assert.rejects(h.run(),/whole-data limit/);assert.equal(h.state.pendingSheetsUpload.runId,RUN);assert.equal(h.state[archiveKey],undefined)});
+test('existing unequal immutable archive is never overwritten',async()=>{const h=harness();h.state[archiveKey]={schema:1,json:'old'};await assert.rejects(h.run(),/already differs/);assert.equal(h.state[archiveKey].json,'old');assert.equal(h.state.pendingSheetsUpload.runId,RUN)});
+test('matching error message without actual brand cannot archive',async()=>{const h=harness();const result=await h.ctx.archiveRejectedSheetsUpload(RUN,Object.assign(new Error('Conflicting Sheets quantities require a complete exact Parser item'),{code:'PARSER_SHEETS_QTY_CONFLICT'}));assert.equal(result,false);assert.equal(h.writes.length,0)});
+test('post-write uncertainty stays pending and receives no rejected outcome',async()=>{const h=harness();for(const item of h.state.orderData.Amazon.orders){item.qty=2;item.composition_parsed=true}await assert.rejects(h.run(),/unexpected POST/);assert.equal(h.post,1);assert.equal(h.state.pendingSheetsUpload.runId,RUN);assert.equal(h.state.parserRejectedUpload,undefined)});
+for(const field of ['sha256','runId','requestToken','archiveKey','rawRows'])test(`receipt ${field} corruption stops handoff`,async()=>{const h=harness();await assert.rejects(h.run());h.state.parserRejectedUpload[field]='foreign';assert.equal(await h.ctx.readParserRejectedUploadProof(),null)});
+test('active queue and changed raw after rejection cannot authorize handoff',async()=>{for(const mutate of [h=>h.state.trackScreenshotQueue.push({track:'late'}),h=>h.state.orderData.Amazon.orders.pop(),h=>h.state.pipelineStage.active=true]){const h=harness();await assert.rejects(h.run());mutate(h);assert.equal(await h.ctx.readParserRejectedUploadProof(),null)}});
+
+for(const [name,mutate] of [
+ ['parser volatile',h=>vm.runInContext('isParsingAllStores=true',h.ctx)],
+ ['screenshot volatile',h=>vm.runInContext('isProcessingScreenshots=true',h.ctx)],
+ ['reuse tab',h=>h.state.parserScreenshotReuseTab={tabId:1}],
+ ['local tab',h=>h.state.parserScreenshotLocalTab={tabId:2}],
+ ['active budget',h=>h.state.screenshotStageBudget={activeSince:1}],
+ ['foreign lease',h=>h.state.nightCabinetLease.token='foreign'],
+])test(`${name} blocks archiving and release`,async()=>{const h=harness();mutate(h);await assert.rejects(h.run());assert.equal(h.state.pendingSheetsUpload.runId,RUN);assert.equal(h.state.parserRejectedUpload,undefined)});
+if(process.env.PARSER_REJECTED_UPLOAD_FORENSIC_FIXTURE)test('private exact degraded1247 forensic state is preserved whole with its real diagnostics',async()=>{
+ const file=fs.readFileSync(process.env.PARSER_REJECTED_UPLOAD_FORENSIC_FIXTURE);
+ assert.equal(createHash('sha256').update(file).digest('hex'),process.env.PARSER_REJECTED_UPLOAD_FORENSIC_SHA);
+ const forensic=JSON.parse(file);const h=harness();Object.assign(h.state,structuredClone(forensic.state));
+ const before=structuredClone(h.state);await assert.rejects(h.run(),e=>e.rejectedUploadArchived===true);
+ const data=JSON.parse(h.state[archiveKey].json);assert.equal(data.rawRows,1247);
+ for(const key of ['orderData','amazonMultiAccountLog','amazonTimeoutAttempt','parsingLogs','nightCabinetLease','lastDailyAutoParseStatus'])assert.deepEqual(data.snapshot[key],before[key]??null);
+});
+
+test('sealed archive resumes after a transient guard failure and diagnostic drift without overwriting it',async()=>{
+ let first=true;const h=harness({afterSet(h,p){if(p[archiveKey]&&first){first=false;h.state.parserScreenshotLocalTab={tabId:7}}}});
+ h.state.parsingLogs=['original'];await assert.rejects(h.run(),/source changed after archive/);const saved=structuredClone(h.state[archiveKey]);
+ assert.equal(h.state.pendingSheetsUpload.runId,RUN);delete h.state.parserScreenshotLocalTab;h.state.parsingLogs=['new diagnostic'];h.state.lastDailyAutoParseStatus='blocked-pending-sheets';
+ await assert.rejects(h.run(),e=>e.rejectedUploadArchived===true);assert.deepEqual(h.state[archiveKey],saved);assert.deepEqual(JSON.parse(saved.json).snapshot.parsingLogs,['original']);
+ assert.equal((await h.ctx.readParserRejectedUploadProof()).archiveVerified,true);h.state.parsingLogs.push('later alarm');assert.equal((await h.ctx.readParserRejectedUploadProof()).archiveVerified,true);
+});
+test('row count cap refuses without silently truncating raw rows',async()=>{const h=harness();h.state.orderData.Amazon.orders=Array.from({length:20001},(_,i)=>({...h.state.orderData.Amazon.orders[i?1:0],order_id:i?`count-${i}`:h.state.orderData.Amazon.orders[0].order_id}));await assert.rejects(h.run(),/row count/);assert.equal(h.state.pendingSheetsUpload.runId,RUN);assert.equal(h.state[archiveKey],undefined)});
+function installCanonicalDoor(h) {
+ const {ctx}=h,now=finished+60000;
+ Object.assign(ctx,{nightCabinetLeaseWriteChain:Promise.resolve(),NIGHT_CABINET_LEASE_KEY:'nightCabinetLease',NIGHT_CABINET_LEASE_TTL_MS:900000,NIGHT_CABINET_TIME_ZONE:'America/New_York',NIGHT_CABINET_OWNERS:new Set(['store-walk','parser']),NIGHT_CABINET_PHASES:new Set(['running','ready','store-catchup','store-main','completed','degraded']),NIGHT_CABINET_TRANSITION_REQUEST_KEY:'nightCoordinatorLeaseTransitionRequest',NIGHT_CABINET_TRANSITION_RESULT_KEY:'nightCoordinatorLeaseTransitionResult',NIGHT_CABINET_TRANSITION_HANDLED_KEY:'lastHandledNightCoordinatorLeaseTransitionId',NIGHT_CABINET_CATCHUP_RESUME_KEY:'nightCabinetCatchupResumeMarkers',nightCabinetLeaseSlotIds:()=>[String(h.state.pipelineRun.slotAt)]});
+ h.state.nightCabinetLease={...h.state.nightCabinetLease,heartbeat:now-1,expires:now+900000};
+ vm.runInContext([
+  take('function inspectNightCabinetLease(','function nightCabinetTerminalSlotProof('),
+  take('function nightCabinetTerminalSlotProof(','async function scheduleNightCabinetRetry('),
+  take('async function handleNightCoordinatorLeaseTransitionRequest(','async function handleNightCoordinatorLeaseTransitionWake('),
+ ].join('\n'),ctx);
+}
+test('actual canonical handoff consumes failed proof, then exact ready retry revalidates unchanged archive without old owner fiction',async()=>{
+ const h=harness();installCanonicalDoor(h);await assert.rejects(h.run(),e=>e.rejectedUploadArchived===true);
+ const lease=h.state.nightCabinetLease,nextToken=`${lease.token}:attempt-2`;
+ h.state.nightCoordinatorLeaseTransitionRequest={requestId:'failure-retry-fixture',requestedAt:finished+60000,expected:{state:'present',slotId:lease.slotId,owner:lease.owner,phase:lease.phase,token:lease.token,runId:RUN},desired:{slotId:lease.slotId,owner:'parser',phase:'ready',token:nextToken}};
+ const result=await h.ctx.handleNightCoordinatorLeaseTransitionRequest();assert.equal(result.ok,true);assert.equal(h.state.nightCabinetLease.phase,'ready');assert.equal(h.state.nightCabinetLease.token,nextToken);
+ assert.equal(await h.ctx.readParserRejectedUploadProof(),null,'default proof cannot claim the old owner after handoff');
+ assert.equal((await h.ctx.readParserRejectedUploadProof({readyRetryToken:nextToken})).archiveVerified,true);
+ assert.equal(await h.ctx.readParserRejectedUploadProof({readyRetryToken:'foreign-token-value'}),null);
+ h.state.orderData.Amazon.orders[0].qty=8;assert.equal(await h.ctx.readParserRejectedUploadProof({readyRetryToken:nextToken}),null);
+ assert.equal(h.state.lastSheetsUploadRunId,undefined);
+});
+
+test('volatile work starting during archive proof read prevents a quiescent handoff',async()=>{const h=harness({beforeGet(h,keys){if(h.flipProof&&keys.includes(archiveKey))vm.runInContext('isProcessingScreenshots=true',h.ctx)}});await assert.rejects(h.run());h.flipProof=true;assert.equal(await h.ctx.readParserRejectedUploadProof(),null)});

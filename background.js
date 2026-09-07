@@ -512,9 +512,14 @@ async function handleNightCoordinatorLeaseTransitionRequest() {
                 && (expected.runId ? current.runId === expected.runId : !current.runId);
         if (!exactCurrent) return finish(false, 'transition-current-proof-mismatch');
 
-        const terminalProof = current?.owner === 'parser' && current.phase === 'running'
+        let terminalProof = current?.owner === 'parser' && current.phase === 'running'
             ? nightCabinetTerminalProof(state, current)
             : false;
+        if (!terminalProof && current?.owner === 'parser' && current.phase === 'running') {
+            const rejected = await readParserRejectedUploadProof();
+            terminalProof = !!rejected && rejected.runId === current.runId
+                && rejected.requestToken === current.token && String(rejected.slotAt) === current.slotId;
+        }
         const catchupResumeCandidate = current?.owner === 'store-walk'
             && current.phase === 'degraded'
             && current.slotId === request.desired.slotId
@@ -716,6 +721,11 @@ async function runDailyAutoParseOnce(source, coordinator = null) {
         await addDailyDiagnostic('run-skip', { source, skipReason: 'pending-sheets-upload' });
         return false;
     }
+
+    if (typeof rejectedUploadArchiveInFlight !== 'undefined' && rejectedUploadArchiveInFlight) return false;
+    const rejectedState = await chrome.storage.local.get(['pipelineRun', 'parserRejectedUpload']);
+    if (rejectedState.parserRejectedUpload?.runId === rejectedState.pipelineRun?.id
+        && !await readParserRejectedUploadProof({ readyRetryToken: coordinator?.external === true ? coordinator.token : null })) return false;
 
     const slotId = coordinator?.slotId || nightCabinetSlotId();
     const externalCoordinator = coordinator?.external === true;
@@ -6853,6 +6863,186 @@ keepPeriodicAlarm(SHEETS_UPLOAD_WATCHDOG_ALARM, 2);
 // completion timer and the alarm watchdog can never append the same run twice.
 let finalSheetsUploadInFlight = null;
 
+// BEGIN REJECTED SHEETS UPLOAD ARCHIVE
+// Only a refusal created by our pre-write planner can enter this protocol.
+// Network/auth/unknown POST errors, including lookalike error codes, cannot.
+const sheetsPrewriteQtyRefusals = new WeakMap();
+let rejectedUploadArchiveInFlight = null;
+const REJECTED_UPLOAD_KEYS = [
+    'pipelineRun', 'pipelineStage', 'parsingState', 'pendingSheetsUpload', 'orderData',
+    'amazonPaginationState', 'amazonMissingTabRecoveries', 'amazonOrders', 'ebayOrders', 'iherbOrders',
+    'multiAccountState', 'multiAccountIherbState', 'iherbParsedAccounts', 'amazonParsingIncomplete',
+    'iherbCancelledOrders', 'ebayCancelledOrders', 'amazonCancelledOrders',
+    'trackScreenshotQueue', 'screenshotQueueBlocked', 'screenshotArchiveLedger', 'sentScreenshots',
+    'screenshotDeadLetter', 'screenshotStageBudget', 'parseReport', 'progressState',
+    'iherbStageFinalizing', 'amazonStageFinalizing', 'pendingIherbSwitch', 'pendingAccountSwitch',
+    'parserRejectedUpload', 'parserScreenshotReuseTab', 'parserScreenshotLocalTab',
+    'parsingLogs', 'amazonMultiAccountLog', 'amazonTimeoutAttempt', 'nightCabinetLease',
+    'lastDailyAutoParseStatus', 'lastDailyAutoParseAttemptedAt', 'lastDailyAutoParseTriggeredAt',
+    'lastDailyAutoParseStartedAt', 'lastDailyAutoParseFinishedAt', 'lastDailyAutoParseSource', 'lastDailyAutoParseError',
+    'lastDailyAutoParseCatchupAt', 'lastDailyAutoParseCatchupReason', 'lastDailyAutoParseMissedSlot',
+    'lastSheetsUploadRunId', 'lastSheetsUploadOkAt'
+];
+const REJECTED_UPLOAD_MAX_BYTES = 16 * 1024 * 1024;
+const REJECTED_UPLOAD_MAX_ROWS = 20000;
+
+function rejectedUploadScope(state, runId, pendingRequired, readyRetryToken = null) {
+    const run = state?.pipelineRun, stage = state?.pipelineStage, lease = state?.nightCabinetLease;
+    return typeof isParsingAllStores !== 'undefined' && isParsingAllStores === false
+        && typeof isProcessingScreenshots !== 'undefined' && isProcessingScreenshots === false
+        && !state.parserScreenshotReuseTab && !state.parserScreenshotLocalTab
+        && (state.screenshotStageBudget?.activeSince == null)
+        && lease?.owner === 'parser' && lease.slotId === String(run?.slotAt)
+        && ((lease.phase === 'running' && lease.runId === runId && lease.token === run?.nightRequestToken)
+            || (typeof readyRetryToken === 'string' && readyRetryToken.length >= 16
+                && lease.phase === 'ready' && !lease.runId && lease.token === readyRetryToken
+                && lease.token !== run?.nightRequestToken))
+        && !!runId && /^[A-Za-z0-9._:-]{1,200}$/.test(runId)
+        && run?.id === runId && ['completed', 'degraded'].includes(run.status)
+        && run.source === 'coordinator-control'
+        && Number.isFinite(run.finishedAt) && run.finishedAt <= Date.now()
+        && Number.isFinite(run.slotAt) && run.nightSlotDay === nightCabinetSlotDay(String(run.slotAt))
+        && typeof run.nightRequestToken === 'string' && run.nightRequestToken.length >= 16
+        && stage?.runId === runId && stage.active === false && stage.stageName === 'done'
+        && stage.currentIndex === 3 && JSON.stringify(stage.stages) === JSON.stringify(['iherb','ebay','amazon','done'])
+        && state.parsingState?.isParsingAllStores === false
+        && Array.isArray(state.trackScreenshotQueue) && state.trackScreenshotQueue.length === 0
+        && !state.screenshotQueueBlocked && !state.iherbStageFinalizing && !state.amazonStageFinalizing
+        && !state.pendingIherbSwitch && !state.pendingAccountSwitch
+        && (pendingRequired
+            ? state.pendingSheetsUpload?.runId === runId && state.pendingSheetsUpload.forSlot === run.slotAt
+                && Number.isFinite(state.pendingSheetsUpload.savedAt) && state.pendingSheetsUpload.savedAt >= run.finishedAt
+            : state.pendingSheetsUpload === null);
+}
+
+async function rejectedUploadDigest(text) {
+    const bytes = new TextEncoder().encode(text);
+    if (bytes.length > REJECTED_UPLOAD_MAX_BYTES) throw new Error('Rejected upload archive exceeds its whole-data limit');
+    const hash = await crypto.subtle.digest('SHA-256', bytes);
+    return { bytes: bytes.length, sha256: Array.from(new Uint8Array(hash), x => x.toString(16).padStart(2, '0')).join('') };
+}
+
+function rejectedUploadSnapshot(state) {
+    const snapshot = {};
+    for (const key of REJECTED_UPLOAD_KEYS) if (key !== 'parserRejectedUpload') snapshot[key] = state[key] ?? null;
+    return snapshot;
+}
+
+function rejectedUploadCritical(state, includePending = true, ignoreLease = false) {
+    const critical = rejectedUploadSnapshot(state);
+    for (const key of Object.keys(critical)) {
+        if (['parsingLogs','amazonMultiAccountLog','amazonTimeoutAttempt','parseReport','progressState','screenshotStageBudget'].includes(key)
+            || key.startsWith('lastDailyAutoParse')) delete critical[key];
+    }
+    const lease = state.nightCabinetLease;
+    critical.nightCabinetLease = lease ? { owner: lease.owner, phase: lease.phase,
+        runId: lease.runId, token: lease.token, slotId: lease.slotId } : null;
+    if (!includePending) delete critical.pendingSheetsUpload;
+    if (ignoreLease) delete critical.nightCabinetLease;
+    return critical;
+}
+
+// Re-reads and hashes the immutable archive. Consumers receive only its receipt,
+// never the private raw rows/ACK ledger. A boolean stored beside a hash is not proof.
+async function readParserRejectedUploadProof({ readyRetryToken = null } = {}) {
+    if (rejectedUploadArchiveInFlight || finalSheetsUploadInFlight || uploadToSheets.activeCount > 0) return null;
+    const state = await chrome.storage.local.get(REJECTED_UPLOAD_KEYS);
+    const outcome = state.parserRejectedUpload, run = state.pipelineRun;
+    if (!outcome || !rejectedUploadScope(state, outcome.runId, false, readyRetryToken)
+        || outcome.schema !== 1 || outcome.status !== 'rejected_preflight'
+        || outcome.code !== 'PARSER_SHEETS_QTY_CONFLICT' || outcome.runId !== run.id
+        || outcome.slotAt !== run.slotAt || outcome.nightSlotDay !== run.nightSlotDay
+        || outcome.requestToken !== run.nightRequestToken || outcome.finishedAt !== run.finishedAt
+        || !Number.isFinite(outcome.rejectedAt) || outcome.rejectedAt < run.finishedAt || outcome.rejectedAt > Date.now()
+        || outcome.archiveKey !== `parserRejectedUploadArchive:${run.id}`) return null;
+    const archive = (await chrome.storage.local.get([outcome.archiveKey]))[outcome.archiveKey];
+    if (!archive || archive.schema !== 1 || typeof archive.json !== 'string') return null;
+    const digest = await rejectedUploadDigest(archive.json);
+    if (digest.sha256 !== outcome.sha256 || digest.bytes !== outcome.bytes) return null;
+    const data = JSON.parse(archive.json), snap = data.snapshot;
+    if (!rejectedUploadScope(snap, run.id, true)) return null;
+    const stores = Object.values(snap.orderData || {});
+    if (!stores.length || stores.some(store => !Array.isArray(store?.orders))
+        || data.rawRows > REJECTED_UPLOAD_MAX_ROWS
+        || stores.reduce((sum, store) => sum + store.orders.length, 0) !== data.rawRows) return null;
+    if (data.schema !== 1 || data.code !== outcome.code || data.runId !== run.id
+        || JSON.stringify(data.destination) !== JSON.stringify(outcome.destination)
+        || JSON.stringify(snap?.pipelineRun) !== JSON.stringify(run)
+        || JSON.stringify(rejectedUploadCritical(snap, false, !!readyRetryToken)) !== JSON.stringify(rejectedUploadCritical(state, false, !!readyRetryToken))
+        || data.rawRows !== outcome.rawRows || !Number.isSafeInteger(data.rawRows) || data.rawRows < 1) return null;
+    const fresh = await chrome.storage.local.get(REJECTED_UPLOAD_KEYS);
+    if (rejectedUploadArchiveInFlight || finalSheetsUploadInFlight || uploadToSheets.activeCount > 0
+        || !rejectedUploadScope(fresh, outcome.runId, false, readyRetryToken)
+        || JSON.stringify(rejectedUploadCritical(fresh, false)) !== JSON.stringify(rejectedUploadCritical(state, false))
+        || JSON.stringify(fresh.parserRejectedUpload) !== JSON.stringify(outcome)) return null;
+    return { ...outcome, archiveVerified: true, browserQuiescent: true };
+}
+
+async function archiveRejectedSheetsUpload(runId, error) {
+    const refusal = sheetsPrewriteQtyRefusals.get(error);
+    if (!refusal || refusal.runId !== runId) return false;
+    if (rejectedUploadArchiveInFlight) throw new Error('Rejected upload archive already active');
+    const fence = { runId };
+    rejectedUploadArchiveInFlight = fence;
+    try {
+        const state = await chrome.storage.local.get(REJECTED_UPLOAD_KEYS);
+        if (!rejectedUploadScope(state, runId, true) || finalSheetsUploadInFlight?.runId !== runId
+            || uploadToSheets.activeCount > 0
+            || JSON.stringify(state.orderData) !== refusal.rawJSON) throw new Error('Rejected upload source changed before archive');
+        const snapshot = rejectedUploadSnapshot(state);
+        let rawRows = 0;
+        if (!snapshot.orderData || typeof snapshot.orderData !== 'object') throw new Error('Rejected upload raw data missing');
+        for (const store of Object.values(snapshot.orderData)) {
+            if (!store || !Array.isArray(store.orders)) throw new Error('Rejected upload raw data malformed');
+            rawRows += store.orders.length;
+        }
+        if (!rawRows || rawRows > REJECTED_UPLOAD_MAX_ROWS) throw new Error('Rejected upload raw row count outside its whole-data limit');
+        let json = JSON.stringify({ schema: 1, code: 'PARSER_SHEETS_QTY_CONFLICT', runId,
+            destination: refusal.destination, collision: refusal.collision, rawRows, snapshot });
+        await rejectedUploadDigest(json);
+        const archiveKey = `parserRejectedUploadArchive:${runId}`;
+        const existing = (await chrome.storage.local.get([archiveKey]))[archiveKey];
+        if (existing) {
+            if (existing.schema !== 1 || typeof existing.json !== 'string') throw new Error('Rejected upload archive already differs');
+            await rejectedUploadDigest(existing.json);
+            let prior; try { prior = JSON.parse(existing.json); } catch (_) { throw new Error('Rejected upload archive already differs'); }
+            if (prior.schema !== 1 || prior.code !== 'PARSER_SHEETS_QTY_CONFLICT' || prior.runId !== runId
+                || prior.rawRows !== rawRows || JSON.stringify(prior.destination) !== JSON.stringify(refusal.destination)
+                || JSON.stringify(prior.collision) !== JSON.stringify(refusal.collision)
+                || JSON.stringify(rejectedUploadCritical(prior.snapshot || {})) !== JSON.stringify(rejectedUploadCritical(snapshot))) {
+                throw new Error('Rejected upload archive already differs');
+            }
+            // Resume the original immutable diagnostic snapshot, never rewrite it.
+            json = existing.json;
+        }
+        const digest = await rejectedUploadDigest(json);
+        // Write the whole immutable archive first. Never clear pending in this write.
+        if (!existing) await chrome.storage.local.set({ [archiveKey]: { schema: 1, json } });
+        const saved = (await chrome.storage.local.get([archiveKey]))[archiveKey];
+        if (saved?.schema !== 1 || saved.json !== json) throw new Error('Rejected upload archive readback failed');
+        const fresh = await chrome.storage.local.get(REJECTED_UPLOAD_KEYS);
+        if (!rejectedUploadScope(fresh, runId, true) || finalSheetsUploadInFlight?.runId !== runId
+            || uploadToSheets.activeCount > 0
+            || JSON.stringify(rejectedUploadCritical(fresh)) !== JSON.stringify(rejectedUploadCritical(snapshot))) throw new Error('Rejected upload source changed after archive');
+        const outcome = { schema: 1, status: 'rejected_preflight', code: 'PARSER_SHEETS_QTY_CONFLICT',
+            runId, slotAt: state.pipelineRun.slotAt, nightSlotDay: state.pipelineRun.nightSlotDay,
+            requestToken: state.pipelineRun.nightRequestToken, finishedAt: state.pipelineRun.finishedAt,
+            rejectedAt: Date.now(), archiveKey, ...digest, rawRows, destination: refusal.destination,
+            priorSheetsWrites: 'not-certified' };
+        await chrome.storage.local.set({ parserRejectedUpload: outcome, pendingSheetsUpload: null });
+        const after = await chrome.storage.local.get(['pipelineRun','pendingSheetsUpload','parserRejectedUpload']);
+        if (after.pipelineRun?.id !== runId || after.pendingSheetsUpload !== null
+            || JSON.stringify(after.parserRejectedUpload) !== JSON.stringify(outcome)) throw new Error('Rejected upload outcome readback failed');
+        error.rejectedUploadArchived = true;
+        return true;
+    } finally {
+        if (rejectedUploadArchiveInFlight === fence) rejectedUploadArchiveInFlight = null;
+    }
+}
+// END REJECTED SHEETS UPLOAD ARCHIVE
+
+
+
 function getOrStartFinalSheetsUpload(runId, { source = 'unknown', beforeStart = null } = {}) {
     if (!runId) throw new Error('missing final Sheets upload runId');
     if (finalSheetsUploadInFlight) {
@@ -6903,7 +7093,12 @@ function getOrStartFinalSheetsUpload(runId, { source = 'unknown', beforeStart = 
         // really owns a new attempt. A caller joining an existing timer never
         // consumes another retry.
         if (typeof beforeStart === 'function') await beforeStart();
-        await uploadToSheets(runId);
+        try {
+            await uploadToSheets(runId);
+        } catch (error) {
+            if (typeof archiveRejectedSheetsUpload === 'function') await archiveRejectedSheetsUpload(runId, error);
+            throw error;
+        }
         await uploadLogsToSheet();
         await markSheetsUploadSuccess(runId);
         return { status: 'uploaded', runId };
@@ -7632,7 +7827,7 @@ function checkAllStoresCompleted() {
 
 async function checkAllStoresCompletedOnce() {
     if (storesCompleted.ebay && storesCompleted.iherb && storesCompleted.amazon) {
-        const runState = await chrome.storage.local.get(['pipelineRun', 'pipelineStage', 'pendingSheetsUpload']);
+        const runState = await chrome.storage.local.get(['pipelineRun', 'pipelineStage', 'pendingSheetsUpload', 'parserRejectedUpload']);
         const runId = runState.pipelineRun?.id || null;
         if (!runId
             || !['completed', 'degraded'].includes(runState.pipelineRun?.status)
@@ -7640,6 +7835,10 @@ async function checkAllStoresCompletedOnce() {
             || runState.pipelineStage?.runId !== runId
             || runState.pipelineStage?.currentIndex !== PIPELINE_STAGES.length - 1) {
             console.log('⏳ Final upload waits for the terminal pipeline stage');
+            return;
+        }
+        if (runState.parserRejectedUpload?.runId === runId) {
+            console.warn('Sheets upload remains rejected; its original raw data is archived');
             return;
         }
         if (finalUploadScheduledRunId === runId || runState.pendingSheetsUpload?.runId === runId) {
@@ -7684,6 +7883,7 @@ async function checkAllStoresCompletedOnce() {
                 } catch (e) {
                     sheetsUploadErr = e;
                     console.error(`❌ Выгрузка в Google Sheets провалилась (попытка ${attempt}/3):`, e?.message || e);
+                    if (e?.rejectedUploadArchived === true) break;
                     if (attempt < 3) await new Promise(r => setTimeout(r, 60000));
                 }
             }
@@ -7692,7 +7892,9 @@ async function checkAllStoresCompletedOnce() {
                 // sheetsUploadWatchdog через alarm (переживает сон SW).
                 const msg = String(sheetsUploadErr?.message || sheetsUploadErr).slice(0, 300);
                 console.error('❌ Выгрузка в Google Sheets не удалась после 3 попыток (догонит alarm):', msg);
-                try { await sendTelegramMessage(`❗ Выгрузка в Google Sheets не удалась после 3 попыток: ${msg}`); } catch (_) {}
+                try { await sendTelegramMessage(sheetsUploadErr?.rejectedUploadArchived === true
+                    ? '❗ Выгрузка остановлена: количество товара не доказано. Исходные данные сохранены; успешная выгрузка не подтверждена.'
+                    : `❗ Выгрузка в Google Sheets не удалась после 3 попыток: ${msg}`); } catch (_) {}
             }
             if (screenshotsEnabled && trackScreenshotQueue.length > 0) {
                 await processScreenshotQueue();
@@ -7951,6 +8153,8 @@ async function checkAllStoresCompletedOnce() {
 }
 
 async function uploadToSheets(runId = null) {
+    if (typeof rejectedUploadArchiveInFlight !== 'undefined' && rejectedUploadArchiveInFlight) throw new Error('Rejected upload archive is being sealed');
+    uploadToSheets.activeCount = (uploadToSheets.activeCount || 0) + 1;
     try {
         // Get settings from storage
         const result = await chrome.storage.local.get([
@@ -8167,7 +8371,14 @@ async function uploadToSheets(runId = null) {
                  const qtyConflict = new Set(copies.map(x => x.cells[4])).size > 1;
                  const positiveQty = /^[1-9]\d*$/.test(r[4]) && Number.isSafeInteger(Number(r[4]));
                  if (qtyConflict && (allOrders[index].composition_parsed !== true || !positiveQty)) {
-                     throw new Error('Conflicting Sheets quantities require a complete exact Parser item');
+                     const error = new Error('Conflicting Sheets quantities require a complete exact Parser item');
+                     error.code = 'PARSER_SHEETS_QTY_CONFLICT';
+                     if (runId && typeof sheetsPrewriteQtyRefusals !== 'undefined') {
+                         sheetsPrewriteQtyRefusals.set(error, { runId, rawJSON: JSON.stringify(orderData),
+                             destination: { spreadsheetId, sheetName },
+                             collision: { key, item: structuredClone(allOrders[index]), copies: structuredClone(copies) } });
+                     }
+                     throw error;
                  }
                  for (const copy of copies) {
                      const parsed = allOrders[index].composition_parsed === true && positiveQty;
@@ -8304,6 +8515,8 @@ async function uploadToSheets(runId = null) {
         chrome.runtime.sendMessage({ action: 'uploadComplete', status: 'error', message: `Upload Error: ${error.message}` });
         sendTelegramMessage(`❌ Ошибка загрузки: ${error.message}`);
         throw error;
+    } finally {
+        uploadToSheets.activeCount--;
     }
 }
 

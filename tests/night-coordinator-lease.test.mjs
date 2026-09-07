@@ -613,6 +613,7 @@ function leaseTransitionHarness({ destination = 'store-walk', blockTransitionSet
     nightCabinetSlotId() { return slotId; },
     nightCabinetLeaseSlotIds() { return [slotId]; },
     nightCabinetSlotDay() { return '2026-08-20'; },
+    async readParserRejectedUploadProof() { return null; }, // This legacy fixture has no rejected archive.
     async loadAccountsConfig() { return {}; },
     buildExpectedPipelineRoster() { return { iherb: [], ebay: [], amazon: [] }; },
     chrome: {
