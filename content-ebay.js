@@ -441,6 +441,7 @@ async function parseEbayOrders() {
             headers: { 'Accept': 'application/json' },
             signal: ac.signal
           });
+          if (!response.ok) throw new Error(`eBay HTTP ${response.status}`);
           responseText = await response.text();
         } catch (netErr) {
           if (pageAttempt < MAX_PAGE_RETRIES) {
@@ -451,11 +452,9 @@ async function parseEbayOrders() {
             await new Promise(r => setTimeout(r, backoff));
             continue;
           }
-          console.error(`❌ Page ${page} fetch failed ${MAX_PAGE_RETRIES}x (${netErr.name}) — skipping`);
-          sendLog('-', '-', '❌ Page LOST', `Page ${page}: fetch failed ${MAX_PAGE_RETRIES}x — its orders were skipped`);
-          pageAttempt = 0;
-          page++;
-          continue;
+          // A later readable page cannot prove the missing page was scanned.
+          // Fail the cabinet before replacing its rows or emitting Done.
+          throw new Error(`eBay page ${page} incomplete: fetch failed after ${MAX_PAGE_RETRIES} retries (${netErr.message})`);
         } finally {
           clearTimeout(to);
         }
@@ -472,17 +471,15 @@ async function parseEbayOrders() {
           await new Promise(r => setTimeout(r, backoff));
           continue; // Retry SAME page (page unchanged)
         }
-        // Exhausted retries — LOUD skip so lost orders aren't invisible
-        console.error(`❌ Page ${page} failed ${MAX_PAGE_RETRIES}x (upstream error) — skipping, orders on it are LOST`);
-        sendLog('-', '-', '❌ Page LOST', `Page ${page}: upstream error ${MAX_PAGE_RETRIES}x — its orders were skipped`);
-        pageAttempt = 0;
-        page++;
-        continue;
+        throw new Error(`eBay page ${page} incomplete: upstream error after ${MAX_PAGE_RETRIES} retries`);
       }
 
-      let data;
+      let data, items;
       try {
         data = JSON.parse(responseText);
+        items = data?.modules?.RIVER?.[0]?.data?.items
+          ?? data?.data?.modules?.RIVER?.[0]?.data?.items;
+        if (!Array.isArray(items)) throw new Error('eBay feed has no valid item array');
       } catch (parseError) {
         console.error(`❌ JSON parse error on page ${page}:`, responseText.substring(0, 100));
         if (pageAttempt < MAX_PAGE_RETRIES) {
@@ -493,20 +490,13 @@ async function parseEbayOrders() {
           await new Promise(r => setTimeout(r, backoff));
           continue; // Retry SAME page (page unchanged)
         }
-        // Exhausted retries — LOUD skip so lost orders aren't invisible
-        console.error(`❌ Page ${page} invalid JSON ${MAX_PAGE_RETRIES}x — skipping, orders on it are LOST`);
-        sendLog('-', '-', '❌ Page LOST', `Page ${page}: invalid JSON ${MAX_PAGE_RETRIES}x — its orders were skipped`);
-        pageAttempt = 0;
-        page++;
-        continue; // Skip this page
+        throw new Error(`eBay page ${page} incomplete: invalid feed after ${MAX_PAGE_RETRIES} retries`);
       }
 
       // Page parsed cleanly — reset the per-page retry counter for the next page.
       pageAttempt = 0;
 
-      let items = data.modules?.RIVER?.[0]?.data?.items || data.data?.modules?.RIVER?.[0]?.data?.items;
-
-      if (!items || items.length === 0) {
+      if (items.length === 0) {
         console.log(`📭 No more items on page ${page}`);
         hasMore = false;
       } else {
