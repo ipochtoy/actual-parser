@@ -233,11 +233,97 @@ function nightCabinetTerminalSlotProof(state, slotId) {
     });
 }
 
+// A manual control grants only a bounded real-time slot. It is separate from the
+// daily alarm and never changes the scheduler's native slot list.
+function inspectManualControlEnvelope(value, { now = Date.now() } = {}) {
+    const keys = ['schemaVersion','kind','id','requestSha','coordinatorRunId','createdAt','deadlineAt','nextNativeAdmissionAt'];
+    const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
+    if (!value || typeof value !== 'object' || Array.isArray(value)
+        || Object.keys(value).length !== keys.length || Object.keys(value).some(k => !keys.includes(k))
+        || value.schemaVersion !== 1 || value.kind !== 'manual-control'
+        || !uuid.test(value.id || '') || !uuid.test(value.coordinatorRunId || '')
+        || !/^[a-f0-9]{64}$/.test(value.requestSha || '')
+        || ![value.createdAt,value.deadlineAt,value.nextNativeAdmissionAt,now].every(Number.isSafeInteger)
+        || value.createdAt <= 0 || value.createdAt > now || now >= value.deadlineAt
+        || value.deadlineAt <= value.createdAt + 15 * 60_000
+        || value.deadlineAt > value.createdAt + 570 * 60_000) return { ok: false, reason: 'manual-control-invalid' };
+    const day = nightCabinetSlotDay(String(value.createdAt));
+    const noon = Date.parse(`${day}T12:00:00Z`);
+    const hour = Number(new Intl.DateTimeFormat('en-US', { timeZone: NIGHT_CABINET_TIME_ZONE, hour: 'numeric', hourCycle: 'h23' }).format(new Date(noon)));
+    const nextNative = noon + (20.5 - hour) * 60 * 60_000;
+    if (value.nextNativeAdmissionAt !== nextNative || value.deadlineAt > nextNative - 15 * 60_000) return { ok: false, reason: 'manual-control-native-boundary' };
+    return { ok: true, envelope: Object.fromEntries(keys.map(k => [k,value[k]])), workDeadlineAt: value.deadlineAt - 15 * 60_000 };
+}
+
+function manualControlEnvelopeEqual(a, b) {
+    return !!a && !!b && Object.keys(a).length === Object.keys(b).length
+        && Object.keys(a).every(k => Object.prototype.hasOwnProperty.call(b,k) && a[k] === b[k]);
+}
+
+function manualControlTokenAllowed(envelope, desired) {
+    if (desired.slotId !== String(envelope.createdAt)) return false;
+    const prefix = `control:${envelope.id}:`;
+    if (desired.owner === 'parser') return desired.phase === 'ready' && desired.token === `${prefix}parser-1`;
+    return desired.owner === 'store-walk' && ((desired.token === `${prefix}main` && desired.phase !== 'store-catchup')
+        || (desired.phase !== 'store-main' && Array.from({length:6},(_,i)=>`${prefix}catchup-${i+1}`).includes(desired.token)));
+}
+
+async function manualControlTransitionProof(request, current, now) {
+    const inspected = inspectManualControlEnvelope(request.manualControl, { now });
+    if (!inspected.ok || !manualControlTokenAllowed(inspected.envelope,request.desired)) return { ok:false, reason:'manual-control-generation-mismatch' };
+    const envelope = inspected.envelope;
+    const key = `manualControlGeneration:${envelope.id}`;
+    const values = await chrome.storage.local.get(['manualControlGenerationIndex',key]);
+    const index = values.manualControlGenerationIndex == null ? [] : values.manualControlGenerationIndex;
+    if (!Array.isArray(index) || index.length > 64 || new Set(index).size !== index.length
+        || index.some(id => typeof id !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(id))) return { ok:false, reason:'manual-control-index-invalid' };
+    const record = values[key];
+    if (record == null) {
+        if (index.includes(envelope.id) || index.length >= 64 || request.desired.owner !== 'store-walk'
+            || request.desired.phase !== 'store-main' || request.desired.token !== `control:${envelope.id}:main`
+            || now >= inspected.workDeadlineAt) return { ok:false, reason:'manual-control-first-transition-refused' };
+        return {ok:true,mutation:{manualControlGenerationIndex:[...index,envelope.id],
+            [key]:{schemaVersion:1,envelope,admittedAt:now,parserRunId:null}}};
+    }
+    if (!index.includes(envelope.id) || !record || typeof record !== 'object' || Array.isArray(record)
+        || Object.keys(record).sort().join(',') !== 'admittedAt,envelope,parserRunId,schemaVersion' || record.schemaVersion !== 1 || !manualControlEnvelopeEqual(record.envelope,envelope)
+        || !Number.isSafeInteger(record.admittedAt) || record.admittedAt < envelope.createdAt || record.admittedAt > now
+        || !(record.parserRunId === null || (typeof record.parserRunId === 'string' && record.parserRunId.length > 0 && record.parserRunId.length <= 200))) return {ok:false,reason:'manual-control-record-mismatch'};
+    if (request.desired.owner === 'parser' && record.parserRunId !== null) return {ok:false,reason:'manual-control-parser-attempt-consumed'};
+    if (now >= inspected.workDeadlineAt) {
+        const same = current && current.slotId === request.desired.slotId && current.token === request.desired.token
+            && current.owner === request.desired.owner && current.phase === request.desired.phase;
+        const terminal = current?.owner === 'store-walk' && current.token === request.desired.token
+            && ['completed','degraded','blocked','failed'].includes(request.desired.phase);
+        if (!same && !terminal) return {ok:false,reason:'manual-control-work-deadline'};
+    }
+    return {ok:true,mutation:{}};
+}
+
+async function manualControlParserStartProof(lease, now) {
+    if (!String(lease?.token || '').startsWith('control:')) return {ok:true,mutation:{}};
+    const match = /^control:([a-f0-9-]{36}):parser-1$/.exec(lease.token);
+    if (!match) throw new Error('manual control parser token invalid');
+    const key = `manualControlGeneration:${match[1]}`;
+    const values = await chrome.storage.local.get(['manualControlGenerationIndex',key]);
+    const record = values[key];
+    const inspected = inspectManualControlEnvelope(record?.envelope,{now});
+    if (!inspected.ok || record?.schemaVersion !== 1 || Object.keys(record).sort().join(',') !== 'admittedAt,envelope,parserRunId,schemaVersion'
+        || !Array.isArray(values.manualControlGenerationIndex) || values.manualControlGenerationIndex.length > 64
+        || new Set(values.manualControlGenerationIndex).size !== values.manualControlGenerationIndex.length
+        || values.manualControlGenerationIndex.some(id=>typeof id!=='string'||!/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(id))
+        || values.manualControlGenerationIndex.filter(id=>id===match[1]).length !== 1
+        || record.envelope.id !== match[1] || lease.slotId !== String(record.envelope.createdAt)
+        || record.parserRunId !== null || now >= inspected.workDeadlineAt
+        || !Number.isSafeInteger(record.admittedAt) || record.admittedAt < record.envelope.createdAt || record.admittedAt > now) throw new Error('manual control parser attempt unavailable');
+    return {ok:true,key,record};
+}
+
 function inspectNightCabinetTransitionRequest(request, { now = Date.now() } = {}) {
     if (!request || typeof request !== 'object' || Array.isArray(request)) {
         return { ok: false, reason: 'transition-request-missing' };
     }
-    const allowedTop = new Set(['requestId', 'requestedAt', 'expected', 'desired']);
+    const allowedTop = new Set(['requestId', 'requestedAt', 'expected', 'desired', 'manualControl']);
     const allowedExpected = new Set(['state', 'slotId', 'owner', 'phase', 'token', 'runId']);
     const allowedDesired = new Set(['slotId', 'owner', 'phase', 'token']);
     if (Object.keys(request).some(key => !allowedTop.has(key))
@@ -265,10 +351,13 @@ function inspectNightCabinetTransitionRequest(request, { now = Date.now() } = {}
             token: String(request.desired.token || '')
         }
     };
+    const manual = Object.prototype.hasOwnProperty.call(request,'manualControl') ? inspectManualControlEnvelope(request.manualControl,{now}) : null;
+    if (!manual && exact.desired.token.startsWith('control:')) return {ok:false,reason:'manual-control-envelope-required'};
+    if (manual && (!manual.ok || !manualControlTokenAllowed(manual.envelope,exact.desired))) return {ok:false,reason:'manual-control-generation-mismatch'};
     if (exact.requestId.length < 16 || exact.requestId.length > 200
         || !Number.isFinite(exact.requestedAt) || exact.requestedAt <= 0 || exact.requestedAt > now + 60_000
         || !/^\d{10,16}$/.test(exact.desired.slotId)
-        || !nightCabinetLeaseSlotIds(now).includes(exact.desired.slotId)
+        || (!manual && !nightCabinetLeaseSlotIds(now).includes(exact.desired.slotId))
         || !NIGHT_CABINET_OWNERS.has(exact.desired.owner)
         || !NIGHT_CABINET_PHASES.has(exact.desired.phase)
         || exact.desired.token.length < 16 || exact.desired.token.length > 200) {
@@ -285,7 +374,7 @@ function inspectNightCabinetTransitionRequest(request, { now = Date.now() } = {}
         || exact.expected.token.length < 16 || exact.expected.token.length > 200) {
         return { ok: false, reason: 'transition-expected-values-invalid' };
     }
-    return { ok: true, request: exact };
+    return { ok: true, request: manual ? {...exact,manualControl:manual.envelope} : exact };
 }
 
 function nightCabinetTransitionAllowed(current, desired, {
@@ -548,6 +637,8 @@ async function handleNightCoordinatorLeaseTransitionRequest() {
             catchupResumeConsumed
         });
         if (!decision.ok) return finish(false, decision.reason);
+        const manual = request.manualControl ? await manualControlTransitionProof(request,current,now) : {ok:true,mutation:{}};
+        if (!manual.ok) return finish(false,manual.reason);
 
         const lease = {
             slotId: request.desired.slotId,
@@ -571,7 +662,7 @@ async function handleNightCoordinatorLeaseTransitionRequest() {
                 }
             }
             : {};
-        return finish(true, decision.reason, lease, resumeMarkerMutation);
+        return finish(true, decision.reason, lease, {...resumeMarkerMutation,...manual.mutation});
     });
 }
 
@@ -1200,6 +1291,8 @@ async function createPipelineRun(source, nightLease) {
         || currentLease.lease.token !== nightLease?.token) {
       throw new Error('night parser lease lost before pipeline run claim');
     }
+    const manual = String(currentLease.lease.token).startsWith('control:')
+      ? await manualControlParserStartProof(currentLease.lease,now) : {ok:true};
     const slotAt = Number(currentLease.lease.slotId);
     const nightSlotDay = nightCabinetSlotDay(currentLease.lease.slotId);
     if (!nightSlotDay) throw new Error('night parser slot day is invalid');
@@ -1222,6 +1315,7 @@ async function createPipelineRun(source, nightLease) {
     // Store Walk heartbeat can never land between the exact read and this set.
     await chrome.storage.local.set({
       pipelineRun,
+      ...(manual.key ? {[manual.key]:{...manual.record,parserRunId:pipelineRun.id}} : {}),
       [NIGHT_CABINET_LEASE_KEY]: {
         ...currentLease.lease,
         phase: 'running',
