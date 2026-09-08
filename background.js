@@ -8481,6 +8481,15 @@ async function uploadToSheets(runId = null) {
              const incomingMap = warehouseGroups(values);
              const incomingKeys = new Set();
              const meaningfulColor = value => /^(?:DONE\b|⚠️ РАЗНЫЕ ЗАКАЗЫ$)/i.test(value) ? '' : value;
+             // Earlier eBay rows retained numeric HTML entities in variants.
+             // Compare their displayed value, preserving the original cells.
+             // Decode once, without interpreting markup or expanding DONE.
+             const variantValue = (value, store) => store !== 'eBay' ? value
+                 : value.replace(/&#(?:x([0-9a-f]+)|(\d+));/gi, (encoded, hex, decimal) => {
+                     const code = parseInt(hex || decimal, hex ? 16 : 10);
+                     return code > 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff)
+                         ? String.fromCodePoint(code) : encoded;
+                 });
              // Historical correction needs a one-to-one current feed identity.
              // Missing observations never erase a known historical variant.
              const legacyVariantCorrections = (incoming, copies) => {
@@ -8553,7 +8562,7 @@ async function uploadToSheets(runId = null) {
                  }
                  if (incoming.length > 1) {
                      const multiset = group => group.map(({ cells }) => JSON.stringify([
-                         cells[4], meaningfulColor(cells[5]), cells[6], cells[10]
+                         cells[4], variantValue(meaningfulColor(cells[5]), r[0]), variantValue(cells[6], r[0]), cells[10]
                      ])).sort();
                      if (JSON.stringify(multiset(incoming)) !== JSON.stringify(multiset(copies))) {
                          // Old eBay producers copied the first color onto every
@@ -8573,10 +8582,10 @@ async function uploadToSheets(runId = null) {
                      continue;
                  }
                  warehouseSnapshots.set(key, copies);
-                 const sizes = new Set(copies.map(x => x.cells[6]));
-                 const colors = new Set(copies.map(x => meaningfulColor(x.cells[5])).filter(Boolean));
-                 if (sizes.size !== 1 || !sizes.has(r[6]) || colors.size > 1
-                     || (colors.size === 1 && !colors.has(meaningfulColor(r[5])))) {
+                 const sizes = new Set(copies.map(x => variantValue(x.cells[6], r[0])));
+                 const colors = new Set(copies.map(x => variantValue(meaningfulColor(x.cells[5]), r[0])).filter(Boolean));
+                 if (sizes.size !== 1 || !sizes.has(variantValue(r[6], r[0])) || colors.size > 1
+                     || (colors.size === 1 && !colors.has(variantValue(meaningfulColor(r[5]), r[0])))) {
                      const corrections = legacyVariantCorrections(incoming, copies);
                      if (corrections) {
                          rowsToUpdate.push(...corrections);

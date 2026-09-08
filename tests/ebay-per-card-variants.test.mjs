@@ -62,9 +62,34 @@ test('shoe size labels retain their size system and never inherit a sibling shir
     card(['UK Shoe Size: 9']), card(['EU Shoe Size: 44']), card(['AU Shoe Size: 9'])]);
   assert.deepEqual(rows.map(r => r.size), ['XL', 'US 10', 'UK 9', 'EU 44', 'AU 9']);
   assert.equal(rows[1].ebay_item_identity.size, 'US 10');
-  const conflict = await parse([card(['Size: XL', 'US Shoe Size: 10'])]);
-  assert.equal(conflict.rows[0].size, '');
-  assert.equal(conflict.rows[0].ebay_item_identity, null);
+  const labels = await parse([card(['Size: XL', 'US Shoe Size: 10'])]);
+  assert.equal(labels.rows[0].size, 'US 10; Size XL', 'preserve both labelled observations without asserting equivalence');
+});
+
+test('seller Size and standardized shoe sizes remain separate exact card attributes', async () => {
+  const shoe = card(['US Shoe Size: 10.5', 'Size: 10-', 'Color: Black &#x2f; White'], {
+    listingId: '123456789012',
+    title: { textSpans: [{ text: 'Synthetic shoes' }], action: { params: { listingId: '123456789012', variationId: '10000000000001' } } },
+    __myb: { actionList: [{ action: { params: { trackingNumber: track, itemId: '123456789012', transactionId: '10000000000002' } } }] },
+  });
+  const { rows } = await parse([shoe, card(['EU Shoe Size: 44', 'US Shoe Size: 10', 'UK Shoe Size: 9', 'AU Shoe Size: 9'])]);
+  assert.equal(rows[0].size, 'US 10.5; Size 10-');
+  assert.equal(rows[0].color, 'Black / White');
+  assert.equal(rows[0].ebay_item_identity.size, 'US 10.5; Size 10-');
+  assert.equal(rows[1].size, 'US 10; UK 9; EU 44; AU 9');
+  const reordered = await parse([{ ...shoe, aspectValuesList: [...shoe.aspectValuesList].reverse() }]);
+  assert.deepEqual(reordered.rows, [rows[0]], 'feed aspect order cannot change the stored variant');
+});
+
+test('conflicting or empty values for one size label still refuse variant identity', async () => {
+  const { rows } = await parse([
+    card(['US Shoe Size: 10', 'US Shoe Size: 11', 'Size: 10-']),
+    card(['US Shoe Size: 10', 'Size: S', 'Size: L']),
+    card(['US Shoe Size: 10', 'US Shoe Size:']),
+    card(['US Shoe Size: 10', 'US Shoe Size: 10']),
+  ]);
+  assert.deepEqual(rows.map(r => r.size), ['', '', '', 'US 10']);
+  assert.ok(rows.slice(0, 3).every(r => r.ebay_item_identity === null));
 });
 
 test('variant identity binds each card to its own transaction and tracking', async () => {

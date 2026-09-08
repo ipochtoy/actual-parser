@@ -105,6 +105,32 @@ test('conflicting or mismatched size/color and conflicting custom notes are not 
   const h=harness(rows);await assert.rejects(h.run(),/Ambiguous variant|Conflicting custom/);assert.equal(h.writes.length,0);
  }
 });
+test('eBay numeric HTML entities are the same variant without rewriting historical cells', async () => {
+ const old = row({0:'eBay',5:'Black &#x2f; White',6:'US5&#47;UK3&#x2F;EU36',9:'',10:''});
+ const current = item({store_name:'eBay',color:'Black / White',size:'US5/UK3/EU36'});
+ for (const count of [1,2]) {
+  const rows = Array.from({length:count},()=>clone(old));
+  const h = harness(rows,Array.from({length:count},()=>clone(current)));
+  await h.run();assert.deepEqual(h.rows,rows);assert.equal(h.writes.length,0);assert.equal(h.appends.length,0);
+ }
+ const update = harness([old],[{...current,qty:'2'}]);await update.run();
+ assert.equal(update.rows[0][4],'2');assert.equal(update.rows[0][5],old[5]);assert.equal(update.rows[0][6],old[6]);
+ assert.ok(update.writes.flatMap(w=>w.data).every(e=>/!E1$|!J1$/.test(e.range)));
+});
+test('entity equivalence never erases a real mismatch or treats encoded text as a DONE marker', async () => {
+ for (const [oldColor,oldSize,color,size] of [
+  ['Black','US5&#x2f;UK3','Black','US6/UK4'],
+  ['Black &amp; White','','Black & White',''],
+  ['&#x44;ONE 123','','',''],
+  ['Black','US5&#0;UK3','Black','US5UK3'],
+  ['Black','US5&#38;#x2f;UK3','Black','US5/UK3'],
+ ]) {
+  const h=harness([row({0:'eBay',5:oldColor,6:oldSize,9:'',10:''})],[item({store_name:'eBay',color,size})]);
+  await assert.rejects(h.run(),/Ambiguous variant/);assert.equal(h.writes.length,0);assert.equal(h.appends.length,0);
+ }
+ const other=harness([row({6:'US5&#47;UK3',10:''})],[item({size:'US5/UK3'})]);
+ await assert.rejects(other.run(),/Ambiguous variant/);assert.equal(other.writes.length,0);
+});
 for (const example of [
  { count: 5, order: '13-15114-11126', track: '9434608106244517838177', product: 'Paul Mitchell The Color Permanent Cream Hair Color N/N+ Shades FASTEST SHIPPING', color: '' },
  { count: 2, order: '07-15122-65815', track: '9400108106245537447330', product: 'Travel Adventure Archive Shadow Box For Memories Keepsake Box With Slot On Top', color: 'Black' },
@@ -208,6 +234,14 @@ test('one untouched eBay shoe row can recover its own proved size from an old si
  } });
  await h.run(); assert.equal(h.rows[0][6], 'US 10'); assert.equal(h.rows[0][4], '1');
  assert.deepEqual(h.writes.flatMap(w => w.data).map(e => e.range).sort(), ['Лист1!G1', 'Лист1!J1']);
+});
+test('exact eBay identity restores both labelled size observations and decoded color together', async () => {
+ const h=variantCorrection(['Black / White'],'Black &#x2f; White',{mutate(rows,items){
+  rows[0][6]='10-';items[0].size='US 10.5; Size 10-';items[0].ebay_item_identity.size=items[0].size;
+ }});
+ await h.run();assert.equal(h.rows[0][5],'Black / White');assert.equal(h.rows[0][6],'US 10.5; Size 10-');
+ assert.equal(h.rows[0][4],'1');assert.equal(h.rows.length,1);
+ assert.deepEqual(h.writes.flatMap(w=>w.data).map(e=>e.range).sort(),['Лист1!F1','Лист1!G1','Лист1!J1']);
 });
 
 test('single legacy variant repair cannot erase a known field or touch an archive, note, or quantity', async () => {

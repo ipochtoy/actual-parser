@@ -739,7 +739,11 @@ function parseItem(item) {
     // must never fill a sibling's missing variant. No order-level fallback is
     // supported without a feed identity proving that it describes this card.
     const cardVariants = (card) => {
-      const values = { color: new Set(), size: new Set() };
+      const values = { color: new Set(), size: new Map() };
+      const addSize = (label, value) => {
+        if (!values.size.has(label)) values.size.set(label, new Set());
+        values.size.get(label).add(value);
+      };
       let complete = Array.isArray(card?.aspectValuesList);
       if (Array.isArray(card?.aspectValuesList)) {
         for (const asp of card.aspectValuesList) {
@@ -751,20 +755,28 @@ function parseItem(item) {
             .replace(/&#(\d+);/g, (m, d) => String.fromCharCode(d));
           const shoe = text.match(/^(US|UK|EU|AU) Shoe Size:\s*(.*)$/i);
           if (shoe) {
-            values.size.add(shoe[2].trim() ? `${shoe[1].toUpperCase()} ${shoe[2].trim()}` : '');
+            addSize(shoe[1].toUpperCase(), shoe[2].trim());
             continue;
           }
           const match = text.match(/^(color|colour|shade|size):\s*(.*)$/i);
           if (!match) { if (!/^(quantity|qty)\b/i.test(text)) complete = false; continue; }
-          const key = match[1].toLowerCase() === 'size' ? 'size' : 'color';
-          values[key].add(match[2].trim());
+          if (match[1].toLowerCase() === 'size') addSize('Size', match[2].trim());
+          else values.color.add(match[2].trim());
         }
       }
+      // A seller's "Size: 10-" and "US Shoe Size: 10.5" are distinct
+      // attributes on the same purchased card. Preserve both labels without
+      // guessing their equivalence. Only conflicting values for ONE label
+      // make the size unknown; do not discard other sizing systems as conflicts.
+      const sizeComplete = [...values.size.values()].every(v => v.size === 1 && !v.has(''));
+      const size = sizeComplete ? ['US', 'UK', 'EU', 'AU', 'Size']
+        .filter(label => values.size.has(label))
+        .map(label => `${label === 'Size' && values.size.size === 1 ? '' : label + ' '}${[...values.size.get(label)][0]}`)
+        .join('; ') : '';
       return {
         color: values.color.size === 1 ? [...values.color][0] : '',
-        size: values.size.size === 1 ? [...values.size][0] : '',
-        complete: complete && values.color.size <= 1 && values.size.size <= 1
-          && !values.color.has('') && !values.size.has(''),
+        size,
+        complete: complete && values.color.size <= 1 && sizeComplete && !values.color.has(''),
       };
     };
 
