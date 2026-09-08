@@ -5129,7 +5129,7 @@ async function finalReturnToIherbPrimaryOnce(_tabId, expectedGeneration = null) 
         && pipelineGenerationMatches(state.iherbStageFinalizing, expectedGeneration)
         && normalizeAccountEmail(state.iherbStageFinalizing?.account)
             === normalizeAccountEmail(primary.email);
-    const preparedReturnMatches = (state, tabId) => ownsReturn(state)
+    const preparedReturnMatches = (state, tabId, phases = ['prepared']) => ownsReturn(state)
         && state.iherbParserTabId === tabId
         && state.pendingIherbSwitch?.runId === expectedGeneration.runId
         && normalizeAccountEmail(state.pendingIherbSwitch?.email)
@@ -5139,7 +5139,7 @@ async function finalReturnToIherbPrimaryOnce(_tabId, expectedGeneration = null) 
             === normalizeAccountEmail(primary.email)
         && state.iherbSwitchDispatch?.tabId === tabId
         && state.iherbSwitchDispatch?.kind === 'final-return'
-        && state.iherbSwitchDispatch?.phase === 'prepared';
+        && phases.includes(state.iherbSwitchDispatch?.phase);
 
     let returnState = await readReturnState();
     if (!ownsReturn(returnState)) {
@@ -5190,7 +5190,10 @@ async function finalReturnToIherbPrimaryOnce(_tabId, expectedGeneration = null) 
                     ...returnState.iherbStageFinalizing,
                     tabId,
                     attempts: attempt,
-                    returnStatus: 'prepared'
+                    returnStatus: 'prepared',
+                    reason: null,
+                    failedAttempt: null,
+                    failedAt: null
                 }
             });
             returnState = await readReturnState();
@@ -5204,9 +5207,9 @@ async function finalReturnToIherbPrimaryOnce(_tabId, expectedGeneration = null) 
                 console.warn('⏭ iHerb final return lost generation before navigation');
                 return false;
             }
-            await iherbUiSignOutAndNavigateToLogin(tabId);
-            returnState = await readReturnState();
-            if (!preparedReturnMatches(returnState, tabId)) return false;
+            // Login content may submit before the awaited navigation settles.
+            // Publish its exact dispatch permission before navigation, then
+            // preserve any login-submitted proof it writes during that wait.
             await chrome.storage.local.set({
                 iherbSwitchDispatch: {
                     ...expectedGeneration,
@@ -5217,11 +5220,28 @@ async function finalReturnToIherbPrimaryOnce(_tabId, expectedGeneration = null) 
                     dispatchedAt: Date.now()
                 }
             });
+            returnState = await readReturnState();
+            if (!preparedReturnMatches(returnState, tabId, ['dispatched'])) return false;
+            await iherbUiSignOutAndNavigateToLogin(tabId);
+            returnState = await readReturnState();
+            if (!preparedReturnMatches(returnState, tabId, ['dispatched', 'login-submitted'])) return false;
             returned = await waitForIherbFinalReturnCompletion(expectedGeneration, 60_000);
             if (!returned) throw new Error('primary_login_not_confirmed');
         } catch (e) {
             returnState = await readReturnState();
             if (!ownsReturn(returnState)) return false;
+            const message = String(e?.message || '');
+            const failure = ['primary_login_not_confirmed', 'logoff_navigate_failed', 'orders_navigate_failed']
+                .find(code => message === code || message.startsWith(`${code}:`))
+                || 'return_action_failed';
+            await chrome.storage.local.set({
+                iherbStageFinalizing: {
+                    ...returnState.iherbStageFinalizing,
+                    reason: `final-primary-return:${failure}`,
+                    failedAttempt: attempt,
+                    failedAt: Date.now()
+                }
+            });
             console.error(`❌ iHerb final return attempt ${attempt}/2 failed:`, e);
             if (attempt >= 2) {
                 sendTelegramMessage(`⚠️ iHerb: не смог вернуться на основной аккаунт photopochtoy — проверь вручную`).catch(() => {});

@@ -84,6 +84,153 @@ function createContext(extra = {}) {
   return context;
 }
 
+function createReturnFlow({ duringNavigation, afterWrite } = {}) {
+  let state = baseState();
+  const writes = [];
+  const actions = [];
+  const context = createContext({
+    console: { log() {}, warn() {}, error() {} },
+    setTimeout: callback => callback(),
+    loadAccountsConfig: async () => ({
+      iherb: [{ email: 'primary@example.com', password: 'configured' }],
+    }),
+    getPrimary: accounts => accounts[0],
+    ensureValidIherbParserTab: async tabId => tabId,
+    sendTelegramMessage: async () => { actions.push('alert'); },
+    chrome: {
+      storage: {
+        local: {
+          get: async () => structuredClone(state),
+          set: async patch => {
+            const copy = structuredClone(patch);
+            writes.push(copy);
+            state = { ...state, ...copy };
+            afterWrite?.(state, copy);
+          },
+          remove: async keys => { for (const key of keys) delete state[key]; },
+        },
+      },
+    },
+    iherbUiSignOutAndNavigateToLogin: async tabId => {
+      actions.push('navigate');
+      await duringNavigation?.(context, state, tabId);
+    },
+    waitForIherbFinalReturnCompletion: async generation => {
+      actions.push('wait');
+      return context.pipelineGenerationMatches(state.pipelineStage, generation)
+        && context.finalReturnConfirmationMatches(
+          state.iherbFinalReturnConfirmed, state.iherbStageFinalizing,
+        );
+    },
+  });
+  for (const name of ['finalReturnConfirmationMatches', 'finalReturnToIherbPrimaryOnce']) {
+    vm.runInContext(extractFunction(background, name), context);
+  }
+  return {
+    context, actions, writes,
+    state: () => structuredClone(state),
+    run: () => context.finalReturnToIherbPrimaryOnce(
+      77, context.pipelineGenerationFromStage(baseState().pipelineStage),
+    ),
+  };
+}
+
+test('final return permits submit and landing while navigation is still settling', async () => {
+  const submissions = [];
+  const flow = createReturnFlow({
+    duringNavigation: async (context, state, tabId) => {
+      const submit = await context.markIherbFinalReturnLoginSubmitted(
+        tabId, 'https://checkout.iherb.com/auth/ui/account/login',
+      );
+      submissions.push(submit.accepted);
+      if (!submit.accepted) throw new Error('submit_proof_rejected');
+      const landing = await context.confirmIherbFinalReturnLanding(
+        tabId, 'https://secure.iherb.com/myaccount/orders',
+      );
+      assert.equal(landing.confirmed, true);
+    },
+  });
+  assert.equal(await flow.run(), true);
+  assert.deepEqual(submissions, [true]);
+  assert.deepEqual(flow.actions, ['navigate', 'wait']);
+  assert.deepEqual(flow.writes.filter(x => x.iherbSwitchDispatch)
+    .map(x => x.iherbSwitchDispatch.phase), ['prepared', 'dispatched', 'login-submitted']);
+  assert.equal(flow.state().iherbSwitchDispatch.phase, 'login-submitted',
+    'navigation completion must not overwrite the content script submit proof');
+});
+
+test('orders navigation without the exact submitted login never confirms return', async () => {
+  const flow = createReturnFlow({
+    duringNavigation: async (context, state, tabId) => {
+      const landing = await context.confirmIherbFinalReturnLanding(
+        tabId, 'https://secure.iherb.com/myaccount/orders',
+      );
+      assert.equal(landing.confirmed, false);
+    },
+  });
+  assert.equal(await flow.run(), false);
+  assert.equal(flow.actions.filter(x => x === 'navigate').length, 2);
+  assert.equal(flow.state().iherbFinalReturnConfirmed, null);
+});
+
+test('a changed generation or owner after dispatch prevents navigation', async () => {
+  const changes = [
+    state => { state.pipelineStage.stageStartedAt = 999; },
+    state => { state.iherbParserTabId = 78; },
+    state => { state.pendingIherbSwitch.email = 'other@example.com'; },
+    state => { state.iherbSwitchDispatch.kind = 'account-switch'; },
+  ];
+  for (const change of changes) {
+    const flow = createReturnFlow({
+      afterWrite: (state, patch) => {
+        if (patch.iherbSwitchDispatch?.phase === 'dispatched') change(state);
+      },
+    });
+    assert.equal(await flow.run(), false);
+    assert.deepEqual(flow.actions, []);
+    assert.equal(flow.state().iherbFinalReturnConfirmed, null);
+  }
+});
+
+test('final-return failures persist a finite cause without raw navigation details', async () => {
+  for (const [error, expected] of [
+    ['orders_navigate_failed: https://secret.example/?token=private', 'orders_navigate_failed'],
+    ['logoff_navigate_failed: private account context', 'logoff_navigate_failed'],
+    ['unexpected private details', 'return_action_failed'],
+    [null, 'primary_login_not_confirmed'],
+  ]) {
+    const flow = createReturnFlow({
+      duringNavigation: async () => { if (error) throw new Error(error); },
+    });
+    assert.equal(await flow.run(), false);
+    const marker = flow.state().iherbStageFinalizing;
+    assert.equal(marker.reason, `final-primary-return:${expected}`);
+    assert.equal(marker.failedAttempt, 2);
+    assert.equal(Number.isFinite(marker.failedAt), true);
+    assert.doesNotMatch(JSON.stringify(flow.writes), /secret|private/);
+  }
+});
+
+test('a successful second return clears the previous attempt failure', async () => {
+  let attempt = 0;
+  const flow = createReturnFlow({
+    duringNavigation: async (context, state, tabId) => {
+      if (++attempt === 1) throw new Error('orders_navigate_failed: transient');
+      assert.equal((await context.markIherbFinalReturnLoginSubmitted(
+        tabId, 'https://checkout.iherb.com/auth/ui/account/login',
+      )).accepted, true);
+      assert.equal((await context.confirmIherbFinalReturnLanding(
+        tabId, 'https://secure.iherb.com/myaccount/orders',
+      )).confirmed, true);
+    },
+  });
+  assert.equal(await flow.run(), true);
+  assert.equal(attempt, 2);
+  assert.equal(flow.state().iherbStageFinalizing.reason, null);
+  assert.equal(flow.state().iherbStageFinalizing.failedAttempt, null);
+  assert.equal(flow.state().iherbStageFinalizing.failedAt, null);
+});
+
 test('only the exact owned iHerb orders landing can confirm final return', () => {
   const context = createContext();
   const exact = baseState();
