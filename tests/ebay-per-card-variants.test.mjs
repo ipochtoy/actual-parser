@@ -46,6 +46,36 @@ test('five colors stay five separate rows with their own variants and unchanged 
   assert.equal(sent.length, 1, 'existing screenshot order/track queue remains unchanged');
 });
 
+test('live feed Shade labels and numeric entities retain all five distinct variants', async () => {
+  const shades = ['20 Volume The Color Cream Developer', '10 Volume The Color Cream Developer', '6n', '5ch&#x2b;', '5n'];
+  const { rows } = await parse(shades.map(s => card([`Shade: ${s}`])));
+  assert.deepEqual(rows.map(r => r.color), ['20 Volume The Color Cream Developer', '10 Volume The Color Cream Developer', '6n', '5ch+', '5n']);
+});
+
+test('variant identity binds each card to its own transaction and tracking', async () => {
+  const identified = (color, transactionId) => card([`Color: ${color}`], {
+    listingId: '123456789012',
+    title: { textSpans: [{ text: 'Synthetic listing' }], action: { params: { listingId: '123456789012', variationId: transactionId } } },
+    __myb: { actionList: [{ action: { params: { trackingNumber: track, itemId: '123456789012', transactionId } } }] },
+  });
+  const { rows } = await parse([identified('Black', '10000000000001'), identified('White', '10000000000002')]);
+  assert.deepEqual(rows.map(r => r.ebay_item_identity), [
+    { schema: 1, source: 'purchase-feed-item-card', orderId: '11-11111-11111', itemId: '123456789012', transactionId: '10000000000001', variationId: '10000000000001', track, color: 'Black', size: '' },
+    { schema: 1, source: 'purchase-feed-item-card', orderId: '11-11111-11111', itemId: '123456789012', transactionId: '10000000000002', variationId: '10000000000002', track, color: 'White', size: '' },
+  ]);
+  const bad = identified('Black', '10000000000001');
+  bad.__myb.actionList[0].action.params.itemId = '999999999999';
+  const refused = await parse([bad, identified('', '10000000000002')]);
+  assert.ok(refused.rows.every(r => r.ebay_item_identity === null));
+});
+
+test('quantity in first-card action params cannot leak onto its sibling', async () => {
+  const first = card(['Color: Black'], { quantity: undefined, __myb: { actionList: [{ action: { params: { trackingNumber: track, quantity: 2 } } }] } });
+  const second = card(['Color: White'], { quantity: undefined, __myb: { actionList: [{ action: { params: { trackingNumber: track, quantity: 3 } } }] } });
+  const { rows } = await parse([first, second]);
+  assert.deepEqual(rows.map(r => r.qty), [2, 3]);
+});
+
 test('two sizes and colors are scoped to the corresponding cards', async () => {
   const { rows } = await parse([card(['Color: Black', 'Size: Small']), card(['Colour: White', 'Size: Large'])]);
   assert.deepEqual(rows.map(r => [r.color, r.size]), [['Black', 'Small'], ['White', 'Large']]);

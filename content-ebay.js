@@ -740,14 +740,17 @@ function parseItem(item) {
     // supported without a feed identity proving that it describes this card.
     const cardVariants = (card) => {
       const values = { color: new Set(), size: new Set() };
+      let complete = Array.isArray(card?.aspectValuesList);
       if (Array.isArray(card?.aspectValuesList)) {
         for (const asp of card.aspectValuesList) {
           const spans = asp?.textSpans;
           if (!Array.isArray(spans) || !spans.length ||
-              !spans.every(span => typeof span?.text === 'string')) continue;
-          const match = spans.map(span => span.text).join('').trim()
-            .match(/^(color|colour|size):\s*(.*)$/i);
-          if (!match) continue;
+              !spans.every(span => typeof span?.text === 'string')) { complete = false; continue; }
+          const text = spans.map(span => span.text).join('').trim()
+            .replace(/&#x([0-9a-f]+);/gi, (m, h) => String.fromCharCode(parseInt(h, 16)))
+            .replace(/&#(\d+);/g, (m, d) => String.fromCharCode(d));
+          const match = text.match(/^(color|colour|shade|size):\s*(.*)$/i);
+          if (!match) { if (!/^(quantity|qty)\b/i.test(text)) complete = false; continue; }
           const key = match[1].toLowerCase() === 'size' ? 'size' : 'color';
           values[key].add(match[2].trim());
         }
@@ -755,6 +758,8 @@ function parseItem(item) {
       return {
         color: values.color.size === 1 ? [...values.color][0] : '',
         size: values.size.size === 1 ? [...values.size][0] : '',
+        complete: complete && values.color.size <= 1 && values.size.size <= 1
+          && !values.color.has('') && !values.size.has(''),
       };
     };
 
@@ -856,11 +861,13 @@ function parseItem(item) {
     // Build entries for all items in Multiple items, each with ITS OWN tracking.
     const entries = cards.map(card => {
       const cardTracking = extractCardTracking(card);
-      const { color, size } = cardVariants(card);
+      const { color, size, complete } = cardVariants(card);
+      const actions = Array.isArray(card?.__myb?.actionList) ? card.__myb.actionList : [];
+      const localParams = actions.map(a => a?.action?.params).filter(p => p && typeof p === 'object');
 
       let quantity = 1;
       if (typeof card?.quantity === 'number') quantity = card.quantity;
-      else if (params?.quantity) quantity = parseInt(params.quantity, 10) || quantity;
+      else if (localParams.some(p => p.quantity)) quantity = parseInt(localParams.find(p => p.quantity).quantity, 10) || quantity;
       else if (card?.aspectValuesList) {
         for (const asp of card.aspectValuesList) {
           const t = (asp?.textSpans?.[0]?.text || '').toLowerCase();
@@ -873,6 +880,22 @@ function parseItem(item) {
         .replace(/&#x([0-9a-f]+);/gi, (m, h) => String.fromCharCode(parseInt(h, 16)))
         .replace(/&#(\d+);/g, (m, d) => String.fromCharCode(d));
 
+      // Retain the feed identity of the exact variant, independently of a
+      // listing title shared by several purchased lines. Missing or conflicting
+      // identity can never authorize correction of historical Sheet variants.
+      const itemId = String(card?.listingId || '');
+      const variant = card?.title?.action?.params;
+      const tracked = localParams.filter(p => String(p.itemId || '') === itemId
+        && pickBestTracking(p.trackingNumber) === cardTracking && /^\d{6,20}$/.test(String(p.transactionId || '')));
+      const transactions = [...new Set(tracked.map(p => String(p.transactionId)))];
+      const identity = complete && (color || size) && /^\d{2}-\d{5}-\d{5}$/.test(orderId)
+        && /^\d{6,20}$/.test(itemId) && String(variant?.listingId || '') === itemId
+        && /^\d{6,20}$/.test(String(variant?.variationId || '')) && cardTracking && transactions.length === 1
+        ? { schema: 1, source: 'purchase-feed-item-card', orderId, itemId,
+            transactionId: transactions[0], variationId: String(variant.variationId),
+            track: cardTracking, color, size }
+        : null;
+
       return {
         store_name: 'eBay',
         order_id: orderId,
@@ -881,6 +904,7 @@ function parseItem(item) {
         qty: quantity,
         color: color || '',
         size: size || '',
+        ebay_item_identity: identity,
         financial: financial,
         total_amount: financial.total_amount,
         account_name: __ebayAccountName || ''

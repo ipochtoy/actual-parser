@@ -8495,6 +8495,51 @@ async function uploadToSheets(runId = null) {
                          cells[4], meaningfulColor(cells[5]), cells[6], cells[10]
                      ])).sort();
                      if (JSON.stringify(multiset(incoming)) !== JSON.stringify(multiset(copies))) {
+                         // Old eBay producers copied the first color onto every
+                         // sibling or dropped Shade entirely. Only interchangeable,
+                         // untouched Parser rows can be rebound to exact current
+                         // feed line identities; distinct historical rows stay blocked.
+                         const old = copies[0].cells;
+                         const lineIds = new Set(), variantValues = new Map();
+                         const legacyEquivalent = !!runId && r[0] === 'eBay'
+                             && incoming.length === copies.length
+                             && old[7] === '' && old[10] === r[10]
+                             && !/^(?:DONE\b|⚠️ РАЗНЫЕ ЗАКАЗЫ$)/i.test(old[5])
+                             && /^parser\|\d{4}-\d{2}-\d{2}T/.test(old[9])
+                             && Number.isFinite(Date.parse(old[9].slice(7)))
+                             && Date.parse(old[9].slice(7)) <= result.pipelineRun.startedAt
+                             && copies.every(copy => JSON.stringify(copy.cells.slice(4)) === JSON.stringify(old.slice(4)))
+                             && incoming.every(copy => {
+                                 const rawItem = allOrders[copy.row - 1], proof = rawItem.ebay_item_identity, cells = copy.cells;
+                                 if (!proof || proof.schema !== 1 || proof.source !== 'purchase-feed-item-card'
+                                     || proof.orderId !== cells[1] || proof.track !== cells[2]
+                                     || proof.color !== cells[5] || proof.size !== cells[6]
+                                     || ![proof.itemId, proof.transactionId, proof.variationId].every(id => /^\d{6,20}$/.test(id || ''))
+                                     || (!cells[5] && !cells[6]) || cells[5].length > 500 || cells[6].length > 500
+                                     || /^(?:DONE\b|⚠️ РАЗНЫЕ ЗАКАЗЫ$)/i.test(cells[5])
+                                     || cells[4] !== old[4] || !/^[1-9]\d*$/.test(cells[4])
+                                     || !Number.isSafeInteger(Number(cells[4])) || cells[10] !== old[10]) return false;
+                                 const lineId = `${proof.itemId}:${proof.transactionId}`;
+                                 const variantId = `${proof.itemId}:${proof.variationId}`, variant = JSON.stringify([cells[5], cells[6]]);
+                                 if (lineIds.has(lineId) || (variantValues.has(variantId) && variantValues.get(variantId) !== variant)) return false;
+                                 lineIds.add(lineId); variantValues.set(variantId, variant);
+                                 return true;
+                             });
+                         if (legacyEquivalent) {
+                             warehouseSnapshots.set(key, copies);
+                             const ordered = [...incoming].sort((a, b) => {
+                                 const x = allOrders[a.row - 1].ebay_item_identity, y = allOrders[b.row - 1].ebay_item_identity;
+                                 return `${x.itemId}:${x.transactionId}`.localeCompare(`${y.itemId}:${y.transactionId}`);
+                             });
+                             copies.forEach((copy, i) => {
+                                 const observed = ordered[i].cells;
+                                 if (copy.cells[5] === observed[5] && copy.cells[6] === observed[6]) return;
+                                 rowsToUpdate.push({ row: copy.row, key, qty: copy.cells[4], stamp: observed[9], note: copy.cells[10],
+                                     qtyChanged: false, noteChanged: false, color: observed[5], size: observed[6],
+                                     colorChanged: copy.cells[5] !== observed[5], sizeChanged: copy.cells[6] !== observed[6] });
+                             });
+                             continue;
+                         }
                          throw new Error('Ambiguous changed or repeated Parser item in Sheets upload');
                      }
                      // Exact unchanged positions already exist. Do not rewrite J,
@@ -8536,7 +8581,8 @@ async function uploadToSheets(runId = null) {
              }
         }
 
-        // Update only E/J/K. Recheck the exact copies immediately before writing:
+        // Ordinary observations update E/J/K. The exact legacy eBay correction
+        // above may also restore F/G. Recheck all copies before either write:
         // a moved row or a changed observation must never receive this update.
         if (rowsToUpdate.length > 0) {
             const authToken = await getAuthToken(false);
@@ -8548,6 +8594,8 @@ async function uploadToSheets(runId = null) {
             }
             const updateData = rowsToUpdate.flatMap(u => [
                 ...(u.qtyChanged ? [{ range: `${sheetName}!E${u.row}`, values: [[u.qty]] }] : []),
+                ...(u.colorChanged ? [{ range: `${sheetName}!F${u.row}`, values: [[u.color]] }] : []),
+                ...(u.sizeChanged ? [{ range: `${sheetName}!G${u.row}`, values: [[u.size]] }] : []),
                 { range: `${sheetName}!J${u.row}`, values: [[u.stamp]] },
                 ...(u.noteChanged ? [{ range: `${sheetName}!K${u.row}`, values: [[u.note]] }] : [])
             ]);
@@ -8566,7 +8614,11 @@ async function uploadToSheets(runId = null) {
             for (const key of new Set(rowsToUpdate.map(u => u.key))) {
                 const expected = warehouseSnapshots.get(key).map(copy => {
                     const update = updates.get(copy.row), cells = [...copy.cells];
-                    if (update) { cells[4] = update.qty; cells[9] = update.stamp; cells[10] = update.note; }
+                    if (update) {
+                        cells[4] = update.qty; cells[9] = update.stamp; cells[10] = update.note;
+                        if (update.colorChanged) cells[5] = update.color;
+                        if (update.sizeChanged) cells[6] = update.size;
+                    }
                     return { row: copy.row, cells };
                 });
                 if (JSON.stringify(after.get(key)) !== JSON.stringify(expected)) {
@@ -8604,6 +8656,7 @@ async function uploadToSheets(runId = null) {
                     tracks: newTrackSet.size,
                     byShop: byShopTracks,
                     qtyUpdated: rowsToUpdate.filter(row => row.qtyChanged).length,
+                    variantsUpdated: rowsToUpdate.filter(row => row.colorChanged || row.sizeChanged).length,
                     at: Date.now()
                 };
                 parseReport.newUploads = newUploads;

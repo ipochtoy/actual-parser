@@ -19,7 +19,7 @@ function harness(rows=[row()],items=[item()],options={}){
   async fetch(url,request){assert.equal(url,'https://sheets.googleapis.com/v4/spreadsheets/fixture/values:batchUpdate');assert.equal(request.method,'POST');
    const body=JSON.parse(request.body);assert.equal(body.valueInputOption,'RAW');h.writes.push(body);
    if(options.httpError)return {ok:false,status:503,text:async()=> 'fixture failure'};
-   for(const entry of body.data){const m=/^Лист1!([EJK])(\d+)$/.exec(entry.range);assert.ok(m,`Unexpected write: ${entry.range}`);if(!options.dropWrites)h.rows[Number(m[2])-1][{E:4,J:9,K:10}[m[1]]]=entry.values[0][0];}
+   for(const entry of body.data){const m=(options.allowVariantWrite?/^Лист1!([EFGJK])(\d+)$/:/^Лист1!([EJK])(\d+)$/).exec(entry.range);assert.ok(m,`Unexpected write: ${entry.range}`);if(!options.dropWrites)h.rows[Number(m[2])-1][{E:4,F:5,G:6,J:9,K:10}[m[1]]]=entry.values[0][0];}
    return {ok:true};},
   chrome:{storage:{local:{async get(){return clone(h.storage);},async set(patch){Object.assign(h.storage,clone(patch));}}},runtime:{sendMessage(message){h.messages.push(message);}}},
  };
@@ -136,6 +136,76 @@ test('repeated variants compare as an unchanged multiset, without summing or rel
  const rows = [row({ 4: '2', 5: 'Black', 10: '' }), row({ 5: 'Red', 10: '' })];
  const h = harness(rows, [item({ color: 'Red' }), item({ qty: '2', color: 'Black' })]);
  await h.run(); assert.deepEqual(h.rows, rows); assert.equal(h.writes.length, 0); assert.equal(h.appends.length, 0);
+});
+
+function variantCorrection(colors = ['Black', 'White'], oldColor = 'Black', options = {}) {
+ const run = { ...coordinatedUpload().storage.pipelineRun, expected: { ebay: ['buyer@example.test'] } };
+ const items = colors.map((color, index) => item({ store_name: 'eBay', order_id: '11-11111-11111',
+  track_number: '9434608106244517838177', color, account_name: 'buyer@example.test',
+  parser_run_id: run.id, parser_account: 'buyer@example.test', observed_at: new Date(run.startedAt + 1000).toISOString(),
+  ebay_item_identity: { schema: 1, source: 'purchase-feed-item-card', orderId: '11-11111-11111',
+   itemId: '123456789012', transactionId: String(10000000000001 + index), variationId: String(600000000001 + index),
+   track: '9434608106244517838177', color, size: '' },
+ }));
+ const rows = items.map(it => row({ 0: 'eBay', 1: it.order_id, 2: it.track_number, 3: it.product_name,
+  5: oldColor, 7: '', 8: it.account_name, 10: '' }));
+ options.mutate?.(rows, items, run);
+ return harness(rows, items, { ...options, runId: run.id, storage: { pipelineRun: run }, allowVariantWrite: true });
+}
+
+test('exact feed identities restore two colors or five shades in interchangeable legacy copies', async () => {
+ for (const [colors, oldColor] of [[['Black', 'White'], 'Black'], [['20 Volume', '10 Volume', '6n', '5ch+', '5n'], '']]) {
+  const h = variantCorrection(colors, oldColor), before = clone(h.rows);
+  await h.run();
+  assert.deepEqual(h.rows.map(r => r[5]), colors);
+  assert.equal(h.rows.length, before.length); assert.equal(h.appends.length, 0);
+  assert.equal(h.storage.lastUpload.qtyUpdated, 0);
+  for (let i = 0; i < before.length; i++) for (const column of [0,1,2,3,4,6,7,8,10]) assert.equal(h.rows[i][column], before[i][column]);
+  assert.ok(h.writes.flatMap(w => w.data).every(e => /!F\d+$|!J\d+$/.test(e.range)));
+  h.writes = []; const corrected = clone(h.rows); await h.run();
+  assert.deepEqual(h.rows, corrected); assert.equal(h.writes.length, 0);
+ }
+});
+
+test('legacy variant correction refuses unbound identities and distinguishable or processed copies', async () => {
+ const mutations = [
+  (rows, items) => { delete items[0].ebay_item_identity; },
+  (rows, items) => { items[1].ebay_item_identity.transactionId = items[0].ebay_item_identity.transactionId; },
+  (rows, items) => { items[1].ebay_item_identity.orderId = 'foreign'; },
+  (rows, items) => { items[1].ebay_item_identity.track = 'foreign'; },
+  (rows, items) => { items[1].ebay_item_identity.color = 'foreign'; },
+  (rows, items) => { items[1].qty = '2'; },
+  (rows, items) => { items[1].qty = null; },
+  rows => { rows[0][7] = 'archive-proof'; },
+  rows => { rows.forEach(r => { r[5] = 'DONE 123'; }); },
+  rows => { rows[0][9] = 'operator correction'; },
+  rows => { rows[0][10] = 'operator note'; },
+  rows => { rows[0][6] = 'large'; },
+  rows => { rows.pop(); },
+  rows => { rows.push(clone(rows[0])); },
+ ];
+ for (const mutate of mutations) {
+  const h = variantCorrection(['Black', 'White'], 'Black', { mutate }), before = clone(h.rows);
+  await assert.rejects(h.run(), /Ambiguous changed or repeated Parser item/);
+  assert.deepEqual(h.rows, before); assert.equal(h.writes.length, 0); assert.equal(h.appends.length, 0);
+ }
+});
+
+test('the same exact legacy correction can restore sizes without altering colors or quantity', async () => {
+ const h = variantCorrection(['M', 'L'], '', { mutate(rows, items) {
+  rows.forEach(r => { r[6] = 'M'; });
+  items.forEach(it => { it.size = it.color; it.color = ''; it.ebay_item_identity.size = it.size; it.ebay_item_identity.color = ''; });
+ } });
+ await h.run(); assert.deepEqual(h.rows.map(r => r[6]), ['M', 'L']);
+ assert.ok(h.rows.every(r => r[4] === '1' && r[5] === ''));
+ assert.ok(h.writes.flatMap(w => w.data).every(e => /!G\d+$|!J\d+$/.test(e.range)));
+});
+
+test('variant correction rechecks exact copies and confirms all preserved cells after writing', async () => {
+ const raced = variantCorrection(['Black', 'White'], 'Black', { beforeRead(h) { if (h.reads === 2) h.rows[0][7] = 'late-proof'; } });
+ await assert.rejects(raced.run(), /changed before/); assert.equal(raced.writes.length, 0);
+ const lost = variantCorrection(['Black', 'White'], 'Black', { dropWrites: true });
+ await assert.rejects(lost.run(), /readback was not confirmed/); assert.equal(lost.storage.lastUpload, undefined);
 });
 test('fresh pre-write read rejects moved, changed or newly duplicated rows',async()=>{
  for(const mutate of [h=>h.rows.unshift(row({1:'another-order'})),h=>h.rows[0][4]='3',h=>h.rows.push(row())]){
