@@ -7001,13 +7001,15 @@ const REJECTED_UPLOAD_KEYS = [
 const REJECTED_UPLOAD_MAX_BYTES = 16 * 1024 * 1024;
 const REJECTED_UPLOAD_MAX_ROWS = 20000;
 
-function rejectedUploadScope(state, runId, pendingRequired, readyRetryToken = null) {
+function rejectedUploadScope(state, runId, pendingRequired, readyRetryToken = null, successorSlotId = null) {
     const run = state?.pipelineRun, stage = state?.pipelineStage, lease = state?.nightCabinetLease;
     return typeof isParsingAllStores !== 'undefined' && isParsingAllStores === false
         && typeof isProcessingScreenshots !== 'undefined' && isProcessingScreenshots === false
         && !state.parserScreenshotReuseTab && !state.parserScreenshotLocalTab
         && (state.screenshotStageBudget?.activeSince == null)
-        && lease?.owner === 'parser' && lease.slotId === String(run?.slotAt)
+        && lease?.owner === 'parser'
+        && (lease.slotId === String(run?.slotAt)
+            || (!pendingRequired && successorSlotId === lease.slotId && Number(successorSlotId) > run?.slotAt))
         && ((lease.phase === 'running' && lease.runId === runId && lease.token === run?.nightRequestToken)
             || (typeof readyRetryToken === 'string' && readyRetryToken.length >= 16
                 && lease.phase === 'ready' && !lease.runId && lease.token === readyRetryToken
@@ -7082,7 +7084,7 @@ function rejectedUploadCritical(state, includePending = true, ignoreLease = fals
     }
     const lease = state.nightCabinetLease;
     critical.nightCabinetLease = lease ? { owner: lease.owner, phase: lease.phase,
-        runId: lease.runId, token: lease.token, slotId: lease.slotId } : null;
+        runId: lease.runId ?? null, token: lease.token, slotId: lease.slotId } : null;
     if (!includePending) delete critical.pendingSheetsUpload;
     if (ignoreLease) delete critical.nightCabinetLease;
     return critical;
@@ -7090,11 +7092,28 @@ function rejectedUploadCritical(state, includePending = true, ignoreLease = fals
 
 // Re-reads and hashes the immutable archive. Consumers receive only its receipt,
 // never the private raw rows/ACK ledger. A boolean stored beside a hash is not proof.
+async function rejectedUploadSuccessorSlot(state, readyRetryToken) {
+    const lease = state.nightCabinetLease, run = state.pipelineRun;
+    if (!readyRetryToken || lease?.slotId === String(run?.slotAt)) return null;
+    const now = Date.now();
+    const decision = externalCoordinatorStartDecision({ slotId: lease?.slotId, token: readyRetryToken }, lease, { now });
+    if (!decision.start || !Number.isSafeInteger(Number(lease.slotId))
+        || Number(lease.slotId) <= run?.slotAt) return null;
+    if (readyRetryToken.startsWith('control:')) {
+        try {
+            const manual = await manualControlParserStartProof(lease, now);
+            if (!manual.ok || !manual.record || manual.record.envelope.createdAt <= run.finishedAt) return null;
+        } catch (_) { return null; }
+    } else if (!nightCabinetLeaseSlotIds(now).includes(lease.slotId)) return null;
+    return lease.slotId;
+}
+
 async function readParserRejectedUploadProof({ readyRetryToken = null } = {}) {
     if (rejectedUploadArchiveInFlight || finalSheetsUploadInFlight || uploadToSheets.activeCount > 0) return null;
     const state = await chrome.storage.local.get(REJECTED_UPLOAD_KEYS);
     const outcome = state.parserRejectedUpload, run = state.pipelineRun;
-    if (!outcome || !rejectedUploadScope(state, outcome.runId, false, readyRetryToken)
+    const successorSlotId = await rejectedUploadSuccessorSlot(state, readyRetryToken);
+    if (!outcome || !rejectedUploadScope(state, outcome.runId, false, readyRetryToken, successorSlotId)
         || outcome.schema !== 1 || outcome.status !== 'rejected_preflight'
         || !REJECTED_UPLOAD_CODES.has(outcome.code) || outcome.runId !== run.id
         || outcome.slotAt !== run.slotAt || outcome.nightSlotDay !== run.nightSlotDay
@@ -7113,14 +7132,16 @@ async function readParserRejectedUploadProof({ readyRetryToken = null } = {}) {
         || stores.reduce((sum, store) => sum + store.orders.length, 0) !== data.rawRows) return null;
     if (data.schema !== 1 || data.code !== outcome.code || data.runId !== run.id
         || !rejectedUploadJsonEqual(data.destination, outcome.destination)
-        || JSON.stringify(snap?.pipelineRun) !== JSON.stringify(run)
-        || JSON.stringify(rejectedUploadCritical(snap, false, !!readyRetryToken)) !== JSON.stringify(rejectedUploadCritical(state, false, !!readyRetryToken))
+        || !rejectedUploadJsonEqual(snap?.pipelineRun, run)
+        || !rejectedUploadJsonEqual(rejectedUploadCritical(snap, false, !!readyRetryToken), rejectedUploadCritical(state, false, !!readyRetryToken))
         || data.rawRows !== outcome.rawRows || !Number.isSafeInteger(data.rawRows) || data.rawRows < 1) return null;
     const fresh = await chrome.storage.local.get(REJECTED_UPLOAD_KEYS);
+    const freshSuccessorSlotId = await rejectedUploadSuccessorSlot(fresh, readyRetryToken);
     if (rejectedUploadArchiveInFlight || finalSheetsUploadInFlight || uploadToSheets.activeCount > 0
-        || !rejectedUploadScope(fresh, outcome.runId, false, readyRetryToken)
-        || JSON.stringify(rejectedUploadCritical(fresh, false)) !== JSON.stringify(rejectedUploadCritical(state, false))
-        || JSON.stringify(fresh.parserRejectedUpload) !== JSON.stringify(outcome)) return null;
+        || freshSuccessorSlotId !== successorSlotId
+        || !rejectedUploadScope(fresh, outcome.runId, false, readyRetryToken, successorSlotId)
+        || !rejectedUploadJsonEqual(rejectedUploadCritical(fresh, false), rejectedUploadCritical(state, false))
+        || !rejectedUploadJsonEqual(fresh.parserRejectedUpload, outcome)) return null;
     return { ...outcome, archiveVerified: true, browserQuiescent: true };
 }
 

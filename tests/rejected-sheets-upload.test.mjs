@@ -18,7 +18,7 @@ function harness(options={}) {
  state.nightCabinetLease={owner:'parser',phase:'running',runId:RUN,token:run.nightRequestToken,slotId:String(run.slotAt)};
  const copies=options.copies || [1,1,1,1,''].map(q=>['Amazon',item.order_id,item.track_number,item.product_name,String(q),'','','existing-archive','ipochtoy@gmail.com','','']);
  const h={state,writes:[],post:0,append:0,success:0,reads:0};
- const ctx={Date:class extends Date{static now(){return finished+60000}},TextEncoder,crypto:webcrypto,structuredClone,Uint8Array,URL,console:{log(){},error(){},warn(){}},DEFAULT_SPREADSHEET_ID:'fixture',parseReport:{},nightCabinetSlotDay:()=>run.nightSlotDay,normalizeAccountEmail:x=>String(x||'').trim().toLowerCase(),async uploadLogsToSheet(){throw new Error('must not upload logs after rejection')},async replayScreenshotLinks(){},async sendTelegramMessage(){},async getAuthToken(){if(options.authError)throw options.authError;return 'fake'},async readSheetData(){if(options.readError)throw options.readError;return structuredClone(copies)},async fetch(){h.post++;throw options.postError||new Error('unexpected POST')},async writeDataToSheet(){h.append++;},chrome:{runtime:{sendMessage(x){if(x.status==='success')h.success++}},storage:{local:{async get(keys){assert.notEqual(keys,null);h.reads++;options.beforeGet?.(h,keys);const out={};for(const k of Array.isArray(keys)?keys:[keys])if(k in state)out[k]=structuredClone(state[k]);return out},async set(patch){options.beforeSet?.(h,patch);h.writes.push(structuredClone(patch));Object.assign(state,structuredClone(patch));options.afterSet?.(h,patch)}}}}};
+ const ctx={Date:class extends Date{static now(){return options.now ?? finished+60000}},TextEncoder,crypto:webcrypto,structuredClone,Uint8Array,URL,console:{log(){},error(){},warn(){}},DEFAULT_SPREADSHEET_ID:'fixture',parseReport:{},nightCabinetSlotDay:()=>run.nightSlotDay,normalizeAccountEmail:x=>String(x||'').trim().toLowerCase(),async uploadLogsToSheet(){throw new Error('must not upload logs after rejection')},async replayScreenshotLinks(){},async sendTelegramMessage(){},async getAuthToken(){if(options.authError)throw options.authError;return 'fake'},async readSheetData(){if(options.readError)throw options.readError;return structuredClone(copies)},async fetch(){h.post++;throw options.postError||new Error('unexpected POST')},async writeDataToSheet(){h.append++;},chrome:{runtime:{sendMessage(x){if(x.status==='success')h.success++}},storage:{local:{async get(keys){assert.notEqual(keys,null);h.reads++;options.beforeGet?.(h,keys);const out={};for(const k of Array.isArray(keys)?keys:[keys])if(k in state)out[k]=structuredClone(state[k]);return out},async set(patch){options.beforeSet?.(h,patch);h.writes.push(structuredClone(patch));Object.assign(state,structuredClone(patch));options.afterSet?.(h,patch)}}}}};
  vm.createContext(ctx);vm.runInContext(`let finalSheetsUploadInFlight=null;let isParsingAllStores=false;let isProcessingScreenshots=false;\n${protocol}\n${flight}\n${upload}`,ctx);
  h.ctx=ctx;h.run=()=>ctx.getOrStartFinalSheetsUpload(RUN).promise;return h;
 }
@@ -98,13 +98,15 @@ test('sealed archive resumes after a transient guard failure and diagnostic drif
 });
 test('row count cap refuses without silently truncating raw rows',async()=>{const h=harness();h.state.orderData.Amazon.orders=Array.from({length:20001},(_,i)=>({...h.state.orderData.Amazon.orders[i?1:0],order_id:i?`count-${i}`:h.state.orderData.Amazon.orders[0].order_id}));await assert.rejects(h.run(),/row count/);assert.equal(h.state.pendingSheetsUpload.runId,RUN);assert.equal(h.state[archiveKey],undefined)});
 function installCanonicalDoor(h) {
- const {ctx}=h,now=finished+60000;
+ const {ctx}=h,now=ctx.Date.now();
  Object.assign(ctx,{nightCabinetLeaseWriteChain:Promise.resolve(),NIGHT_CABINET_LEASE_KEY:'nightCabinetLease',NIGHT_CABINET_LEASE_TTL_MS:900000,NIGHT_CABINET_TIME_ZONE:'America/New_York',NIGHT_CABINET_OWNERS:new Set(['store-walk','parser']),NIGHT_CABINET_PHASES:new Set(['running','ready','store-catchup','store-main','completed','degraded']),NIGHT_CABINET_TRANSITION_REQUEST_KEY:'nightCoordinatorLeaseTransitionRequest',NIGHT_CABINET_TRANSITION_RESULT_KEY:'nightCoordinatorLeaseTransitionResult',NIGHT_CABINET_TRANSITION_HANDLED_KEY:'lastHandledNightCoordinatorLeaseTransitionId',NIGHT_CABINET_CATCHUP_RESUME_KEY:'nightCabinetCatchupResumeMarkers',nightCabinetLeaseSlotIds:()=>[String(h.state.pipelineRun.slotAt)]});
  h.state.nightCabinetLease={...h.state.nightCabinetLease,heartbeat:now-1,expires:now+900000};
  vm.runInContext([
   take('function inspectNightCabinetLease(','function nightCabinetTerminalSlotProof('),
   take('function nightCabinetTerminalSlotProof(','async function scheduleNightCabinetRetry('),
   take('async function handleNightCoordinatorLeaseTransitionRequest(','async function handleNightCoordinatorLeaseTransitionWake('),
+  fullFunction('prepareParserNightCabinetLease'),
+  fullFunction('externalCoordinatorStartDecision'),
  ].join('\n'),ctx);
 }
 test('actual canonical handoff consumes failed proof, then exact ready retry revalidates unchanged archive without old owner fiction',async()=>{
@@ -120,3 +122,71 @@ test('actual canonical handoff consumes failed proof, then exact ready retry rev
 });
 
 test('volatile work starting during archive proof read prevents a quiescent handoff',async()=>{const h=harness({beforeGet(h,keys){if(h.flipProof&&keys.includes(archiveKey))vm.runInContext('isProcessingScreenshots=true',h.ctx)}});await assert.rejects(h.run());h.flipProof=true;assert.equal(await h.ctx.readParserRejectedUploadProof(),null)});
+
+const MANUAL_AT=Date.parse('2026-09-07T13:00:00Z');
+const MANUAL_ID='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+function fullFunction(name) {
+ const match=new RegExp(`(?:async )?function ${name}\\(`).exec(source);
+ assert.ok(match,name);const end=source.indexOf('\n}\n',match.index);assert.ok(end>match.index);
+ return source.slice(match.index,end+2);
+}
+function readySuccessor(h,{manual=true}={}) {
+ installCanonicalDoor(h);
+ vm.runInContext(fullFunction('nightCabinetSlotDay'),h.ctx);
+ const now=h.ctx.Date.now(),slot=manual?MANUAL_AT:Date.parse('2026-09-08T03:00:00Z');
+ const token=manual?`control:${MANUAL_ID}:parser-1`:'night:2026-09-07:successor-fixture';
+ const envelope={schemaVersion:1,kind:'manual-control',id:MANUAL_ID,requestSha:'a'.repeat(64),
+  coordinatorRunId:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',createdAt:MANUAL_AT,
+  deadlineAt:MANUAL_AT+6*3600000,nextNativeAdmissionAt:Date.parse('2026-09-08T00:30:00Z')};
+ const key=`manualControlGeneration:${MANUAL_ID}`;
+ h.state.nightCabinetLease={owner:'parser',phase:'ready',slotId:String(slot),token,heartbeat:now,expires:now+900000};
+ if(manual){h.state.manualControlGenerationIndex=[MANUAL_ID];h.state[key]={schemaVersion:1,envelope,admittedAt:MANUAL_AT,parserRunId:null};}
+ else h.ctx.nightCabinetLeaseSlotIds=()=>[String(slot)];
+ return{token,key,envelope,lease:structuredClone(h.state.nightCabinetLease)};
+}
+for(const manual of [true,false])test(`unchanged rejected archive is readable under the next ${manual?'manual':'native'} canonical ready slot`,async()=>{
+ const h=harness({now:MANUAL_AT});await assert.rejects(h.run());
+ const archive=structuredClone(h.state[archiveKey]),raw=structuredClone(h.state.orderData),n=h.writes.length;
+ const {token}=readySuccessor(h,{manual});
+ assert.equal(await h.ctx.readParserRejectedUploadProof(),null,'old owner cannot be invented');
+ const proof=await h.ctx.readParserRejectedUploadProof({readyRetryToken:token});
+ assert.equal(proof?.archiveVerified,true);assert.equal(proof?.runId,RUN);
+ assert.deepEqual(h.state[archiveKey],archive);assert.deepEqual(h.state.orderData,raw);
+ assert.equal(h.writes.length,n);assert.equal(h.post+h.append+h.success,0);
+});
+for(const bad of ['expired','foreign-token','consumed','missing-envelope','changed-envelope','missing-index','pending','raw-change','archive-change'])
+ test(`successor proof ${bad} cannot release the previous data`,async()=>{
+  const h=harness({now:MANUAL_AT});await assert.rejects(h.run());const next=readySuccessor(h);
+  if(bad==='expired')h.state.nightCabinetLease.expires=MANUAL_AT;
+  if(bad==='foreign-token')h.state.nightCabinetLease.token='foreign-ready-token';
+  if(bad==='consumed')h.state[next.key].parserRunId='already-created';
+  if(bad==='missing-envelope')delete h.state[next.key];
+  if(bad==='changed-envelope')h.state[next.key].envelope.createdAt--;
+  if(bad==='missing-index')h.state.manualControlGenerationIndex=[];
+  if(bad==='pending')h.state.pendingSheetsUpload={runId:RUN};
+  if(bad==='raw-change')h.state.orderData.Amazon.orders[0].qty=7;
+  if(bad==='archive-change')h.state[archiveKey].json+=' ';
+  const n=h.writes.length;assert.equal(await h.ctx.readParserRejectedUploadProof({readyRetryToken:next.token}),null);
+  assert.equal(h.writes.length,n);assert.equal(h.post+h.append+h.success,0);
+ });
+test('generation consumed during archive read cannot pass the final successor check',async()=>{
+ const h=harness({now:MANUAL_AT,beforeGet(h,keys){if(h.flipProof&&keys.includes(archiveKey))h.state[`manualControlGeneration:${MANUAL_ID}`].parserRunId='concurrent-run'}});
+ await assert.rejects(h.run());const next=readySuccessor(h);h.flipProof=true;
+ assert.equal(await h.ctx.readParserRejectedUploadProof({readyRetryToken:next.token}),null);
+});
+test('actual daily start consumes one manual run after rejected prior data, preserving its archive and raw rows',async()=>{
+ const h=harness({now:MANUAL_AT});await assert.rejects(h.run());const next=readySuccessor(h);
+ const archive=structuredClone(h.state[archiveKey]),raw=structuredClone(h.state.orderData);
+ Object.assign(h.ctx,{loadAccountsConfig:async()=>({}),buildExpectedPipelineRoster:()=>({iherb:[],ebay:[],amazon:[]}),
+  addDailyDiagnostic:async()=>{},clearNightCabinetRetry:async()=>{},clearParsingLogs:async()=>{},
+  cachedProgressState:{},parseReport:{},startSequentialPipeline:async()=>({started:true})});
+ vm.runInContext([fullFunction('createPipelineRun'),fullFunction('runDailyAutoParseOnce')].join('\n'),h.ctx);
+ assert.equal(await h.ctx.runDailyAutoParseOnce('coordinator-control',{external:true,slotId:next.lease.slotId,token:next.token}),true);
+ assert.notEqual(h.state.pipelineRun.id,RUN);assert.equal(h.state.pipelineRun.slotAt,MANUAL_AT);
+ assert.equal(h.state[next.key].parserRunId,h.state.pipelineRun.id);
+ assert.equal(h.state.nightCabinetLease.runId,h.state.pipelineRun.id);
+ assert.deepEqual(h.state[archiveKey],archive);assert.deepEqual(h.state.orderData,raw);
+ const current=h.state.pipelineRun.id;
+ await assert.rejects(h.ctx.createPipelineRun('coordinator-control',next.lease),/lease lost/);
+ assert.equal(h.state.pipelineRun.id,current);assert.equal(h.post+h.append+h.success,0);
+});
