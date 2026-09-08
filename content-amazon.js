@@ -294,14 +294,16 @@
     // A quantity belongs to one physical item row. Never climb to a delivery
     // box containing siblings: a badge on item 2 otherwise becomes every qty.
     if (!scope?.closest || !scope?.matches) return null;
-    const itemRoot = scope.closest('.yo-enhanced-flex-card, .yohtmlc-item, [data-test-id="item-row"]')
+    // Both the vertical layout and the horizontal order carousel have a
+    // physical card. The carousel image and title are links to the same item.
+    const itemRoot = scope.closest('.yo-enhanced-flex-card, .yo-enhanced-card, .yohtmlc-item, [data-test-id="item-row"]')
       || scope.closest('.a-fixed-left-grid-inner')
       || (scope.matches('.a-row') ? scope : null);
     if (!itemRoot || (shipmentBox && itemRoot !== shipmentBox && !shipmentBox.contains(itemRoot))) return null;
     const ownLinks = Array.from(itemRoot.querySelectorAll(SHIPMENT.PRODUCT_LINK_SELECTOR));
     const ownAsins = new Set(ownLinks.map(link => String(link.getAttribute('href') || link.href || '')
       .match(/\/(?:dp|product)\/([A-Z0-9]{8,10})/i)?.[1]?.toUpperCase()).filter(Boolean));
-    if (ownAsins.size !== 1 || itemRoot.querySelectorAll('.yo-enhanced-flex-card, .yohtmlc-item, [data-test-id="item-row"]').length > 1) return null;
+    if (ownAsins.size !== 1 || itemRoot.querySelectorAll('.yo-enhanced-flex-card, .yo-enhanced-card, .yohtmlc-item, [data-test-id="item-row"]').length > 1) return null;
     scope = itemRoot;
     const insideItem = node => node && (node === itemRoot || itemRoot.contains(node));
     const badgeQuantity = badges => {

@@ -30,7 +30,7 @@
   const SHIPMENT_HINT_SELECTOR = '.delivery-box__primary-text, .yohtmlc-shipment-status-primaryText';
 
   /** Рамка ОДНОЙ позиции внутри отправки. */
-  const ITEM_SCOPE_SELECTOR = '.yo-enhanced-flex-card, .yohtmlc-item, [data-test-id="item-row"], .a-fixed-left-grid-inner, .a-row';
+  const ITEM_SCOPE_SELECTOR = '.yo-enhanced-flex-card, .yo-enhanced-card, .yohtmlc-item, [data-test-id="item-row"], .a-fixed-left-grid-inner, .a-row';
 
   function countTrackButtons(el) {
     if (!el || !el.querySelectorAll) return 0;
@@ -54,7 +54,7 @@
     let rowFallback = null;
     let cur = node;
     for (let i = 0; i < 8 && cur; i++, cur = cur.parentElement) {
-      if (cur.matches && cur.matches('.yo-enhanced-flex-card, .yohtmlc-item, [data-test-id="item-row"], .a-fixed-left-grid-inner')) return cur;
+      if (cur.matches && cur.matches('.yo-enhanced-flex-card, .yo-enhanced-card, .yohtmlc-item, [data-test-id="item-row"], .a-fixed-left-grid-inner')) return cur;
       if (!rowFallback && cur.matches && cur.matches('.a-row')) rowFallback = cur;
     }
     return rowFallback || node;
