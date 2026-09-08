@@ -6981,6 +6981,7 @@ let finalSheetsUploadInFlight = null;
 // Only a refusal created by our pre-write planner can enter this protocol.
 // Network/auth/unknown POST errors, including lookalike error codes, cannot.
 const sheetsPrewriteQtyRefusals = new WeakMap();
+const REJECTED_UPLOAD_CODES = new Set(['PARSER_SHEETS_QTY_CONFLICT', 'PARSER_SHEETS_VARIANT_CONFLICT']);
 let rejectedUploadArchiveInFlight = null;
 const REJECTED_UPLOAD_KEYS = [
     'pipelineRun', 'pipelineStage', 'parsingState', 'pendingSheetsUpload', 'orderData',
@@ -7095,7 +7096,7 @@ async function readParserRejectedUploadProof({ readyRetryToken = null } = {}) {
     const outcome = state.parserRejectedUpload, run = state.pipelineRun;
     if (!outcome || !rejectedUploadScope(state, outcome.runId, false, readyRetryToken)
         || outcome.schema !== 1 || outcome.status !== 'rejected_preflight'
-        || outcome.code !== 'PARSER_SHEETS_QTY_CONFLICT' || outcome.runId !== run.id
+        || !REJECTED_UPLOAD_CODES.has(outcome.code) || outcome.runId !== run.id
         || outcome.slotAt !== run.slotAt || outcome.nightSlotDay !== run.nightSlotDay
         || outcome.requestToken !== run.nightRequestToken || outcome.finishedAt !== run.finishedAt
         || !Number.isFinite(outcome.rejectedAt) || outcome.rejectedAt < run.finishedAt || outcome.rejectedAt > Date.now()
@@ -7126,6 +7127,8 @@ async function readParserRejectedUploadProof({ readyRetryToken = null } = {}) {
 async function archiveRejectedSheetsUpload(runId, error) {
     const refusal = sheetsPrewriteQtyRefusals.get(error);
     if (!refusal || refusal.runId !== runId) return false;
+    const code = refusal.code || 'PARSER_SHEETS_QTY_CONFLICT';
+    if (!REJECTED_UPLOAD_CODES.has(code)) return false;
     if (rejectedUploadArchiveInFlight) throw new Error('Rejected upload archive already active');
     const fence = { runId };
     rejectedUploadArchiveInFlight = fence;
@@ -7142,7 +7145,7 @@ async function archiveRejectedSheetsUpload(runId, error) {
             rawRows += store.orders.length;
         }
         if (!rawRows || rawRows > REJECTED_UPLOAD_MAX_ROWS) throw new Error('Rejected upload raw row count outside its whole-data limit');
-        let json = JSON.stringify({ schema: 1, code: 'PARSER_SHEETS_QTY_CONFLICT', runId,
+        let json = JSON.stringify({ schema: 1, code, runId,
             destination: refusal.destination, collision: refusal.collision, rawRows, snapshot });
         await rejectedUploadDigest(json);
         const archiveKey = `parserRejectedUploadArchive:${runId}`;
@@ -7151,7 +7154,7 @@ async function archiveRejectedSheetsUpload(runId, error) {
             if (existing.schema !== 1 || typeof existing.json !== 'string') throw new Error('Rejected upload archive already differs');
             await rejectedUploadDigest(existing.json);
             let prior; try { prior = JSON.parse(existing.json); } catch (_) { throw new Error('Rejected upload archive already differs'); }
-            if (prior.schema !== 1 || prior.code !== 'PARSER_SHEETS_QTY_CONFLICT' || prior.runId !== runId
+            if (prior.schema !== 1 || prior.code !== code || prior.runId !== runId
                 || prior.rawRows !== rawRows || JSON.stringify(prior.destination) !== JSON.stringify(refusal.destination)
                 || JSON.stringify(prior.collision) !== JSON.stringify(refusal.collision)
                 || JSON.stringify(rejectedUploadCritical(prior.snapshot || {})) !== JSON.stringify(rejectedUploadCritical(snapshot))) {
@@ -7169,7 +7172,7 @@ async function archiveRejectedSheetsUpload(runId, error) {
         if (!rejectedUploadScope(fresh, runId, true) || finalSheetsUploadInFlight?.runId !== runId
             || uploadToSheets.activeCount > 0
             || JSON.stringify(rejectedUploadCritical(fresh)) !== JSON.stringify(rejectedUploadCritical(snapshot))) throw new Error('Rejected upload source changed after archive');
-        const outcome = { schema: 1, status: 'rejected_preflight', code: 'PARSER_SHEETS_QTY_CONFLICT',
+        const outcome = { schema: 1, status: 'rejected_preflight', code,
             runId, slotAt: state.pipelineRun.slotAt, nightSlotDay: state.pipelineRun.nightSlotDay,
             requestToken: state.pipelineRun.nightRequestToken, finishedAt: state.pipelineRun.finishedAt,
             rejectedAt: Date.now(), archiveKey, ...digest, rawRows, destination: refusal.destination,
@@ -8478,6 +8481,64 @@ async function uploadToSheets(runId = null) {
              const incomingMap = warehouseGroups(values);
              const incomingKeys = new Set();
              const meaningfulColor = value => /^(?:DONE\b|⚠️ РАЗНЫЕ ЗАКАЗЫ$)/i.test(value) ? '' : value;
+             // Historical correction needs a one-to-one current feed identity.
+             // Missing observations never erase a known historical variant.
+             const legacyVariantCorrections = (incoming, copies) => {
+                 const r = incoming[0].cells;
+                 const key = warehouseKey(r);
+                 const old = copies[0].cells;
+                 const lineIds = new Set(), variantValues = new Map();
+                 const legacyEquivalent = !!runId && r[0] === 'eBay'
+                     && incoming.length === copies.length
+                     && old[7] === '' && old[10] === '' && old[10] === r[10]
+                     && !/^(?:DONE\b|⚠️ РАЗНЫЕ ЗАКАЗЫ$)/i.test(old[5])
+                     && /^parser\|\d{4}-\d{2}-\d{2}T/.test(old[9])
+                     && Number.isFinite(Date.parse(old[9].slice(7)))
+                     && Date.parse(old[9].slice(7)) <= result.pipelineRun.startedAt
+                     && copies.every(copy => JSON.stringify(copy.cells.slice(4)) === JSON.stringify(old.slice(4)))
+                     && incoming.every(copy => {
+                         const rawItem = allOrders[copy.row - 1], proof = rawItem.ebay_item_identity, cells = copy.cells;
+                         if (!proof || proof.schema !== 1 || proof.source !== 'purchase-feed-item-card'
+                             || proof.orderId !== cells[1] || proof.track !== cells[2]
+                             || proof.color !== cells[5] || proof.size !== cells[6]
+                             || ![proof.itemId, proof.transactionId, proof.variationId].every(id => /^\d{6,20}$/.test(id || ''))
+                             || (!cells[5] && !cells[6]) || cells[5].length > 500 || cells[6].length > 500
+                             || (old[5] && !cells[5]) || (old[6] && !cells[6])
+                             || /^(?:DONE\b|⚠️ РАЗНЫЕ ЗАКАЗЫ$)/i.test(cells[5])
+                             || cells[4] !== old[4] || !/^[1-9]\d*$/.test(cells[4])
+                             || !Number.isSafeInteger(Number(cells[4])) || cells[10] !== old[10]) return false;
+                         const lineId = `${proof.itemId}:${proof.transactionId}`;
+                         const variantId = `${proof.itemId}:${proof.variationId}`, variant = JSON.stringify([cells[5], cells[6]]);
+                         if (lineIds.has(lineId) || (variantValues.has(variantId) && variantValues.get(variantId) !== variant)) return false;
+                         lineIds.add(lineId); variantValues.set(variantId, variant);
+                         return true;
+                     });
+                 if (!legacyEquivalent) return null;
+                 const corrections = [];
+                 const ordered = [...incoming].sort((a, b) => {
+                     const x = allOrders[a.row - 1].ebay_item_identity, y = allOrders[b.row - 1].ebay_item_identity;
+                     return `${x.itemId}:${x.transactionId}`.localeCompare(`${y.itemId}:${y.transactionId}`);
+                 });
+                 copies.forEach((copy, i) => {
+                     const observed = ordered[i].cells;
+                     if (copy.cells[5] === observed[5] && copy.cells[6] === observed[6]) return;
+                     corrections.push({ row: copy.row, key, qty: copy.cells[4], stamp: observed[9], note: copy.cells[10],
+                         qtyChanged: false, noteChanged: false, color: observed[5], size: observed[6],
+                         colorChanged: copy.cells[5] !== observed[5], sizeChanged: copy.cells[6] !== observed[6] });
+                 });
+                 return corrections;
+             };
+             const refuseVariant = (message, key, incoming, copies) => {
+                 const error = new Error(message);
+                 error.code = 'PARSER_SHEETS_VARIANT_CONFLICT';
+                 if (runId && typeof sheetsPrewriteQtyRefusals !== 'undefined') {
+                     sheetsPrewriteQtyRefusals.set(error, { code: error.code, runId, rawJSON: JSON.stringify(orderData),
+                         destination: { spreadsheetId, sheetName },
+                         collision: { kind: 'variant', key, items: incoming.map(copy => structuredClone(allOrders[copy.row - 1])),
+                             copies: structuredClone(copies) } });
+                 }
+                 throw error;
+             };
              for (const [index, raw] of values.entries()) {
                  const r = warehouseCells(raw), key = warehouseKey(r);
                  if (incomingKeys.has(key)) continue; // the complete group was handled together
@@ -8499,48 +8560,13 @@ async function uploadToSheets(runId = null) {
                          // sibling or dropped Shade entirely. Only interchangeable,
                          // untouched Parser rows can be rebound to exact current
                          // feed line identities; distinct historical rows stay blocked.
-                         const old = copies[0].cells;
-                         const lineIds = new Set(), variantValues = new Map();
-                         const legacyEquivalent = !!runId && r[0] === 'eBay'
-                             && incoming.length === copies.length
-                             && old[7] === '' && old[10] === r[10]
-                             && !/^(?:DONE\b|⚠️ РАЗНЫЕ ЗАКАЗЫ$)/i.test(old[5])
-                             && /^parser\|\d{4}-\d{2}-\d{2}T/.test(old[9])
-                             && Number.isFinite(Date.parse(old[9].slice(7)))
-                             && Date.parse(old[9].slice(7)) <= result.pipelineRun.startedAt
-                             && copies.every(copy => JSON.stringify(copy.cells.slice(4)) === JSON.stringify(old.slice(4)))
-                             && incoming.every(copy => {
-                                 const rawItem = allOrders[copy.row - 1], proof = rawItem.ebay_item_identity, cells = copy.cells;
-                                 if (!proof || proof.schema !== 1 || proof.source !== 'purchase-feed-item-card'
-                                     || proof.orderId !== cells[1] || proof.track !== cells[2]
-                                     || proof.color !== cells[5] || proof.size !== cells[6]
-                                     || ![proof.itemId, proof.transactionId, proof.variationId].every(id => /^\d{6,20}$/.test(id || ''))
-                                     || (!cells[5] && !cells[6]) || cells[5].length > 500 || cells[6].length > 500
-                                     || /^(?:DONE\b|⚠️ РАЗНЫЕ ЗАКАЗЫ$)/i.test(cells[5])
-                                     || cells[4] !== old[4] || !/^[1-9]\d*$/.test(cells[4])
-                                     || !Number.isSafeInteger(Number(cells[4])) || cells[10] !== old[10]) return false;
-                                 const lineId = `${proof.itemId}:${proof.transactionId}`;
-                                 const variantId = `${proof.itemId}:${proof.variationId}`, variant = JSON.stringify([cells[5], cells[6]]);
-                                 if (lineIds.has(lineId) || (variantValues.has(variantId) && variantValues.get(variantId) !== variant)) return false;
-                                 lineIds.add(lineId); variantValues.set(variantId, variant);
-                                 return true;
-                             });
-                         if (legacyEquivalent) {
+                         const corrections = legacyVariantCorrections(incoming, copies);
+                         if (corrections) {
                              warehouseSnapshots.set(key, copies);
-                             const ordered = [...incoming].sort((a, b) => {
-                                 const x = allOrders[a.row - 1].ebay_item_identity, y = allOrders[b.row - 1].ebay_item_identity;
-                                 return `${x.itemId}:${x.transactionId}`.localeCompare(`${y.itemId}:${y.transactionId}`);
-                             });
-                             copies.forEach((copy, i) => {
-                                 const observed = ordered[i].cells;
-                                 if (copy.cells[5] === observed[5] && copy.cells[6] === observed[6]) return;
-                                 rowsToUpdate.push({ row: copy.row, key, qty: copy.cells[4], stamp: observed[9], note: copy.cells[10],
-                                     qtyChanged: false, noteChanged: false, color: observed[5], size: observed[6],
-                                     colorChanged: copy.cells[5] !== observed[5], sizeChanged: copy.cells[6] !== observed[6] });
-                             });
+                             rowsToUpdate.push(...corrections);
                              continue;
                          }
-                         throw new Error('Ambiguous changed or repeated Parser item in Sheets upload');
+                         refuseVariant('Ambiguous changed or repeated Parser item in Sheets upload', key, incoming, copies);
                      }
                      // Exact unchanged positions already exist. Do not rewrite J,
                      // variants, quantity or notes, and do not delete any copies.
@@ -8551,7 +8577,12 @@ async function uploadToSheets(runId = null) {
                  const colors = new Set(copies.map(x => meaningfulColor(x.cells[5])).filter(Boolean));
                  if (sizes.size !== 1 || !sizes.has(r[6]) || colors.size > 1
                      || (colors.size === 1 && !colors.has(meaningfulColor(r[5])))) {
-                     throw new Error('Ambiguous variant in existing Sheets item');
+                     const corrections = legacyVariantCorrections(incoming, copies);
+                     if (corrections) {
+                         rowsToUpdate.push(...corrections);
+                         continue;
+                     }
+                     refuseVariant('Ambiguous variant in existing Sheets item', key, incoming, copies);
                  }
                  const notes = new Set(copies.map(x => x.cells[10]));
                  const managedNote = note => note === '' || note === 'состав не разобран';

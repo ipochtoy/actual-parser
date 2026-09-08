@@ -16,12 +16,31 @@ function harness(options={}) {
  const run={id:RUN,status:'degraded',source:'coordinator-control',slotAt:Date.parse('2026-09-07T03:00:00Z'),attemptedAt:started-50,startedAt:started,finishedAt:finished,nightSlotDay:'2026-09-06',nightRequestToken:'night:2026-09-06:fixture-request',expected:{amazon:['ipochtoy@gmail.com']},completed:{amazon:['ipochtoy@gmail.com']},failures:[{shop:'amazon',account:'missing@example.com'}]};
  const state={spreadsheetId:'fixture',sheetName:'Лист1',pipelineRun:run,pipelineStage:{active:false,runId:RUN,stages:['iherb','ebay','amazon','done'],stageName:'done',currentIndex:3},parsingState:{isParsingAllStores:false},pendingSheetsUpload:{runId:RUN,forSlot:run.slotAt,savedAt:finished+1},trackScreenshotQueue:[],orderData:{Amazon:{orders:[item,...Array.from({length:1246},(_,i)=>({...item,order_id:`historical-${i}`,qty:1,composition_parsed:true}))]}},amazonPaginationState:{allOrders:[{...item,order_id:'partial-cabinet'}]},screenshotArchiveLedger:{schemaVersion:1,entries:{one:{state:'delivered',archive:{link:'https://t.me/c/3888176404/36540',messageId:36540}}}},sentScreenshots:['known-ack-key'],telegramToken:'NEVER_ARCHIVE_THIS'};
  state.nightCabinetLease={owner:'parser',phase:'running',runId:RUN,token:run.nightRequestToken,slotId:String(run.slotAt)};
- const copies=[1,1,1,1,''].map(q=>['Amazon',item.order_id,item.track_number,item.product_name,String(q),'','','existing-archive','ipochtoy@gmail.com','','']);
+ const copies=options.copies || [1,1,1,1,''].map(q=>['Amazon',item.order_id,item.track_number,item.product_name,String(q),'','','existing-archive','ipochtoy@gmail.com','','']);
  const h={state,writes:[],post:0,append:0,success:0,reads:0};
  const ctx={Date:class extends Date{static now(){return finished+60000}},TextEncoder,crypto:webcrypto,structuredClone,Uint8Array,URL,console:{log(){},error(){},warn(){}},DEFAULT_SPREADSHEET_ID:'fixture',parseReport:{},nightCabinetSlotDay:()=>run.nightSlotDay,normalizeAccountEmail:x=>String(x||'').trim().toLowerCase(),async uploadLogsToSheet(){throw new Error('must not upload logs after rejection')},async replayScreenshotLinks(){},async sendTelegramMessage(){},async getAuthToken(){if(options.authError)throw options.authError;return 'fake'},async readSheetData(){if(options.readError)throw options.readError;return structuredClone(copies)},async fetch(){h.post++;throw options.postError||new Error('unexpected POST')},async writeDataToSheet(){h.append++;},chrome:{runtime:{sendMessage(x){if(x.status==='success')h.success++}},storage:{local:{async get(keys){assert.notEqual(keys,null);h.reads++;options.beforeGet?.(h,keys);const out={};for(const k of Array.isArray(keys)?keys:[keys])if(k in state)out[k]=structuredClone(state[k]);return out},async set(patch){options.beforeSet?.(h,patch);h.writes.push(structuredClone(patch));Object.assign(state,structuredClone(patch));options.afterSet?.(h,patch)}}}}};
  vm.createContext(ctx);vm.runInContext(`let finalSheetsUploadInFlight=null;let isParsingAllStores=false;let isProcessingScreenshots=false;\n${protocol}\n${flight}\n${upload}`,ctx);
  h.ctx=ctx;h.run=()=>ctx.getOrStartFinalSheetsUpload(RUN).promise;return h;
 }
+
+for (const repeated of [false,true]) test(`actual ${repeated?'repeated':'single'} variant preflight refusal archives whole data and remains a failure`,async()=>{
+ const copy=['Amazon','111-8440692-1955402','TBA334181350127','Cruel Paradise (Beautifully Cruel)','','','XL','existing-archive','ipochtoy@gmail.com','',''];
+ const h=harness({copies:repeated?[copy,copy]:[copy]});
+ if(repeated)h.state.orderData.Amazon.orders.push(structuredClone(h.state.orderData.Amazon.orders[0]));
+ const before=structuredClone(h.state);
+ await assert.rejects(h.run(),e=>e.code==='PARSER_SHEETS_VARIANT_CONFLICT'&&e.rejectedUploadArchived===true);
+ assert.equal(h.post+h.append+h.success,0);assert.equal(h.state.pendingSheetsUpload,null);
+ assert.deepEqual(h.state.pipelineRun,before.pipelineRun);assert.deepEqual(h.state.orderData,before.orderData);
+ const archived=JSON.parse(h.state[archiveKey].json);assert.equal(archived.code,'PARSER_SHEETS_VARIANT_CONFLICT');
+ assert.deepEqual(archived.snapshot.orderData,before.orderData);assert.deepEqual(archived.snapshot.sentScreenshots,before.sentScreenshots);
+ assert.equal((await h.ctx.readParserRejectedUploadProof()).archiveVerified,true);assert.equal(h.state.lastSheetsUploadRunId,undefined);
+});
+
+test('unbranded variant errors and modified failure kind cannot grant a handoff',async()=>{
+ const h=harness();assert.equal(await h.ctx.archiveRejectedSheetsUpload(RUN,Object.assign(Error('Ambiguous variant in existing Sheets item'),{code:'PARSER_SHEETS_VARIANT_CONFLICT'})),false);
+ await assert.rejects(h.run());h.state.parserRejectedUpload.code='PARSER_SHEETS_VARIANT_CONFLICT';
+ assert.equal(await h.ctx.readParserRejectedUploadProof(),null);
+});
 
 test('actual prewrite refusal seals all1247 raw rows/intermediate/ACK, releases only pending, restart verifies archive',async()=>{
  const h=harness(),before=structuredClone(h.state);await assert.rejects(h.run(),e=>e.code==='PARSER_SHEETS_QTY_CONFLICT'&&e.rejectedUploadArchived===true);

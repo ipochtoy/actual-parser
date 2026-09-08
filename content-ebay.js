@@ -749,6 +749,11 @@ function parseItem(item) {
           const text = spans.map(span => span.text).join('').trim()
             .replace(/&#x([0-9a-f]+);/gi, (m, h) => String.fromCharCode(parseInt(h, 16)))
             .replace(/&#(\d+);/g, (m, d) => String.fromCharCode(d));
+          const shoe = text.match(/^(US|UK|EU|AU) Shoe Size:\s*(.*)$/i);
+          if (shoe) {
+            values.size.add(shoe[2].trim() ? `${shoe[1].toUpperCase()} ${shoe[2].trim()}` : '');
+            continue;
+          }
           const match = text.match(/^(color|colour|shade|size):\s*(.*)$/i);
           if (!match) { if (!/^(quantity|qty)\b/i.test(text)) complete = false; continue; }
           const key = match[1].toLowerCase() === 'size' ? 'size' : 'color';
@@ -889,6 +894,7 @@ function parseItem(item) {
         && pickBestTracking(p.trackingNumber) === cardTracking && /^\d{6,20}$/.test(String(p.transactionId || '')));
       const transactions = [...new Set(tracked.map(p => String(p.transactionId)))];
       const identity = complete && (color || size) && /^\d{2}-\d{5}-\d{5}$/.test(orderId)
+        && typeof card?.title?.textSpans?.[0]?.text === 'string' && card.title.textSpans[0].text.trim()
         && /^\d{6,20}$/.test(itemId) && String(variant?.listingId || '') === itemId
         && /^\d{6,20}$/.test(String(variant?.variationId || '')) && cardTracking && transactions.length === 1
         ? { schema: 1, source: 'purchase-feed-item-card', orderId, itemId,

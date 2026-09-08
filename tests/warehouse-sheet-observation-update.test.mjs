@@ -201,6 +201,22 @@ test('the same exact legacy correction can restore sizes without altering colors
  assert.ok(h.writes.flatMap(w => w.data).every(e => /!G\d+$|!J\d+$/.test(e.range)));
 });
 
+test('one untouched eBay shoe row can recover its own proved size from an old sibling size', async () => {
+ const h = variantCorrection(['US 10'], '', { mutate(rows, items) {
+  rows[0][6] = 'XL'; items[0].size = items[0].color; items[0].color = '';
+  items[0].ebay_item_identity.size = items[0].size; items[0].ebay_item_identity.color = '';
+ } });
+ await h.run(); assert.equal(h.rows[0][6], 'US 10'); assert.equal(h.rows[0][4], '1');
+ assert.deepEqual(h.writes.flatMap(w => w.data).map(e => e.range).sort(), ['Лист1!G1', 'Лист1!J1']);
+});
+
+test('single legacy variant repair cannot erase a known field or touch an archive, note, or quantity', async () => {
+ for (const mutate of [rows => rows[0][6]='XL', rows=>rows[0][7]='archive', rows=>rows[0][10]='operator note', rows=>rows[0][4]='2']) {
+  const h=variantCorrection(['Black'], 'White', { mutate });
+  await assert.rejects(h.run(),/Ambiguous/); assert.equal(h.writes.length,0); assert.equal(h.appends.length,0);
+ }
+});
+
 test('variant correction rechecks exact copies and confirms all preserved cells after writing', async () => {
  const raced = variantCorrection(['Black', 'White'], 'Black', { beforeRead(h) { if (h.reads === 2) h.rows[0][7] = 'late-proof'; } });
  await assert.rejects(raced.run(), /changed before/); assert.equal(raced.writes.length, 0);

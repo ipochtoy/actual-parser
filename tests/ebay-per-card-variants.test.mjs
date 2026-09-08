@@ -52,6 +52,21 @@ test('live feed Shade labels and numeric entities retain all five distinct varia
   assert.deepEqual(rows.map(r => r.color), ['20 Volume The Color Cream Developer', '10 Volume The Color Cream Developer', '6n', '5ch+', '5n']);
 });
 
+test('shoe size labels retain their size system and never inherit a sibling shirt size', async () => {
+  const shoe = card(['US Shoe Size: 10'], {
+    listingId: '168309076827',
+    title: { textSpans: [{ text: 'Synthetic shoes' }], action: { params: { listingId: '168309076827', variationId: '467833716761' } } },
+    __myb: { actionList: [{ action: { params: { trackingNumber: track, itemId: '168309076827', transactionId: '10084151273004' } } }] },
+  });
+  const { rows } = await parse([card(['Size Type: Regular', 'Size: XL']), shoe,
+    card(['UK Shoe Size: 9']), card(['EU Shoe Size: 44']), card(['AU Shoe Size: 9'])]);
+  assert.deepEqual(rows.map(r => r.size), ['XL', 'US 10', 'UK 9', 'EU 44', 'AU 9']);
+  assert.equal(rows[1].ebay_item_identity.size, 'US 10');
+  const conflict = await parse([card(['Size: XL', 'US Shoe Size: 10'])]);
+  assert.equal(conflict.rows[0].size, '');
+  assert.equal(conflict.rows[0].ebay_item_identity, null);
+});
+
 test('variant identity binds each card to its own transaction and tracking', async () => {
   const identified = (color, transactionId) => card([`Color: ${color}`], {
     listingId: '123456789012',
