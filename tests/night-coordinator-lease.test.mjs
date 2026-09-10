@@ -610,6 +610,7 @@ function leaseTransitionHarness({ destination = 'store-walk', blockTransitionSet
     NIGHT_CABINET_TRANSITION_RESULT_KEY: 'nightCoordinatorLeaseTransitionResult',
     NIGHT_CABINET_TRANSITION_HANDLED_KEY: 'lastHandledNightCoordinatorLeaseTransitionId',
     NIGHT_CABINET_CATCHUP_RESUME_KEY: 'nightCabinetCatchupResumeMarkers',
+    STANDALONE_WALK_LEDGER_KEY: 'standaloneWalkGenerationLedger',
     nightCabinetSlotId() { return slotId; },
     nightCabinetLeaseSlotIds() { return [slotId]; },
     nightCabinetSlotDay() { return '2026-08-20'; },
@@ -644,6 +645,7 @@ function leaseTransitionHarness({ destination = 'store-walk', blockTransitionSet
     'withNightCabinetLeaseWrite',
     'nightCabinetTerminalProof',
     'nightCabinetTerminalSlotProof',
+    'storeWalkParserIdleProof',
     'inspectNightCabinetTransitionRequest',
     'nightCabinetTransitionAllowed',
     'handleNightCoordinatorLeaseTransitionRequest',
@@ -914,6 +916,7 @@ function earlyNightHarness(iso, { beforeRequest } = {}) {
   const now = Date.parse(iso);
   const h = leaseTransitionHarness();
   for (const key of Object.keys(h.state)) delete h.state[key];
+  h.state.trackScreenshotQueue = [];
   h.context.Date = class extends Date {
     constructor(...args) { super(...(args.length ? args : [now])); }
     static now() { return now; }
@@ -922,7 +925,7 @@ function earlyNightHarness(iso, { beforeRequest } = {}) {
   h.context.DAILY_PARSE_MINUTE = 0;
   for (const name of [
     'getNextDailyRun', 'getLastDailyRunSlot', 'nightCabinetSlotId',
-    'nightCabinetLeaseSlotIds', 'nightCabinetSlotDay',
+    'nightCabinetLeaseSlotIds', 'nightCabinetSlotDay', 'nightCabinetNativeAdmissionAt',
     'prepareParserNightCabinetLease', 'externalCoordinatorStartDecision',
     'handleExternalControlRequest',
   ]) vm.runInContext(extractFunction(name), h.context);
@@ -1108,5 +1111,40 @@ test('actual 23:00 alarm cannot repeat a completed early run after coordinator t
     assert.deepEqual(h.state.pipelineRun, beforeRun, leaseState);
     assert.deepEqual(h.state.nightCabinetLease, beforeLease, leaseState);
     assert.equal(h.state.lastSheetsUploadRunId, 'completed-early-run', leaseState);
+  }
+});
+
+test('actual 23:00 alarm cannot take an expired unfinished native, manual or standalone Store Walk owner', async () => {
+  const branch = source.slice(source.indexOf('if (alarm.name === DAILY_ALARM_NAME)'),
+    source.indexOf('if (alarm.name === SCREENSHOT_RESUME_ALARM)'));
+  const slotId = String(Date.parse('2026-09-09T23:00:00-04:00'));
+  for (const token of ['expired-native-token-0001',
+    'control:a97db852-3978-4c43-98af-a44e994e1445:main',
+    'standalone:a97db852-3978-4c43-98af-a44e994e1445:walk']) {
+    const h = earlyNightHarness('2026-09-09T23:00:01-04:00');
+    h.state.pipelineRun = { id: 'prior-terminal-parser', status: 'completed' };
+    h.state.pipelineStage = { active: false, runId: 'prior-terminal-parser' };
+    h.state.nightCabinetLease = {
+      slotId: '1788871772564', owner: 'store-walk', phase: 'store-main', token,
+      heartbeat: 1788873124534, expires: 1788874024534,
+    };
+    const beforeLease = clone(h.state.nightCabinetLease), beforeRun = clone(h.state.pipelineRun);
+    let starts = 0, retries = 0;
+    Object.assign(h.context, {
+      alarm: { name: 'dailyAutoParse', scheduledTime: Number(slotId) },
+      DAILY_ALARM_NAME: 'dailyAutoParse', DAILY_ALARM_DRIFT_TOLERANCE_MS: 60_000,
+      DAILY_MISSED_RUN_CATCHUP_MS: 3 * 60 * 60_000, dailyRunStartInFlight: null,
+      console: { log() {}, warn() {} },
+      async addDailyDiagnostic() {}, async ensureDailyAlarm() {},
+      async scheduleNightCabinetRetry() { retries++; return { attempts: 1 }; },
+      async startSequentialPipeline() { starts++; throw new Error('overlapping shop start'); },
+    });
+    for (const name of ['runDailyAutoParse', 'runDailyAutoParseOnce']) vm.runInContext(extractFunction(name), h.context);
+    await vm.runInContext(`(async () => { ${branch} })()`, h.context);
+    assert.equal(starts, 0, token);
+    assert.equal(retries, 1, token);
+    assert.equal(h.state.lastDailyAutoParseStatus, 'deferred-night-lease', token);
+    assert.deepEqual(h.state.nightCabinetLease, beforeLease, token);
+    assert.deepEqual(h.state.pipelineRun, beforeRun, token);
   }
 });

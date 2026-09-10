@@ -99,6 +99,7 @@ test('sealed archive resumes after a transient guard failure and diagnostic drif
 test('row count cap refuses without silently truncating raw rows',async()=>{const h=harness();h.state.orderData.Amazon.orders=Array.from({length:20001},(_,i)=>({...h.state.orderData.Amazon.orders[i?1:0],order_id:i?`count-${i}`:h.state.orderData.Amazon.orders[0].order_id}));await assert.rejects(h.run(),/row count/);assert.equal(h.state.pendingSheetsUpload.runId,RUN);assert.equal(h.state[archiveKey],undefined)});
 function installCanonicalDoor(h) {
  const {ctx}=h,now=ctx.Date.now();
+ ctx.STANDALONE_WALK_LEDGER_KEY='standaloneWalkGenerationLedger';
  Object.assign(ctx,{nightCabinetLeaseWriteChain:Promise.resolve(),NIGHT_CABINET_LEASE_KEY:'nightCabinetLease',NIGHT_CABINET_LEASE_TTL_MS:900000,NIGHT_CABINET_TIME_ZONE:'America/New_York',NIGHT_CABINET_OWNERS:new Set(['store-walk','parser']),NIGHT_CABINET_PHASES:new Set(['running','ready','store-catchup','store-main','completed','degraded']),NIGHT_CABINET_TRANSITION_REQUEST_KEY:'nightCoordinatorLeaseTransitionRequest',NIGHT_CABINET_TRANSITION_RESULT_KEY:'nightCoordinatorLeaseTransitionResult',NIGHT_CABINET_TRANSITION_HANDLED_KEY:'lastHandledNightCoordinatorLeaseTransitionId',NIGHT_CABINET_CATCHUP_RESUME_KEY:'nightCabinetCatchupResumeMarkers',nightCabinetLeaseSlotIds:()=>[String(h.state.pipelineRun.slotAt)]});
  h.state.nightCabinetLease={...h.state.nightCabinetLease,heartbeat:now-1,expires:now+900000};
  vm.runInContext([

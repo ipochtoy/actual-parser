@@ -18,6 +18,10 @@ const NIGHT_CABINET_TRANSITION_REQUEST_KEY = 'nightCoordinatorLeaseTransitionReq
 const NIGHT_CABINET_TRANSITION_RESULT_KEY = 'nightCoordinatorLeaseTransitionResult';
 const NIGHT_CABINET_TRANSITION_HANDLED_KEY = 'lastHandledNightCoordinatorLeaseTransitionId';
 const NIGHT_CABINET_CATCHUP_RESUME_KEY = 'nightCabinetCatchupResumeMarkers';
+const STANDALONE_WALK_LEASE_PROTOCOL_VERSION = 1;
+const STANDALONE_WALK_LEDGER_KEY = 'standaloneWalkGenerationLedger';
+const STANDALONE_WALK_FIRST_ADMISSION_MS = 120_000;
+const STANDALONE_WALK_GENERATION_LIMIT = 128;
 const NIGHT_CABINET_TIME_ZONE = 'America/New_York';
 const NIGHT_CABINET_OWNERS = new Set(['store-walk', 'parser']);
 const NIGHT_CABINET_PHASES = new Set([
@@ -126,10 +130,20 @@ function nightCabinetSlotId(now = Date.now()) {
 // The coordinator starts Store Walk at 21:00, before the standalone Parser
 // alarm at 23:00. Both readers must share the upcoming 23:00 slot from 21:00;
 // ownership/CAS and terminal-proof checks still govern every transition.
-function nightCabinetLeaseSlotIds(now = Date.now()) {
+function nightCabinetLeaseSlotIds(now = Date.now(), desired = null) {
     const slots = [nightCabinetSlotId(now)];
     const next = getNextDailyRun(new Date(now)).getTime();
     if (next - Number(now) <= 2 * 60 * 60_000) slots.push(String(next));
+    // Native RECOVER owns the browser before the main walk. The optional
+    // owner argument opens only Store Walk's existing 20:30 admission; calls
+    // without it and Parser-ready requests retain the original 21:00 window.
+    if (desired?.owner === 'store-walk') {
+        const admissionAt = nightCabinetNativeAdmissionAt(now);
+        const parserSlotAt = admissionAt + 150 * 60_000;
+        if (now >= admissionAt && now < parserSlotAt && !slots.includes(String(parserSlotAt))) {
+            slots.push(String(parserSlotAt));
+        }
+    }
     return slots;
 }
 
@@ -143,6 +157,16 @@ function nightCabinetSlotDay(slotId) {
         day: '2-digit'
     }).formatToParts(slot).map(part => [part.type, part.value]));
     return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function nightCabinetNativeAdmissionAt(now = Date.now()) {
+    const day = nightCabinetSlotDay(String(now));
+    if (!day) return NaN;
+    const noon = Date.parse(`${day}T12:00:00Z`);
+    const hour = Number(new Intl.DateTimeFormat('en-US', {
+        timeZone: NIGHT_CABINET_TIME_ZONE, hour: 'numeric', hourCycle: 'h23'
+    }).format(new Date(noon)));
+    return noon + (20.5 - hour) * 60 * 60_000;
 }
 
 /** Pure, fail-closed validation of the cross-process browser lease. */
@@ -235,7 +259,7 @@ function nightCabinetTerminalSlotProof(state, slotId) {
 
 // A manual control grants only a bounded real-time slot. It is separate from the
 // daily alarm and never changes the scheduler's native slot list.
-function inspectManualControlEnvelope(value, { now = Date.now() } = {}) {
+function inspectManualControlEnvelope(value, { now = Date.now(), allowExpired = false } = {}) {
     const keys = ['schemaVersion','kind','id','requestSha','coordinatorRunId','createdAt','deadlineAt','nextNativeAdmissionAt'];
     const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
     if (!value || typeof value !== 'object' || Array.isArray(value)
@@ -244,7 +268,7 @@ function inspectManualControlEnvelope(value, { now = Date.now() } = {}) {
         || !uuid.test(value.id || '') || !uuid.test(value.coordinatorRunId || '')
         || !/^[a-f0-9]{64}$/.test(value.requestSha || '')
         || ![value.createdAt,value.deadlineAt,value.nextNativeAdmissionAt,now].every(Number.isSafeInteger)
-        || value.createdAt <= 0 || value.createdAt > now || now >= value.deadlineAt
+        || value.createdAt <= 0 || value.createdAt > now || (!allowExpired && now >= value.deadlineAt)
         || value.deadlineAt <= value.createdAt + 15 * 60_000
         || value.deadlineAt > value.createdAt + 570 * 60_000) return { ok: false, reason: 'manual-control-invalid' };
     const day = nightCabinetSlotDay(String(value.createdAt));
@@ -260,6 +284,139 @@ function manualControlEnvelopeEqual(a, b) {
         && Object.keys(a).every(k => Object.prototype.hasOwnProperty.call(b,k) && a[k] === b[k]);
 }
 
+/** A partial standalone walk borrows the same serialized lease, not a pipeline. */
+function inspectStandaloneWalkEnvelope(value, { now = Date.now(), allowExpired = false } = {}) {
+    const keys = ['schemaVersion', 'kind', 'id', 'runId', 'requestSha', 'createdAt', 'deadlineAt', 'nextNativeAdmissionAt'];
+    const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
+    if (!value || typeof value !== 'object' || Array.isArray(value)
+        || Object.keys(value).length !== keys.length || Object.keys(value).some(key => !keys.includes(key))
+        || value.schemaVersion !== 1 || value.kind !== 'standalone-store-walk'
+        || !uuid.test(value.id || '') || !/^[a-f0-9]{64}$/.test(value.requestSha || '')
+        || ![value.createdAt, value.deadlineAt, value.nextNativeAdmissionAt, now].every(Number.isSafeInteger)
+        || value.createdAt <= 0 || value.createdAt > now
+        || (!allowExpired && now >= value.deadlineAt)
+        || value.deadlineAt <= value.createdAt + 15 * 60_000
+        || value.deadlineAt > value.createdAt + 570 * 60_000) return { ok: false, reason: 'standalone-envelope-invalid' };
+    const run = /^store-walk:([1-9]\d{0,9}):(\d{13})$/.exec(value.runId || '');
+    if (!run || Number(run[2]) !== value.createdAt) return { ok: false, reason: 'standalone-run-identity-invalid' };
+    const nativeAt = nightCabinetNativeAdmissionAt(value.createdAt);
+    if (value.nextNativeAdmissionAt !== nativeAt || value.deadlineAt > nativeAt - 15 * 60_000) {
+        return { ok: false, reason: 'standalone-native-boundary' };
+    }
+    return {
+        ok: true, envelope: Object.fromEntries(keys.map(key => [key, value[key]])),
+        day: nightCabinetSlotDay(String(value.createdAt)), workDeadlineAt: value.deadlineAt - 15 * 60_000
+    };
+}
+
+function standaloneWalkTokenAllowed(envelope, desired) {
+    return desired.slotId === String(envelope.createdAt) && desired.owner === 'store-walk'
+        && desired.token === `standalone:${envelope.id}:walk`
+        && ['store-main', 'completed', 'degraded', 'blocked', 'failed'].includes(desired.phase);
+}
+
+function inspectStandaloneWalkLedger(raw, now) {
+    if (raw == null) return { ok: true, ledger: null };
+    const object = value => value && typeof value === 'object' && !Array.isArray(value);
+    if (!object(raw) || Object.keys(raw).sort().join(',') !== 'day,generations,schemaVersion'
+        || raw.schemaVersion !== 1 || !/^\d{4}-\d{2}-\d{2}$/.test(raw.day || '')
+        || !object(raw.generations)) return { ok: false, reason: 'standalone-ledger-invalid' };
+    const entries = Object.entries(raw.generations);
+    if (!entries.length || entries.length > STANDALONE_WALK_GENERATION_LIMIT) return { ok: false, reason: 'standalone-ledger-invalid' };
+    const runIds = new Set();
+    for (const [id, record] of entries) {
+        if (!object(record) || Object.keys(record).sort().join(',') !== 'admittedAt,closedAt,envelope,schemaVersion,terminalPhase'
+            || record.schemaVersion !== 1 || !Number.isSafeInteger(record.admittedAt) || record.admittedAt > now) {
+            return { ok: false, reason: 'standalone-ledger-record-invalid' };
+        }
+        const proof = inspectStandaloneWalkEnvelope(record.envelope, { now: record.admittedAt });
+        if (!proof.ok || proof.envelope.id !== id || proof.day !== raw.day
+            || record.admittedAt - proof.envelope.createdAt > STANDALONE_WALK_FIRST_ADMISSION_MS
+            || record.admittedAt >= proof.workDeadlineAt || runIds.has(proof.envelope.runId)) {
+            return { ok: false, reason: 'standalone-ledger-record-invalid' };
+        }
+        runIds.add(proof.envelope.runId);
+        const open = record.closedAt === null && record.terminalPhase === null;
+        const closed = Number.isSafeInteger(record.closedAt) && record.closedAt >= record.admittedAt && record.closedAt <= now
+            && ['completed', 'degraded', 'blocked', 'failed'].includes(record.terminalPhase);
+        if (!open && !closed) return { ok: false, reason: 'standalone-ledger-record-invalid' };
+    }
+    return { ok: true, ledger: raw };
+}
+
+function standaloneWalkCurrentRecord(current, ledger) {
+    const match = /^standalone:([a-f0-9-]{36}):walk$/.exec(current?.token || '');
+    const record = match && ledger?.generations?.[match[1]];
+    return record && current.owner === 'store-walk' && !current.runId
+        && current.slotId === String(record.envelope.createdAt) ? record : null;
+}
+
+function standaloneWalkTransitionProof(request, current, rawLedger, now) {
+    const terminal = ['completed', 'degraded', 'blocked', 'failed'].includes(request.desired.phase);
+    const inspected = inspectStandaloneWalkEnvelope(request.standaloneWalk, { now, allowExpired: terminal });
+    if (!inspected.ok || !standaloneWalkTokenAllowed(inspected.envelope, request.desired)) {
+        return { ok: false, reason: 'standalone-generation-mismatch' };
+    }
+    const checked = inspectStandaloneWalkLedger(rawLedger, now);
+    if (!checked.ok) return checked;
+    const envelope = inspected.envelope;
+    let ledger = checked.ledger;
+    const record = ledger?.generations?.[envelope.id];
+    const exactCurrent = current && current.slotId === request.desired.slotId
+        && current.owner === request.desired.owner && current.token === request.desired.token && !current.runId;
+    if (record) {
+        if (!manualControlEnvelopeEqual(record.envelope, envelope)) return { ok: false, reason: 'standalone-generation-changed' };
+        if (record.closedAt !== null) return { ok: false, reason: 'standalone-generation-closed' };
+        if (!exactCurrent || current.phase !== 'store-main') return { ok: false, reason: 'standalone-lease-lost' };
+        if (!terminal && current.expires <= now) return { ok: false, reason: 'standalone-lease-expired' };
+        return {
+            ok: true, terminal,
+            mutation: terminal ? { [STANDALONE_WALK_LEDGER_KEY]: {
+                ...ledger, generations: { ...ledger.generations, [envelope.id]: { ...record, closedAt: now, terminalPhase: request.desired.phase } }
+            } } : {}
+        };
+    }
+    if (terminal || exactCurrent || current?.token === request.desired.token
+        || now - envelope.createdAt > STANDALONE_WALK_FIRST_ADMISSION_MS || now >= inspected.workDeadlineAt) {
+        return { ok: false, reason: 'standalone-first-admission-refused' };
+    }
+    if (ledger && ledger.day !== inspected.day) {
+        // Old immutable requests have expired and cannot be admitted again.
+        // Do not discard a missing cleanup proof or rebuild a malformed ledger.
+        if (ledger.day > inspected.day || Object.values(ledger.generations).some(old => old.closedAt === null || old.envelope.deadlineAt > now)) {
+            return { ok: false, reason: 'standalone-ledger-unsettled' };
+        }
+        ledger = null;
+    }
+    ledger ||= { schemaVersion: 1, day: inspected.day, generations: {} };
+    if (Object.values(ledger.generations).some(old => old.envelope.runId === envelope.runId)) return { ok: false, reason: 'standalone-run-already-consumed' };
+    if (Object.keys(ledger.generations).length >= STANDALONE_WALK_GENERATION_LIMIT) return { ok: false, reason: 'standalone-ledger-full' };
+    return { ok: true, terminal: false, mutation: { [STANDALONE_WALK_LEDGER_KEY]: {
+        ...ledger, generations: { ...ledger.generations, [envelope.id]: {
+            schemaVersion: 1, envelope, admittedAt: now, closedAt: null, terminalPhase: null
+        } }
+    } } };
+}
+
+/** Read under the same lease writer as pipeline creation, before a new owner. */
+function storeWalkParserIdleProof(state) {
+    const object = value => value && typeof value === 'object' && !Array.isArray(value);
+    if (!Array.isArray(state.trackScreenshotQueue)) return { ok: false, reason: 'parser-queue-unreadable' };
+    for (const key of ['pipelineRun', 'pipelineStage', 'parsingState']) {
+        if (state[key] != null && !object(state[key])) return { ok: false, reason: 'parser-state-malformed' };
+    }
+    if (state.pipelineRun && !['completed', 'degraded', 'blocked', 'failed', 'failed_to_start', 'interrupted'].includes(state.pipelineRun.status)) {
+        return { ok: false, reason: ['starting', 'running'].includes(state.pipelineRun.status) ? 'parser-active' : 'parser-run-status-unknown' };
+    }
+    if (state.pipelineStage?.active === true || state.parsingState?.isParsingAllStores === true) return { ok: false, reason: 'parser-active' };
+    if ((state.pipelineStage?.active != null && state.pipelineStage.active !== false)
+        || (state.parsingState?.isParsingAllStores != null && state.parsingState.isParsingAllStores !== false)) return { ok: false, reason: 'parser-state-malformed' };
+    for (const key of ['iherbStageFinalizing', 'amazonStageFinalizing', 'pendingIherbSwitch', 'pendingAccountSwitch', 'pendingSheetsUpload', 'screenshotQueueBlocked']) {
+        if (state[key] != null && state[key] !== false) return { ok: false, reason: 'parser-work-pending' };
+    }
+    return state.trackScreenshotQueue.length ? { ok: false, reason: 'parser-screenshot-queue-draining' } : { ok: true };
+}
+
 function manualControlTokenAllowed(envelope, desired) {
     if (desired.slotId !== String(envelope.createdAt)) return false;
     const prefix = `control:${envelope.id}:`;
@@ -269,7 +426,8 @@ function manualControlTokenAllowed(envelope, desired) {
 }
 
 async function manualControlTransitionProof(request, current, now) {
-    const inspected = inspectManualControlEnvelope(request.manualControl, { now });
+    const terminal = ['completed', 'degraded', 'blocked', 'failed'].includes(request.desired.phase);
+    const inspected = inspectManualControlEnvelope(request.manualControl, { now, allowExpired: terminal });
     if (!inspected.ok || !manualControlTokenAllowed(inspected.envelope,request.desired)) return { ok:false, reason:'manual-control-generation-mismatch' };
     const envelope = inspected.envelope;
     const key = `manualControlGeneration:${envelope.id}`;
@@ -323,8 +481,8 @@ function inspectNightCabinetTransitionRequest(request, { now = Date.now() } = {}
     if (!request || typeof request !== 'object' || Array.isArray(request)) {
         return { ok: false, reason: 'transition-request-missing' };
     }
-    const allowedTop = new Set(['requestId', 'requestedAt', 'expected', 'desired', 'manualControl']);
-    const allowedExpected = new Set(['state', 'slotId', 'owner', 'phase', 'token', 'runId']);
+    const allowedTop = new Set(['requestId', 'requestedAt', 'expected', 'desired', 'manualControl', 'standaloneWalk']);
+    const allowedExpected = new Set(['state', 'slotId', 'owner', 'phase', 'token', 'runId', 'heartbeat', 'expires']);
     const allowedDesired = new Set(['slotId', 'owner', 'phase', 'token']);
     if (Object.keys(request).some(key => !allowedTop.has(key))
         || !request.expected || typeof request.expected !== 'object'
@@ -342,7 +500,10 @@ function inspectNightCabinetTransitionRequest(request, { now = Date.now() } = {}
             owner: String(request.expected.owner || ''),
             phase: String(request.expected.phase || ''),
             token: String(request.expected.token || ''),
-            ...(request.expected.runId ? { runId: String(request.expected.runId) } : {})
+            ...(request.expected.runId ? { runId: String(request.expected.runId) } : {}),
+            ...(Object.prototype.hasOwnProperty.call(request.expected, 'heartbeat') ? {
+                heartbeat: request.expected.heartbeat, expires: request.expected.expires
+            } : {})
         },
         desired: {
             slotId: String(request.desired.slotId || ''),
@@ -351,13 +512,30 @@ function inspectNightCabinetTransitionRequest(request, { now = Date.now() } = {}
             token: String(request.desired.token || '')
         }
     };
-    const manual = Object.prototype.hasOwnProperty.call(request,'manualControl') ? inspectManualControlEnvelope(request.manualControl,{now}) : null;
+    const terminal = exact.desired.owner === 'store-walk'
+        && ['completed', 'degraded', 'blocked', 'failed'].includes(exact.desired.phase);
+    const settlementCandidate = terminal && exact.expected.state === 'present'
+        && exact.expected.owner === exact.desired.owner && exact.expected.slotId === exact.desired.slotId
+        && exact.expected.token === exact.desired.token;
+    const hasHeartbeat = Object.prototype.hasOwnProperty.call(request.expected, 'heartbeat');
+    const hasExpires = Object.prototype.hasOwnProperty.call(request.expected, 'expires');
+    if (hasHeartbeat !== hasExpires || (hasHeartbeat && (!Number.isSafeInteger(exact.expected.heartbeat)
+        || !Number.isSafeInteger(exact.expected.expires) || exact.expected.heartbeat <= 0
+        || exact.expected.expires <= exact.expected.heartbeat))) return { ok: false, reason: 'transition-time-proof-invalid' };
+    const manual = Object.prototype.hasOwnProperty.call(request,'manualControl')
+        ? inspectManualControlEnvelope(request.manualControl, { now, allowExpired: settlementCandidate && hasHeartbeat }) : null;
+    const standalone = Object.prototype.hasOwnProperty.call(request, 'standaloneWalk')
+        ? inspectStandaloneWalkEnvelope(request.standaloneWalk, { now, allowExpired: settlementCandidate && hasHeartbeat }) : null;
+    if (manual && standalone) return { ok: false, reason: 'transition-generation-ambiguous' };
     if (!manual && exact.desired.token.startsWith('control:')) return {ok:false,reason:'manual-control-envelope-required'};
     if (manual && (!manual.ok || !manualControlTokenAllowed(manual.envelope,exact.desired))) return {ok:false,reason:'manual-control-generation-mismatch'};
+    if (!standalone && exact.desired.token.startsWith('standalone:')) return { ok: false, reason: 'standalone-envelope-required' };
+    if (standalone && (!standalone.ok || !standaloneWalkTokenAllowed(standalone.envelope, exact.desired))) return { ok: false, reason: 'standalone-generation-mismatch' };
     if (exact.requestId.length < 16 || exact.requestId.length > 200
         || !Number.isFinite(exact.requestedAt) || exact.requestedAt <= 0 || exact.requestedAt > now + 60_000
         || !/^\d{10,16}$/.test(exact.desired.slotId)
-        || (!manual && !nightCabinetLeaseSlotIds(now).includes(exact.desired.slotId))
+        || (!manual && !standalone && !nightCabinetLeaseSlotIds(now, exact.desired).includes(exact.desired.slotId)
+            && !(settlementCandidate && hasHeartbeat))
         || !NIGHT_CABINET_OWNERS.has(exact.desired.owner)
         || !NIGHT_CABINET_PHASES.has(exact.desired.phase)
         || exact.desired.token.length < 16 || exact.desired.token.length > 200) {
@@ -374,7 +552,11 @@ function inspectNightCabinetTransitionRequest(request, { now = Date.now() } = {}
         || exact.expected.token.length < 16 || exact.expected.token.length > 200) {
         return { ok: false, reason: 'transition-expected-values-invalid' };
     }
-    return { ok: true, request: manual ? {...exact,manualControl:manual.envelope} : exact };
+    return { ok: true, request: {
+        ...exact,
+        ...(manual ? { manualControl: manual.envelope } : {}),
+        ...(standalone ? { standaloneWalk: standalone.envelope } : {})
+    } };
 }
 
 function nightCabinetTransitionAllowed(current, desired, {
@@ -394,6 +576,9 @@ function nightCabinetTransitionAllowed(current, desired, {
     const sameToken = current.token === desired.token;
     if (currentState === 'expired' && !sameSlot && !sameToken
         && desired.owner === 'store-walk' && storeOpenPhases.includes(desired.phase)) {
+        if (current.owner === 'store-walk' && !storeTerminalPhases.includes(current.phase)) {
+            return { ok: false, reason: 'store-walk-owner-work-unproven' };
+        }
         if (current.owner === 'parser' && current.phase === 'running' && !terminalProof) {
             return { ok: false, reason: 'parser-terminal-proof-required' };
         }
@@ -548,8 +733,10 @@ async function handleNightCoordinatorLeaseTransitionRequest() {
             NIGHT_CABINET_TRANSITION_HANDLED_KEY,
             NIGHT_CABINET_CATCHUP_RESUME_KEY,
             NIGHT_CABINET_LEASE_KEY,
+            STANDALONE_WALK_LEDGER_KEY,
             'pipelineRun', 'pipelineStage', 'trackScreenshotQueue', 'screenshotQueueBlocked',
-            'pendingSheetsUpload', 'lastSheetsUploadRunId', 'lastSheetsUploadOkAt'
+            'pendingSheetsUpload', 'lastSheetsUploadRunId', 'lastSheetsUploadOkAt',
+            'parsingState', 'iherbStageFinalizing', 'amazonStageFinalizing', 'pendingIherbSwitch', 'pendingAccountSwitch'
         ]);
         const inspectedRequest = inspectNightCabinetTransitionRequest(
             state[NIGHT_CABINET_TRANSITION_REQUEST_KEY], { now }
@@ -598,8 +785,23 @@ async function handleNightCoordinatorLeaseTransitionRequest() {
                 && current.owner === expected.owner
                 && current.phase === expected.phase
                 && current.token === expected.token
-                && (expected.runId ? current.runId === expected.runId : !current.runId);
+                && (expected.runId ? current.runId === expected.runId : !current.runId)
+                && (expected.heartbeat == null || (current.heartbeat === expected.heartbeat && current.expires === expected.expires));
         if (!exactCurrent) return finish(false, 'transition-current-proof-mismatch');
+        const storeTerminal = current?.owner === 'store-walk' && request.desired.owner === 'store-walk'
+            && current.slotId === request.desired.slotId && current.token === request.desired.token
+            && ['completed', 'degraded', 'blocked', 'failed'].includes(request.desired.phase);
+        if (storeTerminal && (inspectedCurrent.state === 'expired'
+            || now >= (request.manualControl?.deadlineAt ?? request.standaloneWalk?.deadlineAt ?? Infinity))
+            && expected.heartbeat == null) return finish(false, 'transition-settlement-time-proof-required');
+        if (String(current?.token || '').startsWith('standalone:') && current.token !== request.desired.token) {
+            const checked = inspectStandaloneWalkLedger(state[STANDALONE_WALK_LEDGER_KEY], now);
+            if (!checked.ok) return finish(false, checked.reason);
+            const record = standaloneWalkCurrentRecord(current, checked.ledger);
+            if (!record || record.closedAt === null || record.terminalPhase !== current.phase) {
+                return finish(false, 'standalone-owner-work-unproven');
+            }
+        }
 
         let terminalProof = current?.owner === 'parser' && current.phase === 'running'
             ? nightCabinetTerminalProof(state, current)
@@ -637,16 +839,35 @@ async function handleNightCoordinatorLeaseTransitionRequest() {
             catchupResumeConsumed
         });
         if (!decision.ok) return finish(false, decision.reason);
+        const newStoreOwner = request.desired.owner === 'store-walk'
+            && !(current?.owner === 'store-walk' && current.slotId === request.desired.slotId && current.token === request.desired.token);
+        if (newStoreOwner) {
+            if (state[STANDALONE_WALK_LEDGER_KEY] != null) {
+                const ledger = inspectStandaloneWalkLedger(state[STANDALONE_WALK_LEDGER_KEY], now);
+                if (!ledger.ok) return finish(false, ledger.reason);
+                if (Object.values(ledger.ledger.generations).some(record => record.closedAt === null)) {
+                    return finish(false, 'standalone-owner-work-unproven');
+                }
+            }
+            const idle = storeWalkParserIdleProof(state);
+            if (!idle.ok) return finish(false, idle.reason);
+        }
         const manual = request.manualControl ? await manualControlTransitionProof(request,current,now) : {ok:true,mutation:{}};
         if (!manual.ok) return finish(false,manual.reason);
+        const standalone = request.standaloneWalk
+            ? standaloneWalkTransitionProof(request, current, state[STANDALONE_WALK_LEDGER_KEY], now)
+            : { ok: true, mutation: {} };
+        if (!standalone.ok) return finish(false, standalone.reason);
 
-        const lease = {
+        // Terminal settlement only closes the exact old owner. In particular,
+        // post-deadline recovery must never renew that owner's browser time.
+        const lease = storeTerminal ? { ...current, phase: request.desired.phase } : {
             slotId: request.desired.slotId,
             owner: request.desired.owner,
             phase: request.desired.phase,
             token: request.desired.token,
             heartbeat: now,
-            expires: now + NIGHT_CABINET_LEASE_TTL_MS
+            expires: Math.min(now + NIGHT_CABINET_LEASE_TTL_MS, request.standaloneWalk?.deadlineAt ?? Infinity)
         };
         const resumeMarkerMutation = decision.reason === 'catchup-resume-one-shot'
             ? {
@@ -662,7 +883,7 @@ async function handleNightCoordinatorLeaseTransitionRequest() {
                 }
             }
             : {};
-        return finish(true, decision.reason, lease, {...resumeMarkerMutation,...manual.mutation});
+        return finish(true, decision.reason, lease, {...resumeMarkerMutation,...manual.mutation,...standalone.mutation});
     });
 }
 
