@@ -376,6 +376,23 @@ test('native RECOVER and main get 20:30 admission; the parameterless and Parser-
   } finally { if (previous == null) delete process.env.TZ; else process.env.TZ = previous; }
 });
 
+test('expired native open leases cannot regain browser time with their exact old token', async () => {
+  for (const currentPhase of ['claimed', 'running', 'store-main', 'store-catchup', 'recover']) {
+    for (const desiredPhase of ['claimed', 'running', 'store-main', 'store-catchup', 'recover']) {
+      const h=harness();
+      h.store.nightCabinetLease={slotId:h.context.nightCabinetSlotId(AT),owner:'store-walk',
+        phase:currentPhase,token:'expired-native-owner-token-0001',heartbeat:AT-900001,expires:AT-1};
+      const before=authority(h);
+      const result=await h.send({requestId:`expired-native-${crypto.randomUUID()}`,requestedAt:AT,
+        expected:h.expected(),desired:{slotId:h.store.nightCabinetLease.slotId,owner:'store-walk',
+          phase:desiredPhase,token:h.store.nightCabinetLease.token}});
+      assert.equal(result.ok,false,`${currentPhase} -> ${desiredPhase}`);
+      assert.equal(result.reason,'store-walk-owner-work-unproven');
+      assert.equal(authority(h),before);
+    }
+  }
+});
+
 test('old native terminal settlement needs exact heartbeat/expires and never extends its lease', async () => {
   const h = harness();
   h.store.nightCabinetLease = {

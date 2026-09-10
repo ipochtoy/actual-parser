@@ -574,6 +574,15 @@ function nightCabinetTransitionAllowed(current, desired, {
     }
     const sameSlot = current.slotId === desired.slotId;
     const sameToken = current.token === desired.token;
+    // An expired open owner cannot regain browser time by presenting its old
+    // token. Only exact terminal settlement is allowed; the writer separately
+    // requires the observed heartbeat/expires CAS for that operation.
+    if (currentState === 'expired' && current.owner === 'store-walk'
+        && storeOpenPhases.includes(current.phase)
+        && !(sameSlot && sameToken && desired.owner === 'store-walk'
+            && storeTerminalPhases.includes(desired.phase))) {
+        return { ok: false, reason: 'store-walk-owner-work-unproven' };
+    }
     if (currentState === 'expired' && !sameSlot && !sameToken
         && desired.owner === 'store-walk' && storeOpenPhases.includes(desired.phase)) {
         if (current.owner === 'store-walk' && !storeTerminalPhases.includes(current.phase)) {
