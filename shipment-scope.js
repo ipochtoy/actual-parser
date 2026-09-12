@@ -20,8 +20,27 @@
 (function (root) {
   'use strict';
 
-  /** Кнопка отправки — тот же набор, что и в главном цикле парсера. */
+  /** Candidates only: a cancel-delivery link also contains progress-tracker. */
   const TRACK_BUTTON_SELECTOR = 'a[href*="ship-track"], a[href*="track-package"], a[href*="progress-tracker"]';
+
+  // Primary capture 2026-09-12: /progress-tracker/package/in-transit/cancel
+  // sits beside Track package. It is an action, not another shipment, and must
+  // never reach either the composition loop or a tracking GET/screenshot.
+  function isTrackingPageUrl(value) {
+    if (typeof value !== 'string' || !value.trim()) return false;
+    try {
+      const url = new URL(value, 'https://www.amazon.com/');
+      return url.protocol === 'https:' && ['www.amazon.com', 'amazon.com'].includes(url.hostname)
+        && !url.username && !url.password && !url.port
+        && /^\/(?:progress-tracker\/package|(?:gp\/(?:your-account|css)\/)?(?:ship-track|track-package))(?:\/ref=[A-Za-z0-9_.=-]+)?\/?$/.test(url.pathname);
+    } catch (_) { return false; }
+  }
+
+  function collectTrackButtons(el) {
+    if (!el || !el.querySelectorAll) return [];
+    return Array.from(el.querySelectorAll(TRACK_BUTTON_SELECTOR))
+      .filter(button => isTrackingPageUrl(button.getAttribute('href') || button.href));
+  }
 
   /** Ссылка на товар. */
   const PRODUCT_LINK_SELECTOR = 'a[href*="/dp/"], a[href*="/gp/product/"]';
@@ -33,8 +52,7 @@
   const ITEM_SCOPE_SELECTOR = '.yo-enhanced-flex-card, .yo-enhanced-card, .yohtmlc-item, [data-test-id="item-row"], .a-fixed-left-grid-inner, .a-row';
 
   function countTrackButtons(el) {
-    if (!el || !el.querySelectorAll) return 0;
-    return el.querySelectorAll(TRACK_BUTTON_SELECTOR).length;
+    return collectTrackButtons(el).length;
   }
 
   function hasProducts(el) {
@@ -132,6 +150,8 @@
 
   root.PPShipmentScope = {
     TRACK_BUTTON_SELECTOR,
+    isTrackingPageUrl,
+    collectTrackButtons,
     PRODUCT_LINK_SELECTOR,
     SHIPMENT_HINT_SELECTOR,
     ITEM_SCOPE_SELECTOR,

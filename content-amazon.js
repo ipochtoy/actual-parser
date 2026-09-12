@@ -532,6 +532,10 @@
 
   async function fetchTrackingFromShipTrackUrl(url, options = {}) {
     try {
+      if (!SHIPMENT.isTrackingPageUrl(url)) {
+        console.warn('    ⚠️ Not a tracking page; request refused');
+        return [];
+      }
       console.log(`    🔗 Fetching: ${url.substring(0, 80)}...`);
       const response = await fetch(url, { credentials: 'include' });
       const html = await response.text();
@@ -867,12 +871,12 @@
       const actual = new URL(trackBtn.getAttribute('href') || trackBtn.href, location.href);
       const orderIds = [...url.searchParams].filter(([key]) => /^orderid$/i.test(key)).map(([,value]) => value);
       if (url.protocol !== 'https:' || !['www.amazon.com', 'amazon.com'].includes(url.hostname)
-          || !/ship-track|track-package|progress-tracker/.test(url.pathname)
+          || !SHIPMENT.isTrackingPageUrl(url.href)
           || url.href !== actual.href || orderIds.length !== 1 || orderIds[0] !== orderId) {
         reasons.push('track-order-context-unproven');
       }
     } catch (_) { reasons.push('track-order-context-unproven'); }
-    const buttons = Array.from(box.querySelectorAll(SHIPMENT.TRACK_BUTTON_SELECTOR));
+    const buttons = SHIPMENT.collectTrackButtons(box);
     try {
       const target = new URL(trackUrl, location.href).href;
       const targets = new Set(buttons.map(button => new URL(button.getAttribute('href') || button.href, location.href).href));
@@ -976,7 +980,7 @@
         // ---------------------------
 
         // Find all Track package buttons (each button = one shipment)
-        const trackButtons = card.querySelectorAll('a[href*="ship-track"], a[href*="track-package"], a[href*="progress-tracker"]');
+        const trackButtons = SHIPMENT.collectTrackButtons(card);
         console.log(`📦 Найдено ${trackButtons.length} кнопок Track package`);
 
         let cardOrders = 0;

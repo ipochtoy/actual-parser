@@ -22,7 +22,11 @@ function model() {
   const card={contains:node=>node===box};
   const context={URL,location:{href:'https://www.amazon.com/gp/css/order-history'},
     SHIPMENT:{TRACK_BUTTON_SELECTOR:'track',collectShipmentProducts:box=>box.products}};
-  vm.createContext(context);vm.runInContext(caller,context);
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(new URL('../shipment-scope.js',import.meta.url),'utf8'),context);
+  context.SHIPMENT.isTrackingPageUrl=context.PPShipmentScope.isTrackingPageUrl;
+  context.SHIPMENT.collectTrackButtons=box=>box.buttons.filter(button=>context.SHIPMENT.isTrackingPageUrl(button.href));
+  vm.runInContext(caller,context);
   const check=(overrides={})=>Array.from(context.amazonShipmentCompositionReasons(
     overrides.shipment||{box,isolated:true},overrides.card||card,overrides.button||button,
     overrides.track||track,overrides.order||order,overrides.products||products));
