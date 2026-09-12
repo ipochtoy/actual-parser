@@ -1,5 +1,44 @@
 # Parser Pro incident register
 
+## 2026-09-11: completed iHerb parsing was mistaken for a failed login
+
+The run `1789095600000-1789093501621-7xzcle` stopped at 02:38:24 UTC with
+`screenshotQueueBlocked.kind=account-mismatch`. Its next card belonged to the
+third iHerb account, but `activeAccount` was empty; 30 cards remained. The last
+confirmed archive receipt preceded the block by six seconds. All three iHerb
+entries in `pipelineRun.completed` describe parsed rows, not a completed
+screenshot stage or a Sheets receipt.
+
+`parserStarted` left `iherbSwitchInProgress` and `iherbSwitchStartedAt` behind.
+Completion consumption then cleared `iherbParseStartedAt` before draining the
+screenshots. The five-minute switch watchdog interpreted this state as a login
+timeout. Its retry handler cleared `currentIherbAccount` and requeued that
+account while screenshots still needed it. The stored switch timestamp was
+02:33:02.776 UTC, 321 seconds before the block. The actual completion → watchdog
+→ failure-handler chain reproduces this loss on both `20fe1ba` and `ef8ec72`.
+A late login-failure message from the same run/account could cause the same
+mutation; no retained service-worker console identifies the historical caller.
+
+The accepted parse start and valid completion now retire only their matching
+switch markers under the existing attempt arbiter. The account remains owned
+until the screenshot drain and normal next-account transition finish. Switch
+failure recovery requires an open, matching attempt with no accepted parse,
+terminal account result, human challenge or screenshot work. A real failed
+switch retains its bounded retry and skip behavior.
+
+New login senders include the attempt ID and stage start. A legacy sender's
+unbound failure cannot request another login; the exact watchdog can still
+recover an actual pending switch. The existing CAPTCHA stop/finalization path
+remains available for a matching pending legacy login, and late CAPTCHA or
+Press & Hold messages cannot reopen accepted parsing. A locally modified live
+login sender must be preserved when deploying the background-only repair.
+
+Regression: `tests/iherb-switch-screenshot-race.test.mjs` covers 30 queued
+screenshots, missing parse-start messages, stale switch flags, late and foreign
+attempts, legacy sender behavior, CAPTCHA/Press & Hold, and bounded real retries.
+This does not turn a blocked run into a usable terminal result or clear its
+stored queue. Coordinator stopped-run recovery requires its own exact proof.
+
 ## 2026-08-18: nightly six-cabinet run skipped accounts and stalled
 
 Symptoms:

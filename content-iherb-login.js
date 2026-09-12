@@ -24,6 +24,8 @@ const IS_NEW_LOGIN = /\/auth\/ui\/account\/login/i.test(location.href);        /
 const IS_OLD_LOGIN = /\/account\/sign-in/i.test(location.href);                // secure.iherb.com (legacy)
 const IS_LOGIN     = IS_NEW_LOGIN || IS_OLD_LOGIN;
 let iherbSwitchRunId = null;
+let iherbSwitchAttemptId = null;
+let iherbSwitchStageStartedAt = null;
 
 function normalizeIherbEmail(value) {
   return String(value || '').trim().toLowerCase();
@@ -41,6 +43,9 @@ async function readFreshIherbLoginIntent(expected) {
     && normalizeIherbEmail(ownership.account) === normalizeIherbEmail(expected.email)
     && pending?.runId === expected.runId
     && normalizeIherbEmail(pending?.email) === normalizeIherbEmail(expected.email)
+    && (expected.finalReturn || (ownership.attemptId === expected.attemptId
+      && ownership.stageStartedAt === expected.stageStartedAt
+      && (!pending.attemptId || pending.attemptId === expected.attemptId)))
     && !!data.iherbFinalReturn === expected.finalReturn;
   return matches ? { ownership, pending, finalReturn: !!data.iherbFinalReturn } : null;
 }
@@ -81,6 +86,8 @@ async function markIherbFinalReturnLoginSubmitted(expected) {
       runId: logoffOwnership.runId,
       tabId: logoffOwnership.tabId,
       email: logoffData.pendingIherbSwitch.email,
+      attemptId: logoffOwnership.attemptId,
+      stageStartedAt: logoffOwnership.stageStartedAt,
       finalReturn: !!logoffData.iherbFinalReturn
     };
     setTimeout(async () => {
@@ -130,8 +137,12 @@ async function markIherbFinalReturnLoginSubmitted(expected) {
     runId,
     tabId: ownership.tabId,
     email,
+    attemptId: ownership.attemptId,
+    stageStartedAt: ownership.stageStartedAt,
     finalReturn: !!data.iherbFinalReturn
   };
+  iherbSwitchAttemptId = ownership.attemptId || null;
+  iherbSwitchStageStartedAt = ownership.stageStartedAt || null;
 
   console.log(`🔐 [iHerb Login] auto-login as ${email} (finalReturn=${!!data.iherbFinalReturn}, layout=${IS_NEW_LOGIN ? '2step' : 'legacy'})`);
 
@@ -657,7 +668,9 @@ function sendFailed(email, reason) {
     action: 'iherbSwitchFailed',
     email,
     reason,
-    runId: iherbSwitchRunId
+    runId: iherbSwitchRunId,
+    attemptId: iherbSwitchAttemptId,
+    stageStartedAt: iherbSwitchStageStartedAt
   }, () => chrome.runtime.lastError /* swallow */);
 }
 

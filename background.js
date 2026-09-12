@@ -3138,22 +3138,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             }
         })();
     } else if (request.action === "iherbSwitchFailed") {
-        (async () => {
-            const reason = request.reason || 'unknown';
-            const email = request.email || 'unknown';
-            console.warn(`❌ iHerb switch failed for ${email}: ${reason}`);
-            const gate = await chrome.storage.local.get(['iherbParserTabId', 'pipelineRun']);
-            if (!sender?.tab?.id || sender.tab.id !== gate.iherbParserTabId
-                || !request.runId || request.runId !== gate.pipelineRun?.id) {
-                console.warn('⏭ Ignoring iHerb switch failure from a stale tab/run');
-                return;
-            }
-            if (reason === 'captcha') {
-                await abortIherbStageDueToCaptcha(email, request.runId);
-                return;
-            }
-            await handleIherbSwitchFailure(email, reason, request.runId);
-        })();
+        handleIherbSwitchFailureMessage(request, sender?.tab?.id || null)
+            .catch(error => console.warn('iHerb switch failure rejected:', error?.message || error));
         return true;
     } else if (request.action === "solveCaptcha") {
         // Решение reCAPTCHA v2 через 2captcha. Вызывается из content-iherb-login.js
@@ -3376,7 +3362,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             }
             const startedAt = Date.now();
             if (signal.store === 'iherb') {
-                await chrome.storage.local.set({ iherbParseStartedAt: startedAt, iherbWatchdogRetried: false });
+                if (!await acceptIherbParserStarted(request, sender?.tab?.id || null)) return;
             } else if (signal.store === 'amazon') {
                 await chrome.storage.local.set({ lastAmazonProgressAt: startedAt });
             }
@@ -3476,10 +3462,8 @@ async function solveRecaptchaVia2Captcha(sitekey, pageurl, timeoutMs = 60000) {
 // чтобы watchdog/ретраи не воскресили зависшую стадию. НЕ делаем
 // finalReturnToIherbPrimary в pipeline-режиме — повторный логин снова упрётся в
 // captcha и снова сожжёт 60с. Следующим магазинам логин-состояние iHerb не нужно.
-async function abortIherbStageDueToCaptcha(email, runId, expectedGeneration = null) {
+async function abortIherbStageDueToCaptcha(email, runId, expectedGeneration = null, expectedAttempt = null) {
     const who = (email || '').split('@')[0] || 'аккаунт';
-    console.warn(`🧩 [iHerb] captcha unsolved for ${email} — skipping iHerb stage, moving to next shop`);
-    sendTelegramMessage(`🧩 iHerb: captcha не пройдена (${who}). Пропускаю iHerb, перехожу к следующему магазину.`).catch(() => {});
 
     const initial = await chrome.storage.local.get([
         'pipelineRun', 'pipelineStage', 'multiAccountIherbState'
@@ -3492,28 +3476,25 @@ async function abortIherbStageDueToCaptcha(email, runId, expectedGeneration = nu
         || normalizeAccountEmail(initial.multiAccountIherbState?.currentIherbAccount)
             !== normalizeAccountEmail(email)) return false;
 
-    await recordIherbSkipReason(email, 'captcha', runId);
-    const gate = await chrome.storage.local.get([
-        'pipelineRun', 'pipelineStage', 'multiAccountIherbState'
-    ]);
-    if (gate.pipelineRun?.id !== runId
-        || !gate.pipelineStage?.active
-        || !pipelineGenerationMatches(gate.pipelineStage, generation)
-        || normalizeAccountEmail(gate.multiAccountIherbState?.currentIherbAccount)
-            !== normalizeAccountEmail(email)) return false;
-    iherbAccountsQueue = [];
-    await chrome.storage.local.set({
-        iherbSwitchInProgress: null,
-        iherbSwitchStartedAt: null,
-        pendingIherbSwitch: null,
-        iherbSwitchDispatch: null,
-        multiAccountIherbState: {
-            ...(gate.multiAccountIherbState || {}),
-            isMultiAccountIherb: true,
-            iherbAccountsQueue: [],
-            currentIherbAccount: email
-        }
+    const claimed = await withIherbAttemptMutation(async () => {
+        const gate = await readIherbWatchdogState();
+        if (!iherbPendingSwitchMatchesAttempt(gate, expectedAttempt)) return false;
+        await recordIherbSkipReason(email, 'captcha', runId);
+        iherbAccountsQueue = [];
+        await chrome.storage.local.set({
+            ...iherbAcceptedSwitchPatch(gate, expectedAttempt),
+            multiAccountIherbState: {
+                ...(gate.multiAccountIherbState || {}),
+                isMultiAccountIherb: true,
+                iherbAccountsQueue: [],
+                currentIherbAccount: email
+            }
+        });
+        return true;
     });
+    if (!claimed) return false;
+    console.warn(`🧩 [iHerb] captcha unsolved for ${email} — skipping iHerb stage, moving to next shop`);
+    sendTelegramMessage(`🧩 iHerb: captcha не пройдена (${who}). Пропускаю iHerb, перехожу к следующему магазину.`).catch(() => {});
 
     // Всегда закрываем стадию через единый chokepoint: он гарантированно вернёт
     // сессию на primary (оператор хочет always-return, даже после captcha),
@@ -4521,7 +4502,7 @@ function dispatchCurrentIherbAccountSwitch(email, expectedGeneration) {
 async function dispatchCurrentIherbAccountSwitchOnce(email, expectedGeneration) {
     const readDispatchState = () => chrome.storage.local.get([
         'pipelineRun', 'pipelineStage', 'multiAccountIherbState',
-        'pendingIherbSwitch', 'iherbParserTabId', 'iherbSwitchDispatch'
+        'pendingIherbSwitch', 'iherbParserTabId', 'iherbSwitchDispatch', 'iherbParseAttemptId'
     ]);
     const ownsDispatch = state => !!expectedGeneration
         && state.pipelineStage?.active === true
@@ -4530,6 +4511,8 @@ async function dispatchCurrentIherbAccountSwitchOnce(email, expectedGeneration) 
         && state.pipelineRun?.id === expectedGeneration.runId
         && state.pendingIherbSwitch?.runId === expectedGeneration.runId
         && normalizeAccountEmail(state.pendingIherbSwitch?.email) === normalizeAccountEmail(email)
+        && (!state.pendingIherbSwitch.attemptId
+            || state.pendingIherbSwitch.attemptId === state.iherbParseAttemptId)
         && normalizeAccountEmail(state.multiAccountIherbState?.currentIherbAccount)
             === normalizeAccountEmail(email);
     const state = await readDispatchState();
@@ -4550,6 +4533,7 @@ async function dispatchCurrentIherbAccountSwitchOnce(email, expectedGeneration) 
             ...expectedGeneration,
             account: email,
             tabId,
+            attemptId: afterTab.iherbParseAttemptId,
             phase: 'prepared',
             preparedAt: Date.now()
         }
@@ -4572,7 +4556,8 @@ async function dispatchCurrentIherbAccountSwitchOnce(email, expectedGeneration) 
         await handleIherbSwitchFailure(
             email,
             'ui_signout_failed',
-            expectedGeneration.runId
+            expectedGeneration.runId,
+            iherbAttemptRefFromState(beforeNavigation)
         );
         return false;
     }
@@ -4592,6 +4577,7 @@ async function dispatchCurrentIherbAccountSwitchOnce(email, expectedGeneration) 
             ...expectedGeneration,
             account: email,
             tabId,
+            attemptId: fresh.iherbParseAttemptId,
             phase: 'dispatched',
             dispatchedAt: Date.now()
         }
@@ -4672,7 +4658,10 @@ async function switchToNextIherbAccountOnce(expectedGeneration = null) {
         const startedAt = Date.now();
         const parseAttemptId = `${fresh.pipelineRun.id}:${normalizeAccountEmail(next.email)}:${startedAt}:${Math.random().toString(36).slice(2, 8)}`;
         await chrome.storage.local.set({
-            pendingIherbSwitch: { email: next.email, password: next.password, runId: fresh.pipelineRun.id },
+            pendingIherbSwitch: {
+                email: next.email, password: next.password, runId: fresh.pipelineRun.id,
+                attemptId: parseAttemptId
+            },
             iherbSwitchInProgress: true,
             // The previous account's outcome and timeout cannot survive into the
             // new cabinet. This transition shares the exact-attempt arbiter with
@@ -4692,6 +4681,7 @@ async function switchToNextIherbAccountOnce(expectedGeneration = null) {
                 ...generation,
                 account: next.email,
                 tabId: fresh.iherbParserTabId || null,
+                attemptId: parseAttemptId,
                 phase: 'prepared',
                 preparedAt: startedAt
             },
@@ -4746,74 +4736,128 @@ async function iherbIsLoggedIn(tabId) {
     }
 }
 
-// Общий обработчик сбоев iHerb-свитча (retry или skip).
-// Вызывается из catch-а UI sign-out flow и из message listener (iherbSwitchFailed
-// от content-iherb-login.js).
-async function handleIherbSwitchFailure(email, reason, requestedRunId = null) {
-    const failData = await chrome.storage.local.get([
-        'iherbSwitchFailures', 'pipelineRun', 'pipelineStage', 'multiAccountIherbState'
-    ]);
-    const runId = requestedRunId || failData.pipelineRun?.id || null;
-    const generation = pipelineGenerationFromStage(failData.pipelineStage);
-    if (!runId
-        || failData.pipelineRun?.id !== runId
-        || !['starting', 'running'].includes(failData.pipelineRun?.status)
-        || failData.pipelineStage?.runId !== runId
-        || failData.pipelineStage?.stages?.[failData.pipelineStage?.currentIndex] !== 'iherb'
-        || normalizeAccountEmail(failData.multiAccountIherbState?.currentIherbAccount) !== normalizeAccountEmail(email)) {
-        console.warn('⏭ Ignoring stale iHerb switch failure');
-        return false;
-    }
-    if (failData.multiAccountIherbState) {
-        isMultiAccountIherb = failData.multiAccountIherbState.isMultiAccountIherb;
-        iherbAccountsQueue = failData.multiAccountIherbState.iherbAccountsQueue || [];
-        currentIherbAccount = failData.multiAccountIherbState.currentIherbAccount;
-    }
-    const failures = failData.iherbSwitchFailures || {};
-    failures[email] = (failures[email] || 0) + 1;
-    await chrome.storage.local.set({ iherbSwitchFailures: failures });
+// Successful parsing and screenshots retain the cabinet authority. Only the
+// matching, still-open login attempt may retire these switch markers.
+function iherbAcceptedSwitchPatch(state, attempt) {
+    if (!iherbAttemptMatchesRuntime(attempt, state) || state.iherbFinalReturn) return null;
+    const pending = state.pendingIherbSwitch;
+    if (pending && (pending.runId !== attempt.runId
+        || normalizeAccountEmail(pending.email) !== attempt.account
+        || (pending.attemptId && pending.attemptId !== attempt.attemptId))) return null;
+    const dispatch = state.iherbSwitchDispatch;
+    if (dispatch && (!pipelineGenerationMatches(dispatch, pipelineGenerationFromStage(state.pipelineStage))
+        || normalizeAccountEmail(dispatch.account) !== attempt.account
+        || dispatch.tabId !== attempt.parserTabId
+        || (dispatch.attemptId && dispatch.attemptId !== attempt.attemptId)
+        || dispatch.kind === 'final-return')) return null;
+    return {
+        iherbSwitchInProgress: null, iherbSwitchStartedAt: null,
+        pendingIherbSwitch: null, iherbSwitchDispatch: null
+    };
+}
 
-    const MAX_IH_ATTEMPTS = 2;
-    if (failures[email] < MAX_IH_ATTEMPTS && reason !== 'captcha') {
-        console.log(`🔁 Retry iHerb switch for ${email} (attempt ${failures[email] + 1}/${MAX_IH_ATTEMPTS})`);
-        const cfg = await loadAccountsConfig();
-        const retryGate = await chrome.storage.local.get([
-            'pipelineRun', 'pipelineStage', 'multiAccountIherbState'
-        ]);
-        if (retryGate.pipelineRun?.id !== runId
-            || !retryGate.pipelineStage?.active
-            || !pipelineGenerationMatches(retryGate.pipelineStage, generation)
-            || retryGate.pipelineStage.stages?.[retryGate.pipelineStage.currentIndex] !== 'iherb'
-            || normalizeAccountEmail(retryGate.multiAccountIherbState?.currentIherbAccount)
-                !== normalizeAccountEmail(email)) return false;
-        const creds = cfg.iherb.find(a => a.email === email);
-        if (creds) iherbAccountsQueue.unshift(creds);
-        currentIherbAccount = null;
+async function acceptIherbParserStarted(request, senderTabId) {
+    return withIherbAttemptMutation(async () => {
+        const state = await readIherbWatchdogState();
+        const attempt = {
+            runId: request.runId, account: normalizeAccountEmail(request.account),
+            attemptId: request.attemptId, parserTabId: senderTabId,
+            stageStartedAt: state.pipelineStage?.stageStartedAt
+        };
+        const patch = iherbAcceptedSwitchPatch(state, attempt);
+        if (!patch || iherbTimeoutAttemptMatchesRuntime(state.iherbTimeoutAttempt, state)
+            || state.iherbParsingComplete
+            || pipelineRunAccountIsTerminal(state.pipelineRun, 'iherb', attempt.account)) return false;
         await chrome.storage.local.set({
-            multiAccountIherbState: {
-                isMultiAccountIherb: true,
-                iherbAccountsQueue,
-                currentIherbAccount: null
-            }
+            ...patch,
+            iherbParseStartedAt: state.iherbParseStartedAt || Date.now(),
+            iherbWatchdogRetried: state.iherbWatchdogRetried === true
         });
-        await new Promise(r => setTimeout(r, 5000));
-        await switchToNextIherbAccount(generation);
+        return true;
+    });
+}
+
+function iherbPendingSwitchMatchesAttempt(state, attempt) {
+    return !!iherbAcceptedSwitchPatch(state, attempt)
+        && state.iherbSwitchInProgress === true
+        && Number(state.iherbSwitchStartedAt) > 0
+        && state.pendingIherbSwitch?.runId === attempt.runId
+        && normalizeAccountEmail(state.pendingIherbSwitch?.email) === attempt.account
+        && !state.iherbParseStartedAt && !state.iherbParsingComplete
+        && !state.iherbTimeoutAttempt && !state.iherbHumanChallenge
+        && !pipelineRunAccountIsTerminal(state.pipelineRun, 'iherb', attempt.account)
+        && Array.isArray(state.trackScreenshotQueue) && state.trackScreenshotQueue.length === 0
+        && !state.screenshotQueueBlocked
+        && !(typeof isProcessingScreenshots === 'boolean' && isProcessingScreenshots);
+}
+
+async function handleIherbSwitchFailureMessage(request, senderTabId) {
+    const state = await readIherbWatchdogState();
+    if (!senderTabId || senderTabId !== state.iherbParserTabId
+        || request.runId !== state.pipelineRun?.id
+        || normalizeAccountEmail(request.email)
+            !== normalizeAccountEmail(state.multiAccountIherbState?.currentIherbAccount)) return false;
+    // Legacy senders have no attempt identity. They cannot authorize a login
+    // retry. Preserve the existing CAPTCHA stop path so its watchdog cannot
+    // turn a reported human challenge into another login attempt.
+    if (!request.attemptId && request.reason !== 'captcha') return false;
+    const attempt = request.attemptId ? {
+        runId: request.runId, account: normalizeAccountEmail(request.email),
+        attemptId: request.attemptId, parserTabId: senderTabId,
+        stageStartedAt: request.stageStartedAt
+    } : iherbAttemptRefFromState(state);
+    if (!iherbPendingSwitchMatchesAttempt(state, attempt)) return false;
+    if (request.reason === 'captcha') {
+        return abortIherbStageDueToCaptcha(request.email, request.runId,
+            pipelineGenerationFromStage(state.pipelineStage), attempt);
+    }
+    return handleIherbSwitchFailure(request.email, request.reason || 'unknown', request.runId, attempt);
+}
+
+async function handleIherbSwitchFailure(email, reason, requestedRunId = null, expectedAttempt = null) {
+    if (!expectedAttempt || requestedRunId !== expectedAttempt.runId
+        || normalizeAccountEmail(email) !== expectedAttempt.account || reason === 'captcha') return false;
+    const result = await withIherbAttemptMutation(async () => {
+        const state = await readIherbWatchdogState();
+        if (!iherbPendingSwitchMatchesAttempt(state, expectedAttempt)) return null;
+        const generation = pipelineGenerationFromStage(state.pipelineStage);
+        const failures = { ...(state.iherbSwitchFailures || {}) };
+        failures[email] = (failures[email] || 0) + 1;
+        const queue = [...(state.multiAccountIherbState.iherbAccountsQueue || [])];
+        if (failures[email] < 2) {
+            const cfg = await loadAccountsConfig();
+            const fresh = await readIherbWatchdogState();
+            if (!iherbPendingSwitchMatchesAttempt(fresh, expectedAttempt)) return null;
+            const creds = cfg.iherb.find(a => a.email === email);
+            if (!creds) return null;
+            queue.unshift(creds);
+            await chrome.storage.local.set({
+                iherbSwitchFailures: failures,
+                multiAccountIherbState: {
+                    isMultiAccountIherb: true, iherbAccountsQueue: queue, currentIherbAccount: null
+                }
+            });
+            isMultiAccountIherb = true;
+            iherbAccountsQueue = queue;
+            currentIherbAccount = null;
+            return { retry: true, generation };
+        }
+        await chrome.storage.local.set({ iherbSwitchFailures: failures });
+        await recordIherbSkipReason(email, 'switch_failed', requestedRunId);
+        const fresh = await readIherbWatchdogState();
+        const patch = iherbAcceptedSwitchPatch(fresh, expectedAttempt);
+        if (!patch) return null;
+        await chrome.storage.local.set(patch);
+        return { retry: false, generation, remaining: queue.length };
+    });
+    if (!result) return false;
+    if (result.retry) {
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        await switchToNextIherbAccount(result.generation);
     } else {
-        console.log(`🚫 iHerb ${email} skipped (failures=${failures[email]}, reason=${reason})`);
         sendTelegramMessage(`🚫 iHerb ${email.split('@')[0]} пропущен (${reason})`).catch(() => {});
-        await recordIherbSkipReason(email, 'switch_failed', runId);
-        const skipGate = await chrome.storage.local.get([
-            'pipelineRun', 'pipelineStage', 'multiAccountIherbState'
-        ]);
-        if (skipGate.pipelineRun?.id !== runId
-            || !skipGate.pipelineStage?.active
-            || !pipelineGenerationMatches(skipGate.pipelineStage, generation)
-            || skipGate.pipelineStage.stages?.[skipGate.pipelineStage.currentIndex] !== 'iherb'
-            || normalizeAccountEmail(skipGate.multiAccountIherbState?.currentIherbAccount)
-                !== normalizeAccountEmail(email)) return false;
-        await chrome.storage.local.remove(['iherbSwitchInProgress', 'iherbSwitchStartedAt', 'pendingIherbSwitch']);
-        if (iherbAccountsQueue.length > 0) await switchToNextIherbAccount(generation);
-        else await finalizeIherbStage(undefined, { expectedGeneration: generation });
+        if (result.remaining > 0) await switchToNextIherbAccount(result.generation);
+        else await finalizeIherbStage(undefined, { expectedGeneration: result.generation });
     }
     return true;
 }
@@ -5017,7 +5061,8 @@ async function consumeIherbCompletionMarker(expectedGeneration) {
             'pipelineRun', 'pipelineStage', 'multiAccountIherbState',
             'iherbParserTabId', 'iherbParseAttemptId', 'iherbTimeoutAttempt',
             'iherbParsingComplete', 'iherbStageFinalizing',
-            'iherbParsedAccounts', 'iherbSkipReasons'
+            'iherbParsedAccounts', 'iherbSkipReasons',
+            'pendingIherbSwitch', 'iherbSwitchDispatch', 'iherbFinalReturn'
         ]);
         const marker = state.iherbParsingComplete;
         if (!marker
@@ -5025,6 +5070,8 @@ async function consumeIherbCompletionMarker(expectedGeneration) {
             || !iherbAttemptMatchesRuntime(marker, state)) {
             return { claimed: false };
         }
+        const switchPatch = iherbAcceptedSwitchPatch(state, marker);
+        if (!switchPatch) return { claimed: false };
         const parsed = Array.isArray(state.iherbParsedAccounts)
             ? [...state.iherbParsedAccounts]
             : [];
@@ -5043,6 +5090,7 @@ async function consumeIherbCompletionMarker(expectedGeneration) {
         );
         if (!nextRun) return { claimed: false };
         await chrome.storage.local.set({
+            ...switchPatch,
             pipelineRun: nextRun,
             iherbParsedAccounts: parsed,
             iherbSkipReasons: skipReasons,
@@ -7779,7 +7827,9 @@ async function readIherbWatchdogState() {
         'iherbParseStartedAt', 'iherbWatchdogRetried',
         'iherbParseAttemptId', 'iherbTimeoutAttempt', 'iherbParsingComplete',
         'iherbSwitchInProgress', 'iherbSwitchStartedAt', 'pendingIherbSwitch',
-        'multiAccountIherbState', 'iherbParserTabId', 'pipelineRun', 'pipelineStage'
+        'multiAccountIherbState', 'iherbParserTabId', 'pipelineRun', 'pipelineStage',
+        'iherbSwitchDispatch', 'iherbStageFinalizing', 'iherbFinalReturn',
+        'iherbSwitchFailures', 'iherbHumanChallenge', 'trackScreenshotQueue', 'screenshotQueueBlocked'
     ]);
 }
 
@@ -7801,12 +7851,17 @@ async function handleIherbWatchdog() {
     if (!stored.iherbParseStartedAt
         && stored.iherbSwitchInProgress
         && stored.iherbSwitchStartedAt) {
+        // A consumed Done clears parseStartedAt while screenshots drain. Old
+        // workers left switch flags behind; those flags alone never authorize
+        // another login or clearing the screenshot account.
+        if (!iherbPendingSwitchMatchesAttempt(stored, attempt)) return;
         const switchElapsed = Date.now() - stored.iherbSwitchStartedAt;
         if (switchElapsed >= IHERB_SWITCH_TIMEOUT_MS) {
             const acc = stored.multiAccountIherbState?.currentIherbAccount || 'unknown';
             console.log(`[iherbWatchdog] switch deadlock: acc=${acc}, elapsed=${Math.round(switchElapsed/1000)}s`);
             const fresh = await readIherbWatchdogState();
-            if (!iherbWatchdogAttemptMatches(fresh, attempt)) return;
+            if (!iherbWatchdogAttemptMatches(fresh, attempt)
+                || !iherbPendingSwitchMatchesAttempt(fresh, attempt)) return;
             sendTelegramMessage(`🚫 iHerb (${acc.split('@')[0]}) переключение зависло ${Math.round(switchElapsed/60000)} мин — двигаю pipeline`).catch(()=>{});
 
             // Восстановим in-memory state на случай если SW рестартил между alarm-тиками.
@@ -7815,7 +7870,7 @@ async function handleIherbWatchdog() {
                 iherbAccountsQueue = fresh.multiAccountIherbState.iherbAccountsQueue || [];
                 currentIherbAccount = fresh.multiAccountIherbState.currentIherbAccount;
             }
-            await handleIherbSwitchFailure(acc, 'switch_timeout', attempt.runId).catch(e => {
+            await handleIherbSwitchFailure(acc, 'switch_timeout', attempt.runId, attempt).catch(e => {
                 console.warn('[iherbWatchdog] handleIherbSwitchFailure threw:', e?.message || e);
             });
         }
