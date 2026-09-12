@@ -1,3 +1,4 @@
+import { installNativeParserFixture } from './helpers/parser-normal-fixture.mjs';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
@@ -29,6 +30,15 @@ function extractFunction(name) {
 
 function clone(value) {
   return value == null ? value : structuredClone(value);
+}
+
+function loadNormalLeaseHelpers(context) {
+  const key = source.match(/^const PARSER_WORK_AUTHORITY_KEY = .+;/m);
+  assert.ok(key, 'actual normal authority key');
+  vm.runInContext(key[0] + '\n' + [
+    'cleanupObject', 'cleanupKeys', 'cleanupUuid', 'parserWorkRecord', 'parserWorkText',
+    'parserWorkRecordValid', 'parserWorkAuthorityValid', 'parserWorkGenerationMatches', 'parserWorkLeaseTransitionAllowed',
+  ].map(extractFunction).join('\n'), context);
 }
 
 function leaseContext(initialLease = undefined) {
@@ -68,7 +78,7 @@ function leaseContext(initialLease = undefined) {
       },
     },
   };
-  vm.createContext(context);
+  vm.createContext(context); installNativeParserFixture(context,source);
   for (const name of [
     'nightCabinetSlotDay',
     'inspectNightCabinetLease',
@@ -254,7 +264,7 @@ test('slot day and coordinator adoption fields are deterministic and atomically 
     Intl,
     NIGHT_CABINET_TIME_ZONE: 'America/New_York',
   };
-  vm.createContext(context);
+  vm.createContext(context); installNativeParserFixture(context,source);
   vm.runInContext(extractFunction('nightCabinetSlotDay'), context);
   assert.equal(context.nightCabinetSlotDay('1787281200000'), '2026-08-20');
 
@@ -316,7 +326,7 @@ test('terminal commit cannot overwrite coordinator lease after a crash or takeov
       },
     },
   };
-  vm.createContext(context);
+  vm.createContext(context); installNativeParserFixture(context,source);
   vm.runInContext(extractFunction('finishTerminalPipelineState'), context);
 
   assert.equal(await context.finishTerminalPipelineState({
@@ -353,7 +363,7 @@ test('retry alarm is idempotent and stops at its bounded attempt count', async (
       },
     },
   };
-  vm.createContext(context);
+  vm.createContext(context); installNativeParserFixture(context,source);
   vm.runInContext(extractFunction('scheduleNightCabinetRetry'), context);
 
   const slotId = '1787281200000';
@@ -452,7 +462,7 @@ function controlWakeHarness({ request, lastHandledControlAt = 0, result = null }
       },
     },
   };
-  vm.createContext(context);
+  vm.createContext(context); installNativeParserFixture(context,source);
   for (const name of [
     'nightCabinetSlotDay',
     'inspectNightCabinetLease',
@@ -639,7 +649,7 @@ function leaseTransitionHarness({ destination = 'store-walk', blockTransitionSet
       },
     },
   };
-  vm.createContext(context);
+  vm.createContext(context); installNativeParserFixture(context,source);
   for (const name of [
     'inspectNightCabinetLease',
     'withNightCabinetLeaseWrite',
@@ -652,6 +662,7 @@ function leaseTransitionHarness({ destination = 'store-walk', blockTransitionSet
     'handleNightCoordinatorLeaseTransitionWake',
     'createPipelineRun',
   ]) vm.runInContext(extractFunction(name), context);
+  loadNormalLeaseHelpers(context);
   return {
     context, state, lease, slotId, nextToken, writes,
     setEntered, releaseSet,
@@ -891,7 +902,7 @@ test('a delayed Store Walk heartbeat cannot overwrite Parser running ownership',
   };
   const stale = await harness.context.handleNightCoordinatorLeaseTransitionRequest();
   assert.equal(stale.ok, false);
-  assert.equal(stale.reason, 'transition-current-proof-mismatch');
+  assert.equal(stale.reason, 'parser-work-authority-unsettled');
   assert.deepEqual(harness.state.nightCabinetLease, running);
   assert.equal(harness.state.nightCabinetLease.runId, run.id);
 
@@ -1091,13 +1102,13 @@ test('actual 23:00 alarm cannot repeat a completed early run after coordinator t
     const beforeRun = clone(h.state.pipelineRun);
     const beforeLease = clone(h.state.nightCabinetLease);
     let shopStarts = 0;
-    let retries = 0;
+    let retries = 0; const diagnostics=[];
     Object.assign(h.context, {
       alarm: { name: 'dailyAutoParse', scheduledTime: Number(slotId) },
       DAILY_ALARM_NAME: 'dailyAutoParse', DAILY_ALARM_DRIFT_TOLERANCE_MS: 60_000,
       DAILY_MISSED_RUN_CATCHUP_MS: 3 * 60 * 60_000, dailyRunStartInFlight: null,
       console: { log() {}, warn() {} },
-      async addDailyDiagnostic() {}, async ensureDailyAlarm() {},
+      async addDailyDiagnostic(event, detail) { diagnostics.push(detail); }, async ensureDailyAlarm() {},
       async scheduleNightCabinetRetry() { retries++; return { attempts: 1 }; },
       async startSequentialPipeline() { shopStarts++; throw new Error('duplicate shop start'); },
     });
@@ -1106,8 +1117,8 @@ test('actual 23:00 alarm cannot repeat a completed early run after coordinator t
     }
     await vm.runInContext(`(async () => { ${branch} })()`, h.context);
     assert.equal(shopStarts, 0, leaseState);
-    assert.equal(retries, 1, leaseState);
-    assert.equal(h.state.lastDailyAutoParseStatus, 'deferred-night-lease', leaseState);
+    assert.equal(retries, 0, leaseState);
+    assert.ok(diagnostics.some(d=>d.skipReason==='native-verifier-required'),leaseState);
     assert.deepEqual(h.state.pipelineRun, beforeRun, leaseState);
     assert.deepEqual(h.state.nightCabinetLease, beforeLease, leaseState);
     assert.equal(h.state.lastSheetsUploadRunId, 'completed-early-run', leaseState);
@@ -1129,21 +1140,21 @@ test('actual 23:00 alarm cannot take an expired unfinished native, manual or sta
       heartbeat: 1788873124534, expires: 1788874024534,
     };
     const beforeLease = clone(h.state.nightCabinetLease), beforeRun = clone(h.state.pipelineRun);
-    let starts = 0, retries = 0;
+    let starts = 0, retries = 0; const diagnostics=[];
     Object.assign(h.context, {
       alarm: { name: 'dailyAutoParse', scheduledTime: Number(slotId) },
       DAILY_ALARM_NAME: 'dailyAutoParse', DAILY_ALARM_DRIFT_TOLERANCE_MS: 60_000,
       DAILY_MISSED_RUN_CATCHUP_MS: 3 * 60 * 60_000, dailyRunStartInFlight: null,
       console: { log() {}, warn() {} },
-      async addDailyDiagnostic() {}, async ensureDailyAlarm() {},
+      async addDailyDiagnostic(event, detail) { diagnostics.push(detail); }, async ensureDailyAlarm() {},
       async scheduleNightCabinetRetry() { retries++; return { attempts: 1 }; },
       async startSequentialPipeline() { starts++; throw new Error('overlapping shop start'); },
     });
     for (const name of ['runDailyAutoParse', 'runDailyAutoParseOnce']) vm.runInContext(extractFunction(name), h.context);
     await vm.runInContext(`(async () => { ${branch} })()`, h.context);
     assert.equal(starts, 0, token);
-    assert.equal(retries, 1, token);
-    assert.equal(h.state.lastDailyAutoParseStatus, 'deferred-night-lease', token);
+    assert.equal(retries, 0, token);
+    assert.ok(diagnostics.some(d=>d.skipReason==='native-verifier-required'),token);
     assert.deepEqual(h.state.nightCabinetLease, beforeLease, token);
     assert.deepEqual(h.state.pipelineRun, beforeRun, token);
   }

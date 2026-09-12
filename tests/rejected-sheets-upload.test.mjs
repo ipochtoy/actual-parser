@@ -1,3 +1,4 @@
+import { installNativeParserFixture } from './helpers/parser-normal-fixture.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -99,6 +100,21 @@ test('sealed archive resumes after a transient guard failure and diagnostic drif
 test('row count cap refuses without silently truncating raw rows',async()=>{const h=harness();h.state.orderData.Amazon.orders=Array.from({length:20001},(_,i)=>({...h.state.orderData.Amazon.orders[i?1:0],order_id:i?`count-${i}`:h.state.orderData.Amazon.orders[0].order_id}));await assert.rejects(h.run(),/row count/);assert.equal(h.state.pendingSheetsUpload.runId,RUN);assert.equal(h.state[archiveKey],undefined)});
 function installCanonicalDoor(h) {
  const {ctx}=h,now=ctx.Date.now();
+ installNativeParserFixture(ctx,source);
+ Object.assign(ctx,{PARSER_WORK_AUTHORITY_KEY:'parserWorkAuthority',PARSER_WORK_PROTOCOL_VERSION:1,PARSER_WORK_RETRY_ALARM:'parserWorkAdmissionRetry',PARSER_WORK_RETRY_MS:30000,PARSER_WORK_WAIT_MS:300000,parserWorkStartInFlight:null,parserWorkFinishInFlight:null,setTimeout,clearTimeout});
+ vm.runInContext(['cleanupObject','cleanupKeys','cleanupUuid','cleanupCanonicalJson','cleanupEqual'].map(fullFunction).join('\n')+'\n'+take('function parserWorkRecord(', 'async function runDailyAutoParse('),ctx);
+ let normalFence=null;
+ const previousRuntime=ctx.chrome.runtime.sendMessage;
+ ctx.chrome.runtime.sendMessage=async(id,message)=>{
+  if(typeof id!=='string')return previousRuntime(id);
+  assert.equal(id,'ppcgaihnphmgololipboonimikclclgc');
+  if(message.operation==='read')return{ok:true,protocolVersion:1,now:ctx.Date.now(),record:structuredClone(normalFence)};
+  assert.deepEqual(structuredClone(message.expected),normalFence);
+  const d=message.desired,authority=await ctx.readParserWorkAuthority({action:'parserWorkAuthorityV1',runId:d.runId,slotId:d.slotId,token:d.token});
+  assert.equal(authority.known,true);normalFence=structuredClone(d);
+  return{ok:true,protocolVersion:1,requestId:message.requestId,record:structuredClone(d)};
+ };
+ ctx.chrome.alarms={clear:async()=>{},create:async()=>{}};
  ctx.STANDALONE_WALK_LEDGER_KEY='standaloneWalkGenerationLedger';
  Object.assign(ctx,{NIGHT_CABINET_AUTHORITY_SCOPE_KEY:'nightCabinetAuthorityScope',
   NIGHT_CABINET_CLEANUP_KEY:'nightCabinetCleanupLease',NIGHT_CABINET_CLEANUP_LEDGER_KEY:'nightCabinetCleanupLedger'});
@@ -182,7 +198,7 @@ test('actual daily start consumes one manual run after rejected prior data, pres
  const archive=structuredClone(h.state[archiveKey]),raw=structuredClone(h.state.orderData);
  Object.assign(h.ctx,{loadAccountsConfig:async()=>({}),buildExpectedPipelineRoster:()=>({iherb:[],ebay:[],amazon:[]}),
   addDailyDiagnostic:async()=>{},clearNightCabinetRetry:async()=>{},clearParsingLogs:async()=>{},
-  cachedProgressState:{},parseReport:{},startSequentialPipeline:async()=>({started:true})});
+  storesCompleted:{},cachedProgressState:{},parseReport:{},startSequentialPipeline:async()=>({started:true})});
  vm.runInContext([fullFunction('createPipelineRun'),fullFunction('runDailyAutoParseOnce')].join('\n'),h.ctx);
  assert.equal(await h.ctx.runDailyAutoParseOnce('coordinator-control',{external:true,slotId:next.lease.slotId,token:next.token}),true);
  assert.notEqual(h.state.pipelineRun.id,RUN);assert.equal(h.state.pipelineRun.slotAt,MANUAL_AT);

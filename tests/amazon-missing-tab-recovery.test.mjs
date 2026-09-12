@@ -1,3 +1,4 @@
+import { installParserComponentAdmission } from './helpers/parser-normal-fixture.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
@@ -28,7 +29,7 @@ function harness(data=initial(),hooks={}){
  tabs:{async get(id){calls.push(['getTab',id]);if(hooks.tabGet)return hooks.tabGet(id,tabs,data);if(!tabs.has(id))throw Error('No tab with id: '+id+'.');return clone(tabs.get(id))},
  async create(opts){calls.push(['create',clone(opts)]);await hooks.create?.(data);const t={id:18+calls.filter(c=>c[0]==='create').length,url:opts.url};tabs.set(t.id,t);return clone(t)},
  async update(id,opts){calls.push(['update',id,clone(opts)]);await hooks.update?.(data);tabs.set(id,{id,url:opts.url});return clone(tabs.get(id))},async remove(id){calls.push(['remove',id]);await hooks.remove?.(id,tabs,data);tabs.delete(id)}}}};
- vm.createContext(context);vm.runInContext('let amazonAttemptMutationChain=Promise.resolve();let parserOperationFlights=new Map();',context);
+ vm.createContext(context); installParserComponentAdmission(context);vm.runInContext('let amazonAttemptMutationChain=Promise.resolve();let parserOperationFlights=new Map();',context);
  for(const name of ['normalizeAccountEmail','pipelineRunAccountIsTerminal','pipelineGenerationFromStage','pipelineGenerationMatches','pipelineOperationKey','runParserOperationSingleFlight','amazonWatchdogAttemptFromState','amazonWatchdogAttemptIdentityMatches','amazonWatchdogAttemptMatches','withAmazonAttemptMutation','amazonPaginationPayloadMatchesAttempt','amazonAttemptRefMatchesRuntime','amazonAttemptRefFromPayload','isSafeAmazonOrdersUrl','handleAmazonAttemptCommit','resumePreparedPipelineStageAfterRestart','getAmazonParserTab','readAmazonTimeoutTabEvidence','getAmazonSwitchAccountUrl','dispatchCurrentAmazonAccountSwitch','dispatchCurrentAmazonAccountSwitchOnce'])vm.runInContext(fn(name),context);
  const start=source.indexOf('const AMAZON_MISSING_TAB_SNAPSHOT_CAP =');const end=source.indexOf('async function getAmazonParserTab(',start);vm.runInContext(source.slice(start,end),context);
  return {context,data,calls,tabs,clock,recover:()=>context.recoverAmazonMissingTab(clone(data)),dispatch:()=>context.dispatchCurrentAmazonAccountSwitch(data.multiAccountState.currentAmazonAccount,context.pipelineGenerationFromStage(data.pipelineStage),'account-switch')};

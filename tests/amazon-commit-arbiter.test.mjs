@@ -1,3 +1,4 @@
+import { installParserComponentAdmission } from './helpers/parser-normal-fixture.mjs';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
@@ -243,7 +244,7 @@ function createHarness(initial, { storageHooks = {}, updateTab = null } = {}) {
     },
     beginAmazonStageFinalization: async () => true,
   };
-  vm.createContext(context);
+  vm.createContext(context); installParserComponentAdmission(context);
   for (const name of REAL_FUNCTIONS) {
     vm.runInContext(extractFunction(background, name), context);
   }

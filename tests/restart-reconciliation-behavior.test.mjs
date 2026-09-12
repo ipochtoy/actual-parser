@@ -1,3 +1,4 @@
+import { installParserComponentAdmission } from './helpers/parser-normal-fixture.mjs';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
@@ -105,7 +106,7 @@ function makeReconcileHarness(initialState) {
     uploadLogsToSheet: async () => calls.uploads.push('logs'),
     clearPipelineRuntimeState: async reason => calls.clear.push(reason),
   };
-  vm.createContext(context);
+  vm.createContext(context); installParserComponentAdmission(context);
   for (const name of [
     'normalizeAccountEmail',
     'pipelineGenerationFromStage',
@@ -257,7 +258,7 @@ test('restart resume advances an exact terminal eBay account and never redispatc
       return null;
     },
   };
-  vm.createContext(context);
+  vm.createContext(context); installParserComponentAdmission(context);
   for (const name of [
     'normalizeAccountEmail',
     'pipelineGenerationFromStage',
@@ -330,7 +331,7 @@ test('terminal eBay restart waits for the real screenshot drain before starting 
       return null;
     },
   };
-  vm.createContext(context);
+  vm.createContext(context); installParserComponentAdmission(context);
   for (const name of [
     'normalizeAccountEmail',
     'pipelineGenerationFromStage',

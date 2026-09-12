@@ -1,3 +1,4 @@
+import { installParserComponentAdmission } from './helpers/parser-normal-fixture.mjs';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
@@ -46,7 +47,7 @@ function makeColdHarness(initialRead) {
     isProcessingScreenshots: false,
     checkpointScreenshotStageBudget: async () => {},
   };
-  vm.createContext(context);
+  vm.createContext(context); installParserComponentAdmission(context);
   const initStart = source.indexOf('const screenshotQueueReady =');
   const initEnd = source.indexOf('\nasync function persistScreenshotQueue', initStart);
   assert.ok(initStart >= 0 && initEnd > initStart);
@@ -142,7 +143,7 @@ function makeProcessHarness({ queue, activeIherb = 'questburgh@gmail.com', activ
       },
     },
   };
-  vm.createContext(context);
+  vm.createContext(context); installParserComponentAdmission(context);
   vm.runInContext(`
     ${extractFunction('screenshotQueueKey')}
     ${extractFunction('mergePersistedScreenshotQueue')}

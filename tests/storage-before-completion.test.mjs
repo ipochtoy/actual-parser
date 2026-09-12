@@ -29,7 +29,10 @@ test('daily run awaits a durable pipeline start and refuses a second active run'
   const source = read('background.js');
   const daily = between(source, 'async function runDailyAutoParse(source', 'async function runMissedDailyAutoParseIfNeeded');
   assert.match(daily, /pipelineStage\?\.active/);
-  assert.match(daily, /await startSequentialPipeline\(\)/);
+  assert.match(daily, /await parserWorkResumeStart\(pipelineRun.id\)/);
+  const admittedStart = between(source, 'async function parserWorkResumeStartOnce(', 'async function parserWorkRefuseUnstarted(');
+  assert.match(admittedStart, /await parserWorkAcquire\(runId\)/);
+  assert.match(admittedStart, /await startSequentialPipeline\(\)/);
   assert.match(daily, /lastDailyAutoParseStatus: 'failed-to-start'/);
 
   const sequential = between(source, 'async function startSequentialPipelineOnce()', 'async function runPipelineStage');

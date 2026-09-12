@@ -1,3 +1,4 @@
+import { installNativeParserFixture } from './helpers/parser-normal-fixture.mjs';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -33,6 +34,8 @@ function harness() {
     readParserRejectedUploadProof: async () => null,
   });
   const names = [
+    'cleanupObject', 'cleanupKeys', 'cleanupUuid', 'parserWorkRecord', 'parserWorkText',
+    'parserWorkRecordValid', 'parserWorkAuthorityValid', 'parserWorkGenerationMatches', 'parserWorkLeaseTransitionAllowed',
     'getNextDailyRun', 'getLastDailyRunSlot', 'nightCabinetSlotId', 'nightCabinetLeaseSlotIds',
     'nightCabinetSlotDay', 'nightCabinetNativeAdmissionAt', 'inspectNightCabinetLease',
     'withNightCabinetLeaseWrite', 'nightCabinetTerminalProof', 'nightCabinetTerminalSlotProof',
@@ -42,6 +45,7 @@ function harness() {
     'storeWalkParserIdleProof', 'inspectNightCabinetTransitionRequest', 'nightCabinetTransitionAllowed',
     'handleNightCoordinatorLeaseTransitionRequest', 'handleNightCoordinatorLeaseTransitionWake',
   ];
+ installNativeParserFixture(context,source);
   vm.runInContext(source.slice(0, source.indexOf('let dailyDiagnosticWriteQueue'))
     + '\nlet nightCabinetLeaseWriteChain = Promise.resolve();\n'
     + names.map(actualFunction).join('\n'), context);

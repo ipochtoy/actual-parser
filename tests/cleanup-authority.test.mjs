@@ -1,3 +1,4 @@
+import { installNativeParserFixture } from './helpers/parser-normal-fixture.mjs';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -54,6 +55,8 @@ function harness() {
     uploadToSheets: () => {},
   });
   const names = [
+    'parserWorkRecord', 'parserWorkText', 'parserWorkRecordValid', 'parserWorkAuthorityValid',
+    'parserWorkGenerationMatches', 'parserWorkLeaseTransitionAllowed',
     'getNextDailyRun', 'getLastDailyRunSlot', 'nightCabinetSlotId', 'nightCabinetLeaseSlotIds',
     'nightCabinetSlotDay', 'nightCabinetNativeAdmissionAt', 'inspectNightCabinetLease', 'withNightCabinetLeaseWrite',
     'nightCabinetTerminalProof', 'nightCabinetTerminalSlotProof', 'inspectManualControlEnvelope',
@@ -67,6 +70,7 @@ function harness() {
     'handleParserTabOwnershipMessage',
     ...Array.from(source.matchAll(/^(?:async )?function ((?:cleanup\w*|inspectCleanup\w*|inspectManualCleanupClosures|withCleanupParserStart|handleNightCabinetCleanup\w*|readNightCabinetCleanupAuthority))\(/gm), m => m[1]),
   ];
+ installNativeParserFixture(context,source);
   vm.runInContext(source.slice(0, source.indexOf('let dailyDiagnosticWriteQueue'))
     + '\nlet nightCabinetLeaseWriteChain=Promise.resolve(), dailyRunStartInFlight=null;\n'
     + 'let isParsingAllStores=false,isProcessingScreenshots=false,isMultiAccountParsing=false,isMultiAccountIherb=false;\n'
@@ -321,7 +325,9 @@ for (const stateName of ['open', 'expired', 'aux-malformed', 'missing-aux', 'led
     for (const name of ['runDailyAutoParseOnce', 'startSequentialPipelineOnce', 'startMultiAccountIherbParsing',
       'startMultiAccountAmazonParsing', 'startEbayStageForPipeline', 'launchParsersFromBackground',
       'resumePreparedPipelineStageAfterRestart']) {
-      await assert.rejects(h.context[name](), /cleanup/);
+      if (name === 'launchParsersFromBackground') {
+        assert.deepEqual(copy(await h.context[name]()), { started: false, reason: 'legacy-parallel-parser-start-refused' });
+      } else await assert.rejects(h.context[name](), /cleanup/);
     }
     await assert.rejects(h.context.createPipelineRun('test', { slotId: lease.slotId, token: lease.token }), /cleanup/);
     assert.equal((await h.context.prepareParserNightCabinetLease({ slotId: lease.slotId, token: lease.token, external: true })).ok, false);
@@ -364,7 +370,9 @@ test('every direct outer gate observes persisted-null cleanup keys without canon
   for (const name of ['runDailyAutoParseOnce', 'startSequentialPipelineOnce', 'startMultiAccountIherbParsing',
     'startMultiAccountAmazonParsing', 'startEbayStageForPipeline', 'launchParsersFromBackground',
     'resumePreparedPipelineStageAfterRestart']) {
-    await assert.rejects(h.context[name](), /cleanup-authority-malformed/, name);
+    if (name === 'launchParsersFromBackground') {
+      assert.deepEqual(copy(await h.context[name]()), { started: false, reason: 'legacy-parallel-parser-start-refused' });
+    } else await assert.rejects(h.context[name](), /cleanup-authority-malformed/, name);
   }
   assert.deepEqual(h.writes, []); assert.deepEqual(h.starts, []);
 });

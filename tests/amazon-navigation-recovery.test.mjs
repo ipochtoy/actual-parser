@@ -1,3 +1,4 @@
+import { installParserComponentAdmission } from './helpers/parser-normal-fixture.mjs';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
@@ -37,7 +38,7 @@ test('Amazon page URL helpers preserve the filter and target page 17 exactly', (
     URL,
     location: { href: 'https://www.amazon.com/gp/your-account/order-history?orderFilter=months-3&startIndex=150' },
   };
-  vm.createContext(context);
+  vm.createContext(context); installParserComponentAdmission(context);
   vm.runInContext(extractFunction(content, 'getAmazonPageFromUrl'), context);
   vm.runInContext(extractFunction(content, 'buildAmazonPageUrl'), context);
 
@@ -118,7 +119,7 @@ test('prepared navigation survives a restart during the page settle and redispat
       return { ok: true, status: 'navigating' };
     } } },
   };
-  vm.createContext(context);
+  vm.createContext(context); installParserComponentAdmission(context);
   for (const name of [
     'amazonParserContextMatchesState', 'getOwnedAmazonParserContext',
     'requireOwnedAmazonPaginationState', 'amazonAttemptRefFromState',
@@ -152,7 +153,7 @@ test('late old Amazon page sends one fenced cursor request and performs no direc
       },
     },
   };
-  vm.createContext(context);
+  vm.createContext(context); installParserComponentAdmission(context);
   for (const name of [
     'amazonAttemptRefFromState',
     'commitAmazonAttempt',
@@ -183,7 +184,7 @@ test('watchdog retries only a safe matching navigation generation, at most twice
     AMAZON_NAVIGATION_MAX_RETRIES: 2,
     AMAZON_NAVIGATION_RETRY_GAP_MS: 60_000,
   };
-  vm.createContext(context);
+  vm.createContext(context); installParserComponentAdmission(context);
   vm.runInContext(extractFunction(background, 'normalizeAccountEmail'), context);
   vm.runInContext(extractFunction(background, 'getAmazonNavigationRetryDecision'), context);
 
@@ -213,7 +214,7 @@ test('watchdog retries only a safe matching navigation generation, at most twice
 
 test('navigation recovery grants a bounded hard-cap grace window', () => {
   const context = { Date };
-  vm.createContext(context);
+  vm.createContext(context); installParserComponentAdmission(context);
   vm.runInContext(extractFunction(background, 'isAmazonHardCapExpired'), context);
 
   assert.equal(context.isAmazonHardCapExpired({ totalElapsed: 1_200_001, hardCapMs: 1_200_000, now: 100, graceUntil: 200 }), false);
@@ -250,7 +251,7 @@ test('recovery is wired before the destructive account-skip path', () => {
 
 test('timeout fences the exact attempt and never erases a racing completion slot', () => {
   const context = {};
-  vm.createContext(context);
+  vm.createContext(context); installParserComponentAdmission(context);
   vm.runInContext(extractFunction(background, 'normalizeAccountEmail'), context);
   vm.runInContext(extractFunction(background, 'amazonWatchdogAttemptIdentityMatches'), context);
   const attempt = {
@@ -359,7 +360,7 @@ test('Amazon account dispatch rechecks generation after a delayed tab lookup', a
       },
     },
   };
-  vm.createContext(context);
+  vm.createContext(context); installParserComponentAdmission(context);
   for (const name of [
     'normalizeAccountEmail',
     'pipelineGenerationMatches',
@@ -449,7 +450,7 @@ test('duplicate Amazon final dispatch shares one navigation with or without an e
           },
         },
       };
-      vm.createContext(context);
+      vm.createContext(context); installParserComponentAdmission(context);
       for (const name of [
         'normalizeAccountEmail',
         'pipelineGenerationMatches',
@@ -525,7 +526,7 @@ test('duplicate Amazon stage final return shares one confirmation flow', async (
       },
     },
   };
-  vm.createContext(context);
+  vm.createContext(context); installParserComponentAdmission(context);
   for (const name of [
     'normalizeAccountEmail',
     'pipelineGenerationMatches',
@@ -568,7 +569,7 @@ test('missing Next, stop and parser errors cannot emit Amazon completion', () =>
 test('timeout diagnosis distinguishes disappearance, unexpected redirect and unreadable tabs', async () => {
   let read;
   const context = { URL, chrome: { tabs: { get: async id => read(id) } } };
-  vm.createContext(context);
+  vm.createContext(context); installParserComponentAdmission(context);
   vm.runInContext(extractFunction(background, 'readAmazonTimeoutTabEvidence'), context);
   read = async id => ({ id, url: 'https://www.amazon.com/errors/validateCaptcha?token=secret', status: 'complete' });
   let evidence = await context.readAmazonTimeoutTabEvidence(41);
@@ -589,7 +590,7 @@ test('timeout diagnosis distinguishes disappearance, unexpected redirect and unr
 
 test('Parser ownership protects durable exact parsing and screenshot IDs across worker restart', () => {
   const context = {};
-  vm.createContext(context);
+  vm.createContext(context); installParserComponentAdmission(context);
   vm.runInContext(extractFunction(background, 'parserTabOwnershipReply'), context);
   const state = {
     pipelineRun: { id: 'run-a', status: 'running' },
@@ -625,7 +626,7 @@ test('ownership IPC rejects unrelated senders and exposes only an ownership deci
     assert.ok(keys.every(key => /^(pipelineRun|pipelineStage|amazonParserTabId|iherbParserTabId|ebayParserTabId|parserScreenshotReuseTab|parserScreenshotLocalTab|trackScreenshotQueue|screenshotQueueBlocked|screenshotStageBudget|amazonStageFinalizing|iherbStageFinalizing|pendingAccountSwitch|pendingIherbSwitch|autoParsePending|parsingState)$/.test(key)));
     return { pipelineRun: { id: 'a', status: 'running' }, pipelineStage: { active: true, runId: 'a', stageStartedAt: 123 }, amazonParserTabId: 41 };
   } } } } };
-  vm.createContext(context);
+  vm.createContext(context); installParserComponentAdmission(context);
   vm.runInContext(extractFunction(background, 'parserTabOwnershipReply'), context);
   vm.runInContext(extractFunction(background, 'handleParserTabOwnershipMessage'), context);
   const request = { action: 'parserTabOwnershipV1', tabId: 41 };
@@ -644,7 +645,7 @@ test('screenshot tab ownership is persisted on creation and cleared only for mat
     set: async patch => Object.assign(state, patch),
     remove: async key => { delete state[key]; },
   } } } };
-  vm.createContext(context);
+  vm.createContext(context); installParserComponentAdmission(context);
   vm.runInContext(extractFunction(background, 'rememberParserScreenshotTab'), context);
   vm.runInContext(extractFunction(background, 'forgetParserScreenshotTab'), context);
   await context.rememberParserScreenshotTab(41, 'parserScreenshotReuseTab');
@@ -659,7 +660,7 @@ test('screenshot tab ownership is persisted on creation and cleared only for mat
 
 test('terminal screenshot drain and pending finalizers never grant a false cleanup permit', () => {
   const context = {};
-  vm.createContext(context);
+  vm.createContext(context); installParserComponentAdmission(context);
   vm.runInContext(extractFunction(background, 'parserTabOwnershipReply'), context);
   const state = {
     pipelineRun: { id: 'run-a', status: 'completed' },

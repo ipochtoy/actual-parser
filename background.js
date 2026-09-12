@@ -34,6 +34,13 @@ const NIGHT_CABINET_CLEANUP_PROOF_MS = 60_000;
 const NIGHT_CABINET_CLEANUP_ATTEMPT_LIMIT = 64;
 const NIGHT_CABINET_CLEANUP_START_PERMIT = Symbol('serialized-parser-cleanup-start');
 const nightCabinetCleanupParserStarts = new Set();
+const PARSER_WORK_PROTOCOL_VERSION = 1;
+const PARSER_WORK_AUTHORITY_KEY = 'parserWorkAuthority';
+const PARSER_WORK_RETRY_ALARM = 'parserWorkAdmissionRetry';
+const PARSER_WORK_RETRY_MS = 30_000;
+const PARSER_WORK_WAIT_MS = 5 * 60_000;
+let parserWorkStartInFlight = null;
+let parserWorkFinishInFlight = null;
 const NIGHT_CABINET_TIME_ZONE = 'America/New_York';
 const NIGHT_CABINET_OWNERS = new Set(['store-walk', 'parser']);
 const NIGHT_CABINET_PHASES = new Set([
@@ -776,6 +783,7 @@ async function handleNightCoordinatorLeaseTransitionRequest() {
         const now = Date.now();
         const state = await chrome.storage.local.get([
             NIGHT_CABINET_TRANSITION_REQUEST_KEY,
+            PARSER_WORK_AUTHORITY_KEY,
             NIGHT_CABINET_TRANSITION_RESULT_KEY,
             NIGHT_CABINET_TRANSITION_HANDLED_KEY,
             NIGHT_CABINET_CATCHUP_RESUME_KEY,
@@ -817,6 +825,7 @@ async function handleNightCoordinatorLeaseTransitionRequest() {
             const gate = await cleanupNormalAdmission(state);
             if (!gate.ok) return finish(false, gate.reason);
         }
+        if (!parserWorkLeaseTransitionAllowed(state, request.desired)) return finish(false, 'parser-work-authority-unsettled');
         if (state[NIGHT_CABINET_TRANSITION_HANDLED_KEY] === request.requestId) {
             return {
                 handled: false,
@@ -1445,6 +1454,494 @@ async function ensureDailyAlarm(reason = 'ensure') {
     return new Date(existing.scheduledTime);
 }
 
+// Normal Parser ownership is separate from orphan cleanup. Its durable record
+// has no automatic expiry: a deadline, worker restart or lost reply is never
+// proof that merchant work stopped or that the primary accounts were restored.
+function parserWorkRecord(run) {
+    return { schemaVersion: 1, kind: 'parser-work-fence', runId: run.id,
+        slotId: String(run.slotAt), token: run.nightRequestToken, createdAt: run.attemptedAt,
+        state: 'held', closedAt: null, receipt: null };
+}
+
+function parserWorkText(value) {
+    return typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\x00-\x1f]/.test(value);
+}
+
+function parserWorkRecordValid(record) {
+    if (!cleanupKeys(record, ['schemaVersion', 'kind', 'runId', 'slotId', 'token', 'createdAt', 'state', 'closedAt', 'receipt'])
+        || record.schemaVersion !== 1 || record.kind !== 'parser-work-fence'
+        || !parserWorkText(record.runId) || !/^\d{10,16}$/.test(record.slotId)
+        || !parserWorkText(record.token) || !Number.isSafeInteger(record.createdAt) || record.createdAt <= 0) return false;
+    if (record.state === 'held') return record.closedAt === null && record.receipt === null;
+    const receipt = record.receipt;
+    return record.state === 'closed' && Number.isSafeInteger(record.closedAt) && record.closedAt >= record.createdAt
+        && cleanupKeys(receipt, ['schemaVersion', 'kind', 'runId', 'slotId', 'token', 'completedAt', 'home', 'ownTabs'])
+        && receipt.schemaVersion === 1 && receipt.kind === 'parser-work-complete'
+        && receipt.runId === record.runId && receipt.slotId === record.slotId && receipt.token === record.token
+        && receipt.completedAt === record.closedAt && receipt.home === true && receipt.ownTabs === true;
+}
+
+function parserWorkAuthorityValid(authority) {
+    return cleanupKeys(authority, ['schemaVersion', 'state', 'record', 'request', 'attempts', 'merchantStarted', 'ownedTabs', 'pendingCreates', 'browserSessionId'])
+        && authority.schemaVersion === 1 && ['requesting', 'held', 'closed', 'refused'].includes(authority.state)
+        && cleanupUuid(authority.browserSessionId)
+        && parserWorkRecordValid(authority.record)
+        && (authority.state === 'closed') === (authority.record.state === 'closed')
+        && Number.isSafeInteger(authority.attempts) && authority.attempts >= 0
+        && typeof authority.merchantStarted === 'boolean'
+        && Array.isArray(authority.ownedTabs) && authority.ownedTabs.every(id => Number.isSafeInteger(id) && id > 0)
+        && new Set(authority.ownedTabs).size === authority.ownedTabs.length
+        && Array.isArray(authority.pendingCreates) && authority.pendingCreates.every(id => cleanupUuid(id))
+        && (authority.state !== 'refused' || (authority.request === null && authority.merchantStarted === false
+            && authority.ownedTabs.length === 0 && authority.pendingCreates.length === 0))
+        && (authority.request === null || cleanupKeys(authority.request, ['action', 'operation', 'requestId', 'requestedAt', 'expected', 'desired'])
+            && authority.request.action === 'rpc_parserWorkFence' && ['acquire', 'release'].includes(authority.request.operation)
+            && cleanupUuid(authority.request.requestId) && Number.isSafeInteger(authority.request.requestedAt)
+            && (authority.request.expected === null || parserWorkRecordValid(authority.request.expected))
+            && parserWorkRecordValid(authority.request.desired));
+}
+
+async function parserWorkBrowserSession(create = false) {
+    const state = await chrome.storage.session.get('parserWorkBrowserSessionId');
+    const id = state.parserWorkBrowserSessionId;
+    if (id === undefined && create) {
+        const fresh = crypto.randomUUID();
+        await chrome.storage.session.set({ parserWorkBrowserSessionId: fresh });
+        return fresh;
+    }
+    return cleanupUuid(id) ? id : null;
+}
+
+function parserWorkGenerationMatches(state, authority, { live = false } = {}) {
+    if (!parserWorkAuthorityValid(authority)) return false;
+    const run = state.pipelineRun, record = authority.record, lease = state[NIGHT_CABINET_LEASE_KEY];
+    return run?.id === record.runId && String(run.slotAt) === record.slotId && run.nightRequestToken === record.token
+        && lease?.owner === 'parser' && lease.slotId === record.slotId && lease.token === record.token
+        && lease.runId === record.runId && lease.phase === 'running'
+        && ['active', 'expired'].includes(inspectNightCabinetLease(lease).state)
+        && (live ? inspectNightCabinetLease(lease).state === 'active' : true);
+}
+
+// Only the canonical native starter supplies this receipt, after proving its
+// current kernel identity and coordinator claim. A popup/legacy start has no
+// native owner that could independently verify the final primary accounts.
+function parserWorkNativeAdmissionValid(admission, lease, now = Date.now()) {
+    if (!cleanupKeys(admission, ['schemaVersion', 'kind', 'slotId', 'token', 'createdAt', 'owner', 'descriptorSha'])
+        || admission.schemaVersion !== 1 || admission.kind !== 'parser-native-admission'
+        || admission.slotId !== lease?.slotId || admission.token !== lease?.token
+        || !Number.isSafeInteger(admission.createdAt) || admission.createdAt > now || now - admission.createdAt >= 300000
+        || !/^[a-f0-9]{64}$/.test(admission.descriptorSha)) return false;
+    const owner = admission.owner;
+    return cleanupKeys(owner, ['hostId', 'bootId', 'pid', 'ppid', 'pgid', 'processStartFingerprint', 'commandSha', 'runId'])
+        && owner.hostId === 'pittsburgh' && cleanupUuid(owner.bootId)
+        && Number.isSafeInteger(owner.pid) && owner.pid > 0
+        && Number.isSafeInteger(owner.ppid) && owner.ppid >= 0 && Number.isSafeInteger(owner.pgid) && owner.pgid > 0
+        && parserWorkText(owner.processStartFingerprint) && parserWorkText(owner.runId) && /^[a-f0-9]{64}$/.test(owner.commandSha);
+}
+
+function parserWorkLeaseTransitionAllowed(state, desired) {
+    const authority = state[PARSER_WORK_AUTHORITY_KEY];
+    if (authority === undefined) return true;
+    if (!parserWorkAuthorityValid(authority)) return false;
+    if (authority.state === 'refused' || (authority.state === 'closed' && authority.request === null)) return true;
+    return ['requesting', 'held'].includes(authority.state) && parserWorkGenerationMatches(state, authority)
+        && desired?.owner === 'parser' && desired.phase === 'running'
+        && ['runId', 'slotId', 'token'].every(key => desired[key] === authority.record[key]);
+}
+
+async function parserWorkRpc(message) {
+    let timer;
+    try {
+        return await Promise.race([
+            chrome.runtime.sendMessage('ppcgaihnphmgololipboonimikclclgc', message),
+            new Promise(resolve => { timer = setTimeout(() => resolve(null), 2500); })
+        ]);
+    } catch (_) { return null; } finally { clearTimeout(timer); }
+}
+
+async function readParserWorkAuthority(request) {
+    const unknown = { action: 'parserWorkAuthorityV1', protocolVersion: PARSER_WORK_PROTOCOL_VERSION,
+        known: false, now: Date.now(), state: 'unknown', record: null, lease: null };
+    if (!cleanupKeys(request, ['action', 'runId', 'slotId', 'token']) || request.action !== unknown.action) return unknown;
+    const state = await chrome.storage.local.get([PARSER_WORK_AUTHORITY_KEY, 'pipelineRun', NIGHT_CABINET_LEASE_KEY]);
+    const authority = state[PARSER_WORK_AUTHORITY_KEY];
+    if (!parserWorkAuthorityValid(authority) || authority.record.runId !== request.runId
+        || authority.record.slotId !== request.slotId || authority.record.token !== request.token
+        || authority.state === 'refused') return unknown;
+    // Closed receipts remain readable after the coordinator advances. A cached
+    // acquire ACK cannot become permission for a new generation.
+    if (authority.state !== 'closed' && !parserWorkGenerationMatches(state, authority, { live: authority.state === 'requesting' })) return unknown;
+    if (authority.state !== 'closed' && await parserWorkBrowserSession() !== authority.browserSessionId) return unknown;
+    if (authority.state === 'requesting' && state.pipelineRun?.status !== 'starting') return unknown;
+    return { ...unknown, known: true, now: Date.now(), state: authority.state,
+        record: authority.record, lease: state[NIGHT_CABINET_LEASE_KEY] || null };
+}
+
+async function parserWorkReadFence() {
+    const reply = await parserWorkRpc({ action: 'rpc_parserWorkFence', operation: 'read' });
+    if (!reply || reply.ok !== true || reply.protocolVersion !== PARSER_WORK_PROTOCOL_VERSION
+        || !Number.isSafeInteger(reply.now) || !Object.prototype.hasOwnProperty.call(reply, 'record')
+        || (reply.record !== null && !parserWorkRecordValid(reply.record))) throw new Error('PARSER_WORK_FENCE_UNREADABLE');
+    return reply;
+}
+
+async function parserWorkRequire(expectedRunId = null, { terminal = false } = {}) {
+    const state = await chrome.storage.local.get([PARSER_WORK_AUTHORITY_KEY, 'parserWorkFinishProgress', 'pipelineRun', NIGHT_CABINET_LEASE_KEY]);
+    const authority = state[PARSER_WORK_AUTHORITY_KEY];
+    if (!parserWorkGenerationMatches(state, authority) || authority.state !== 'held'
+        || await parserWorkBrowserSession() !== authority.browserSessionId
+        || state.parserWorkFinishProgress != null
+        || (expectedRunId && authority.record.runId !== expectedRunId)
+        || !(terminal ? ['starting', 'running', 'completed', 'degraded'] : ['starting', 'running']).includes(state.pipelineRun.status)) {
+        throw new Error('PARSER_WORK_GENERATION_REQUIRED');
+    }
+    const external = await parserWorkReadFence();
+    const fresh = await chrome.storage.local.get([PARSER_WORK_AUTHORITY_KEY, 'parserWorkFinishProgress', 'pipelineRun', NIGHT_CABINET_LEASE_KEY]);
+    if (!cleanupEqual(external.record, authority.record) || fresh[PARSER_WORK_AUTHORITY_KEY]?.state !== 'held'
+        || !cleanupEqual(fresh[PARSER_WORK_AUTHORITY_KEY]?.record, authority.record)
+        || fresh.parserWorkFinishProgress != null
+        || !parserWorkGenerationMatches(fresh, fresh[PARSER_WORK_AUTHORITY_KEY])) throw new Error('PARSER_WORK_AUTHORITY_CHANGED');
+    return authority;
+}
+
+async function parserWorkAcquire(runId) {
+    let state = await chrome.storage.local.get([PARSER_WORK_AUTHORITY_KEY, 'pipelineRun', NIGHT_CABINET_LEASE_KEY]);
+    let authority = state[PARSER_WORK_AUTHORITY_KEY];
+    if (!parserWorkAuthorityValid(authority) || await parserWorkBrowserSession() !== authority.browserSessionId) {
+        throw new Error('PARSER_WORK_BROWSER_SESSION_CHANGED');
+    }
+    if (!parserWorkGenerationMatches(state, authority, { live: true }) || authority.record.runId !== runId
+        || !['requesting', 'held'].includes(authority.state) || state.pipelineRun.status !== 'starting') {
+        return { admitted: false, reason: 'PARSER_WORK_GENERATION_CHANGED' };
+    }
+    const observed = await parserWorkReadFence();
+    let request = authority.request;
+    if (!cleanupEqual(observed.record, authority.record)) {
+        if (observed.record?.state === 'held') return { admitted: false, reason: 'PARSER_WORK_FOREIGN_FENCE' };
+        if (Date.now() - authority.record.createdAt >= PARSER_WORK_WAIT_MS) return { admitted: false, reason: 'PARSER_WORK_IDLE_DEADLINE' };
+        if (request === null) {
+            request = { action: 'rpc_parserWorkFence', operation: 'acquire', requestId: crypto.randomUUID(),
+                requestedAt: Date.now(), expected: observed.record, desired: authority.record };
+            const saved = await withNightCabinetLeaseWrite(async () => {
+                state = await chrome.storage.local.get([PARSER_WORK_AUTHORITY_KEY, 'pipelineRun', NIGHT_CABINET_LEASE_KEY]);
+                if (!cleanupEqual(state[PARSER_WORK_AUTHORITY_KEY], authority) || !parserWorkGenerationMatches(state, authority, { live: true })) return false;
+                authority = { ...authority, request, attempts: authority.attempts + 1 };
+                await chrome.storage.local.set({ [PARSER_WORK_AUTHORITY_KEY]: authority });
+                return true;
+            });
+            if (!saved) return { admitted: false, reason: 'PARSER_WORK_GENERATION_CHANGED' };
+        }
+        // Never await AutoBuy while holding the Parser writer: AutoBuy verifies
+        // this exact durable intent through the read-only external callback.
+        const reply = await parserWorkRpc(request);
+        if (!reply || reply.protocolVersion !== 1 || reply.requestId !== request.requestId) {
+            return { admitted: false, pending: true, reason: 'PARSER_WORK_ACQUIRE_UNCERTAIN' };
+        }
+        if (reply.ok !== true) {
+            // Explicit refusal is the only reason to mint another request id.
+            // A lost response preserves the original id and durable intent.
+            await withNightCabinetLeaseWrite(async () => {
+                const current = (await chrome.storage.local.get(PARSER_WORK_AUTHORITY_KEY))[PARSER_WORK_AUTHORITY_KEY];
+                if (cleanupEqual(current, authority)) {
+                    authority = { ...authority, request: null };
+                    await chrome.storage.local.set({ [PARSER_WORK_AUTHORITY_KEY]: authority });
+                }
+            });
+            return { admitted: false, pending: true, reason: String(reply.reason || 'PARSER_WORK_ACQUIRE_REFUSED') };
+        }
+        if (!cleanupEqual(reply.record, authority.record)) return { admitted: false, reason: 'PARSER_WORK_ACQUIRE_REPLY_CHANGED' };
+    }
+    const reread = await parserWorkReadFence();
+    if (!cleanupEqual(reread.record, authority.record)) return { admitted: false, reason: 'PARSER_WORK_ACQUIRE_LOST' };
+    return withNightCabinetLeaseWrite(async () => {
+        state = await chrome.storage.local.get([PARSER_WORK_AUTHORITY_KEY, 'pipelineRun', NIGHT_CABINET_LEASE_KEY]);
+        if (!cleanupEqual(state[PARSER_WORK_AUTHORITY_KEY], authority) || !parserWorkGenerationMatches(state, authority, { live: true })) {
+            return { admitted: false, reason: 'PARSER_WORK_GENERATION_CHANGED' };
+        }
+        await chrome.storage.local.set({ [PARSER_WORK_AUTHORITY_KEY]: { ...authority, state: 'held', request: null } });
+        return { admitted: true };
+    });
+}
+
+async function parserWorkRememberTab(tabId, expectedRunId) {
+    return withNightCabinetLeaseWrite(async () => {
+        const state = await chrome.storage.local.get([PARSER_WORK_AUTHORITY_KEY, 'parserWorkFinishProgress', 'pipelineRun', NIGHT_CABINET_LEASE_KEY]);
+        const authority = state[PARSER_WORK_AUTHORITY_KEY];
+        if (!Number.isSafeInteger(tabId) || tabId <= 0 || !parserWorkGenerationMatches(state, authority)
+            || authority.state !== 'held' || authority.record.runId !== expectedRunId
+            || state.parserWorkFinishProgress != null || await parserWorkBrowserSession() !== authority.browserSessionId
+            || !authority.ownedTabs.includes(tabId)) throw new Error('PARSER_WORK_TAB_OWNER_CHANGED');
+        await chrome.storage.local.set({ [PARSER_WORK_AUTHORITY_KEY]: { ...authority, merchantStarted: true,
+            ownedTabs: [...new Set([...authority.ownedTabs, tabId])] } });
+    });
+}
+
+async function parserWorkCreateTab(options, { terminal = false, runId = null } = {}) {
+    const authority = await parserWorkRequire(runId, { terminal });
+    const id = crypto.randomUUID();
+    await withNightCabinetLeaseWrite(async () => {
+        const state = await chrome.storage.local.get([PARSER_WORK_AUTHORITY_KEY, 'parserWorkFinishProgress']);
+        const current = state[PARSER_WORK_AUTHORITY_KEY];
+        if (!cleanupEqual(current, authority) || current.pendingCreates.length || state.parserWorkFinishProgress != null
+            || await parserWorkBrowserSession() !== authority.browserSessionId) throw new Error('PARSER_WORK_TAB_CREATE_UNCERTAIN');
+        await chrome.storage.local.set({ [PARSER_WORK_AUTHORITY_KEY]: { ...current, merchantStarted: true, pendingCreates: [id] } });
+    });
+    const tab = await chrome.tabs.create(options);
+    if (!Number.isSafeInteger(tab?.id) || tab.id <= 0) throw new Error('PARSER_WORK_TAB_CREATE_UNCERTAIN');
+    await withNightCabinetLeaseWrite(async () => {
+        const current = (await chrome.storage.local.get(PARSER_WORK_AUTHORITY_KEY))[PARSER_WORK_AUTHORITY_KEY];
+        if (!parserWorkAuthorityValid(current) || !cleanupEqual(current.record, authority.record)
+            || current.state !== 'held' || current.pendingCreates.length !== 1 || current.pendingCreates[0] !== id) {
+            throw new Error('PARSER_WORK_TAB_CREATE_OWNER_CHANGED');
+        }
+        await chrome.storage.local.set({ [PARSER_WORK_AUTHORITY_KEY]: { ...current,
+            pendingCreates: [], ownedTabs: [...new Set([...current.ownedTabs, tab.id])] } });
+    });
+    return tab;
+}
+
+async function parserWorkResumeStart(runId) {
+    if (parserWorkStartInFlight) return parserWorkStartInFlight;
+    parserWorkStartInFlight = parserWorkResumeStartOnce(runId);
+    try { return await parserWorkStartInFlight; }
+    finally { parserWorkStartInFlight = null; }
+}
+
+async function parserWorkResumeStartOnce(runId) {
+    const state = await chrome.storage.local.get([PARSER_WORK_AUTHORITY_KEY, 'pipelineRun', 'pipelineStage', NIGHT_CABINET_LEASE_KEY]);
+    const authority = state[PARSER_WORK_AUTHORITY_KEY], pipelineRun = state.pipelineRun;
+    if (!parserWorkGenerationMatches(state, authority) || authority.record.runId !== runId
+        || pipelineRun.status !== 'starting' || state.pipelineStage?.active) return false;
+    const source = pipelineRun.source;
+    let admission;
+    try { admission = await parserWorkAcquire(runId); }
+    catch (_) { admission = { admitted: false, pending: true, reason: 'PARSER_WORK_ACQUIRE_UNCERTAIN' }; }
+    if (!admission.admitted) {
+        const exhausted = Date.now() - authority.record.createdAt >= PARSER_WORK_WAIT_MS;
+        await chrome.storage.local.set({ lastDailyAutoParseStatus: exhausted ? 'blocked-autobuy-admission' : 'waiting-autobuy-idle',
+            lastDailyAutoParseError: admission.reason });
+        if (!exhausted) chrome.alarms.create(PARSER_WORK_RETRY_ALARM, { when: Date.now() + PARSER_WORK_RETRY_MS });
+        if (exhausted) await parserWorkRefuseUnstarted(runId);
+        await addDailyDiagnostic('run-deferred', { source, runId, skipReason: admission.reason, exhausted });
+        return false;
+    }
+    await parserWorkRequire(runId);
+    await chrome.alarms.clear(PARSER_WORK_RETRY_ALARM);
+    await chrome.storage.local.set({
+        lastDailyAutoParseAttemptedAt: pipelineRun.attemptedAt,
+        lastDailyAutoParseSource: source,
+        lastDailyAutoParseStatus: 'starting',
+        lastDailyAutoParseError: null
+    });
+
+    // Reset states and start parsing.
+    cachedProgressState = {};
+    parseReport = {
+        stores: {},
+        screenshots: { sent: 0, skipped: 0, failed: 0, broken: 0 },
+        startedAt: pipelineRun.attemptedAt,
+        runId: pipelineRun.id
+    };
+    await chrome.storage.local.set({ progressState: cachedProgressState, stopAllParsers: false });
+    await clearParsingLogs();
+
+    const started = await startSequentialPipeline();
+    if (started?.started === false) {
+        const status = started.reason === 'screenshot-queue-blocked'
+            ? 'blocked-screenshots'
+            : 'failed-to-start';
+        await chrome.storage.local.set({
+            lastDailyAutoParseStatus: status,
+            lastDailyAutoParseFinishedAt: Date.now(),
+            lastDailyAutoParseError: started.reason || 'start-refused'
+        });
+        await updatePipelineRun(run => ({
+            ...run,
+            status: status === 'blocked-screenshots' ? 'blocked' : 'failed_to_start',
+            finishedAt: Date.now(),
+            failures: [...(run.failures || []), { shop: 'pipeline', account: '', reason: started.reason || 'start-refused', at: Date.now() }]
+        }));
+        await addDailyDiagnostic('run-skip', { source, skipReason: started.reason || 'start-refused' });
+        return false;
+    }
+    // startSequentialPipeline commits pipelineRun + pipelineStage + the
+    // legacy trigger proof in one storage.set.  A crash can therefore leave
+    // either a retryable `starting` attempt or a fully owned running stage,
+    // never three mutually contradictory half-start markers.
+    sendTelegramMessage('⏰ Автоматический ночной парсинг запущен (23:00)...').catch(() => {});
+    return true;
+}
+
+async function parserWorkRefuseUnstarted(runId) {
+    const external = await parserWorkReadFence();
+    return withNightCabinetLeaseWrite(async () => {
+        const state = await chrome.storage.local.get([PARSER_WORK_AUTHORITY_KEY, 'pipelineRun', NIGHT_CABINET_LEASE_KEY]);
+        const authority = state[PARSER_WORK_AUTHORITY_KEY];
+        if (!parserWorkGenerationMatches(state, authority) || authority.record.runId !== runId
+            || authority.state !== 'requesting' || authority.request !== null || authority.merchantStarted
+            || authority.ownedTabs.length || authority.pendingCreates.length || state.pipelineRun.status !== 'starting'
+            || Date.now() - authority.record.createdAt < PARSER_WORK_WAIT_MS
+            || cleanupEqual(external.record, authority.record)) return false;
+        // Only an ungranted, definitely refused attempt may end this way.
+        // AutoBuy rejects fresh acquisitions after the same five-minute bound.
+        // Unknown outstanding requests and any held fence stay unresolved.
+        const at = Date.now();
+        await chrome.storage.local.set({ [PARSER_WORK_AUTHORITY_KEY]: { ...authority, state: 'refused' },
+            pipelineRun: { ...state.pipelineRun, status: 'failed_to_start', finishedAt: at,
+                failures: [...(state.pipelineRun.failures || []), { shop: 'pipeline', account: '', at, reason: 'autobuy-idle-admission-deadline' }] },
+            lastDailyAutoParseStatus: 'failed-to-start', lastDailyAutoParseFinishedAt: at });
+        return true;
+    });
+}
+
+function parserWorkFinishProofValid(request, now = Date.now()) {
+    if (!cleanupKeys(request, ['schemaVersion', 'kind', 'requestId', 'requestedAt', 'expected', 'proof'])
+        || request.schemaVersion !== 1 || request.kind !== 'parser-work-finish' || !cleanupUuid(request.requestId)
+        || !parserWorkRecordValid(request.expected) || request.expected.state !== 'held'
+        || !Number.isSafeInteger(request.requestedAt) || request.requestedAt > now || now - request.requestedAt > 300000) return false;
+    const p = request.proof, r = request.expected;
+    const time = at => Number.isSafeInteger(at) && at >= r.createdAt && at <= now && now - at <= 300000;
+    return cleanupKeys(p, ['schemaVersion', 'kind', 'runId', 'slotId', 'token', 'verifiedAt', 'descriptorSha', 'owner', 'primary', 'ownTabs'])
+        && p.schemaVersion === 1 && p.kind === 'parser-primary-verification'
+        && ['runId', 'slotId', 'token'].every(key => p[key] === r[key]) && time(p.verifiedAt) && cleanupHash(p.descriptorSha)
+        && cleanupKeys(p.owner, ['hostId', 'bootId', 'pid', 'processStartFingerprint', 'runId'])
+        && p.owner.hostId === 'pittsburgh' && cleanupUuid(p.owner.bootId)
+        && Number.isSafeInteger(p.owner.pid) && p.owner.pid > 0
+        && parserWorkText(p.owner.processStartFingerprint) && parserWorkText(p.owner.runId)
+        && Array.isArray(p.primary) && p.primary.length === 2
+        && [['iherb', 'photopochtoy@gmail.com'], ['amazon', 'ipochtoy@gmail.com']].every(([shop, account], i) => {
+            const row = p.primary[i];
+            return cleanupKeys(row, ['shop', 'account', 'verifiedAt', 'outputSha']) && row.shop === shop
+                && row.account === account && time(row.verifiedAt) && row.verifiedAt <= p.verifiedAt && cleanupHash(row.outputSha);
+        })
+        && cleanupKeys(p.ownTabs, ['session', 'remaining', 'verifiedAt']) && parserWorkText(p.ownTabs.session)
+        && p.ownTabs.remaining === 0 && time(p.ownTabs.verifiedAt) && p.ownTabs.verifiedAt <= p.verifiedAt;
+}
+
+function parserWorkTerminalQuiet(state, expected) {
+    const run = state.pipelineRun, stage = state.pipelineStage;
+    return cleanupParserRuntimeIdle() && parserWorkStartInFlight === null && parserOperationFlights.size === 0
+        && parserWorkGenerationMatches(state, state[PARSER_WORK_AUTHORITY_KEY])
+        && cleanupEqual(state[PARSER_WORK_AUTHORITY_KEY].record, expected)
+        && state[PARSER_WORK_AUTHORITY_KEY].state === 'held'
+        && state[PARSER_WORK_AUTHORITY_KEY].pendingCreates.length === 0
+        && ['completed', 'degraded'].includes(run.status) && Number.isSafeInteger(run.finishedAt)
+        && run.finishedAt >= expected.createdAt && run.finishedAt <= Date.now()
+        && stage?.active === false && stage.runId === run.id && stage.currentIndex === 3
+        && cleanupEqual(stage.stages, ['iherb', 'ebay', 'amazon', 'done'])
+        && state.parsingState?.isParsingAllStores === false
+        && Array.isArray(state.trackScreenshotQueue) && state.trackScreenshotQueue.length === 0
+        && !state.screenshotQueueBlocked && !state.parserScreenshotReuseTab && !state.parserScreenshotLocalTab
+        && state.pendingSheetsUpload === null && state.lastSheetsUploadRunId === run.id
+        && Number.isSafeInteger(state.lastSheetsUploadOkAt) && state.lastSheetsUploadOkAt >= run.finishedAt;
+}
+
+async function parserWorkReleaseClosed() {
+    let authority = (await chrome.storage.local.get(PARSER_WORK_AUTHORITY_KEY))[PARSER_WORK_AUTHORITY_KEY];
+    if (!parserWorkAuthorityValid(authority) || authority.state !== 'closed'
+        || (authority.request !== null && authority.request.operation !== 'release')) throw new Error('PARSER_WORK_RELEASE_UNKNOWN');
+    let read = await parserWorkReadFence();
+    if (!cleanupEqual(read.record, authority.record)) {
+        if (!authority.request || !cleanupEqual(read.record, authority.request.expected)) throw new Error('PARSER_WORK_RELEASE_FOREIGN');
+        // A lost result keeps the exact same request. No cabinet or tab action
+        // is repeated after the durable completion receipt has been written.
+        const ack = await parserWorkRpc(authority.request);
+        if (!ack || ack.ok !== true || ack.protocolVersion !== 1 || ack.requestId !== authority.request.requestId
+            || !cleanupEqual(ack.record, authority.record)) throw new Error('PARSER_WORK_RELEASE_UNCERTAIN');
+        read = await parserWorkReadFence();
+    }
+    if (!cleanupEqual(read.record, authority.record)) throw new Error('PARSER_WORK_RELEASE_UNCERTAIN');
+    await withNightCabinetLeaseWrite(async () => {
+        const current = (await chrome.storage.local.get(PARSER_WORK_AUTHORITY_KEY))[PARSER_WORK_AUTHORITY_KEY];
+        if (!cleanupEqual(current, authority)) throw new Error('PARSER_WORK_RELEASE_CHANGED');
+        if (current.request !== null) await chrome.storage.local.set({ [PARSER_WORK_AUTHORITY_KEY]: { ...current, request: null } });
+    });
+    return { ok: true, protocolVersion: 1, record: authority.record };
+}
+
+async function handleParserWorkFinishRequest() {
+    if (parserWorkFinishInFlight) return parserWorkFinishInFlight;
+    parserWorkFinishInFlight = parserWorkFinishOnce();
+    try { return await parserWorkFinishInFlight; } finally { parserWorkFinishInFlight = null; }
+}
+
+async function parserWorkFinishOnce() {
+    let state = await chrome.storage.local.get(null);
+    const request = state.parserWorkFinishRequest, authority = state[PARSER_WORK_AUTHORITY_KEY];
+    const result = async (ok, reason, record = null) => {
+        const value = { ok, protocolVersion: 1, requestId: request?.requestId || null, reason, record };
+        await chrome.storage.local.set({ parserWorkFinishResult: value }); return value;
+    };
+    // Exact durable completion may be acknowledged after the short verification
+    // window. It never permits a new browser action or a different generation.
+    if (parserWorkAuthorityValid(authority) && authority.state === 'closed'
+        && cleanupEqual(state.parserWorkFinishProgress?.request, request)
+        && state.parserWorkFinishProgress?.state === 'completed') {
+        try { const closed = await parserWorkReleaseClosed(); return result(true, 'closed', closed.record); }
+        catch (error) { return result(false, error.message); }
+    }
+    if (!parserWorkFinishProofValid(request) || !parserWorkTerminalQuiet(state, request.expected)
+        || await parserWorkBrowserSession() !== authority.browserSessionId) return result(false, 'PARSER_WORK_FINISH_NOT_QUIET');
+    const read = await parserWorkReadFence();
+    if (!cleanupEqual(read.record, request.expected)) return result(false, 'PARSER_WORK_FINISH_FOREIGN');
+    const progress = { schemaVersion: 1, state: 'cleaning', request };
+    const admitted = await withNightCabinetLeaseWrite(async () => {
+        state = await chrome.storage.local.get(null);
+        const previous = state.parserWorkFinishProgress;
+        if (!parserWorkTerminalQuiet(state, request.expected) || !cleanupEqual(state.parserWorkFinishRequest, request)
+            || (previous != null && (!cleanupEqual(previous, progress)
+                && (previous.state !== 'cleaning' || previous.schemaVersion !== 1
+                    || !cleanupEqual(previous.request?.expected, request.expected)
+                    || previous.request.requestedAt >= request.requestedAt)))) return false;
+        if (previous != null && !cleanupEqual(previous, progress)) {
+            // A fresh exact native verification may replace an interrupted,
+            // completed-in-RAM cleaning attempt. Preserve its receipt before CAS.
+            await chrome.storage.local.set({ [`parserWorkFinishHistory:${previous.request.requestId}`]: previous });
+        }
+        await chrome.storage.local.set({ parserWorkFinishProgress: progress }); return true;
+    });
+    if (!admitted) return result(false, 'PARSER_WORK_FINISH_CHANGED');
+    try {
+        const ids = [...state[PARSER_WORK_AUTHORITY_KEY].ownedTabs];
+        for (const id of ids) {
+            const current = await chrome.storage.local.get(null);
+            if (!parserWorkFinishProofValid(request) || !parserWorkTerminalQuiet(current, request.expected)
+                || !cleanupEqual(current.parserWorkFinishProgress, progress)
+                || await parserWorkBrowserSession() !== authority.browserSessionId) throw new Error('PARSER_WORK_FINISH_CHANGED');
+            const fence = await parserWorkReadFence();
+            if (!cleanupEqual(fence.record, request.expected)) throw new Error('PARSER_WORK_FINISH_FOREIGN');
+            let exists = true;
+            try { await chrome.tabs.get(id); } catch (error) {
+                if (!new RegExp(`^No tab with id: ${id}\\.?$`, 'i').test(String(error?.message || error))) throw error;
+                exists = false;
+            }
+            if (!parserWorkFinishProofValid(request)) throw new Error('PARSER_WORK_FINISH_EXPIRED');
+            if (exists) await chrome.tabs.remove(id);
+        }
+        for (const id of ids) {
+            try { await chrome.tabs.get(id); throw new Error('PARSER_WORK_OWN_TAB_REMAINS'); }
+            catch (error) { if (!new RegExp(`^No tab with id: ${id}\\.?$`, 'i').test(String(error?.message || error))) throw error; }
+        }
+        const closed = await withNightCabinetLeaseWrite(async () => {
+            state = await chrome.storage.local.get(null);
+            if (!parserWorkFinishProofValid(request) || !parserWorkTerminalQuiet(state, request.expected)
+                || !cleanupEqual(state.parserWorkFinishProgress, progress)
+                || !cleanupEqual(state[PARSER_WORK_AUTHORITY_KEY].ownedTabs, ids)) throw new Error('PARSER_WORK_FINISH_CHANGED');
+            const at = Date.now();
+            const record = { ...request.expected, state: 'closed', closedAt: at,
+                receipt: { schemaVersion: 1, kind: 'parser-work-complete', runId: request.expected.runId,
+                    slotId: request.expected.slotId, token: request.expected.token, completedAt: at, home: true, ownTabs: true } };
+            await chrome.storage.local.set({ [PARSER_WORK_AUTHORITY_KEY]: { ...state[PARSER_WORK_AUTHORITY_KEY], state: 'closed', record,
+                request: { action: 'rpc_parserWorkFence', operation: 'release', requestId: crypto.randomUUID(),
+                    requestedAt: at, expected: request.expected, desired: record }, ownedTabs: [] },
+                parserWorkFinishProgress: { ...progress, state: 'completed' } });
+            return record;
+        });
+        await parserWorkReleaseClosed();
+        return result(true, 'closed', closed);
+    } catch (error) { return result(false, String(error?.message || error)); }
+}
+
 async function runDailyAutoParse(source, coordinator = null) {
     if (dailyRunStartInFlight) {
         await addDailyDiagnostic('run-skip', { source, skipReason: 'start-already-in-flight' });
@@ -1466,6 +1963,10 @@ async function runDailyAutoParseOnce(source, coordinator = null) {
     if ((cleanupStartState.nightCabinetAuthorityScope !== undefined || cleanupStartState.nightCabinetCleanupLease !== undefined
         || cleanupStartState.nightCabinetCleanupLedger !== undefined) && cleanupPermit !== NIGHT_CABINET_CLEANUP_START_PERMIT) {
         return withCleanupParserStart(() => runDailyAutoParseOnce(source, coordinator, NIGHT_CABINET_CLEANUP_START_PERMIT));
+    }
+    if (source !== 'coordinator-control' || coordinator?.external !== true) {
+        await addDailyDiagnostic('run-skip', { source, skipReason: 'native-verifier-required' });
+        return false;
     }
     console.log(`⏰ Daily auto-parse started (${source})`);
     await addDailyDiagnostic('run-start', { source });
@@ -1565,49 +2066,7 @@ async function runDailyAutoParseOnce(source, coordinator = null) {
     let pipelineRun = null;
     try {
         pipelineRun = await createPipelineRun(source, nightLease);
-        await chrome.storage.local.set({
-            lastDailyAutoParseAttemptedAt: pipelineRun.attemptedAt,
-            lastDailyAutoParseSource: source,
-            lastDailyAutoParseStatus: 'starting',
-            lastDailyAutoParseError: null
-        });
-
-        // Reset states and start parsing.
-        cachedProgressState = {};
-        parseReport = {
-            stores: {},
-            screenshots: { sent: 0, skipped: 0, failed: 0, broken: 0 },
-            startedAt: pipelineRun.attemptedAt,
-            runId: pipelineRun.id
-        };
-        await chrome.storage.local.set({ progressState: cachedProgressState, stopAllParsers: false });
-        await clearParsingLogs();
-
-        const started = await startSequentialPipeline();
-        if (started?.started === false) {
-            const status = started.reason === 'screenshot-queue-blocked'
-                ? 'blocked-screenshots'
-                : 'failed-to-start';
-            await chrome.storage.local.set({
-                lastDailyAutoParseStatus: status,
-                lastDailyAutoParseFinishedAt: Date.now(),
-                lastDailyAutoParseError: started.reason || 'start-refused'
-            });
-            await updatePipelineRun(run => ({
-                ...run,
-                status: status === 'blocked-screenshots' ? 'blocked' : 'failed_to_start',
-                finishedAt: Date.now(),
-                failures: [...(run.failures || []), { shop: 'pipeline', account: '', reason: started.reason || 'start-refused', at: Date.now() }]
-            }));
-            await addDailyDiagnostic('run-skip', { source, skipReason: started.reason || 'start-refused' });
-            return false;
-        }
-        // startSequentialPipeline commits pipelineRun + pipelineStage + the
-        // legacy trigger proof in one storage.set.  A crash can therefore leave
-        // either a retryable `starting` attempt or a fully owned running stage,
-        // never three mutually contradictory half-start markers.
-        sendTelegramMessage('⏰ Автоматический ночной парсинг запущен (23:00)...').catch(() => {});
-        return true;
+        return await parserWorkResumeStart(pipelineRun.id);
     } catch (error) {
         const message = String(error?.message || error).slice(0, 300);
         isParsingAllStores = false;
@@ -2008,6 +2467,17 @@ async function createPipelineRun(source, nightLease) {
         || currentLease.lease.token !== nightLease?.token) {
       throw new Error('night parser lease lost before pipeline run claim');
     }
+    const oldAuthority = (await chrome.storage.local.get(PARSER_WORK_AUTHORITY_KEY))[PARSER_WORK_AUTHORITY_KEY];
+    if (oldAuthority !== undefined && (!parserWorkAuthorityValid(oldAuthority) || !['closed', 'refused'].includes(oldAuthority.state)
+        || (oldAuthority.state === 'closed' && oldAuthority.request !== null))) {
+      throw new Error('previous Parser browser authority is unresolved');
+    }
+    const nativeAdmission = (await chrome.storage.local.get('parserWorkNativeAdmission')).parserWorkNativeAdmission;
+    if (!parserWorkNativeAdmissionValid(nativeAdmission, currentLease.lease, now)) {
+      throw new Error('exact native Parser verifier admission is required');
+    }
+    const browserSessionId = await parserWorkBrowserSession(true);
+    if (!browserSessionId) throw new Error('Parser browser session identity is unreadable');
     const manual = String(currentLease.lease.token).startsWith('control:')
       ? await manualControlParserStartProof(currentLease.lease,now) : {ok:true};
     const slotAt = Number(currentLease.lease.slotId);
@@ -2032,6 +2502,9 @@ async function createPipelineRun(source, nightLease) {
     // Store Walk heartbeat can never land between the exact read and this set.
     await chrome.storage.local.set({
       pipelineRun,
+      parserWorkFinishProgress: null,
+      [PARSER_WORK_AUTHORITY_KEY]: { schemaVersion: 1, state: 'requesting', record: parserWorkRecord(pipelineRun),
+        request: null, attempts: 0, merchantStarted: false, ownedTabs: [], pendingCreates: [], browserSessionId },
       ...(manual.key ? {[manual.key]:{...manual.record,parserRunId:pipelineRun.id}} : {}),
       [NIGHT_CABINET_LEASE_KEY]: {
         ...currentLease.lease,
@@ -2616,6 +3089,7 @@ function isCanonicalResumablePipeline(run, pipeline) {
 
 async function reconcileStalePipelineState({ allowDestructiveCleanup = true } = {}) {
     const state = await chrome.storage.local.get([
+        PARSER_WORK_AUTHORITY_KEY,
         'pipelineRun',
         'pipelineStage',
         'progressState',
@@ -2644,6 +3118,15 @@ async function reconcileStalePipelineState({ allowDestructiveCleanup = true } = 
     ]);
     const run = state.pipelineRun;
     const pipeline = state.pipelineStage;
+    if (state[PARSER_WORK_AUTHORITY_KEY] !== undefined) {
+        const authority = state[PARSER_WORK_AUTHORITY_KEY];
+        if (!parserWorkAuthorityValid(authority)) return;
+        if (authority.record.runId === run?.id && ['requesting', 'held'].includes(authority.state)) {
+            // The new protocol resumes a pending admission separately. It must
+            // never become the legacy 60-second destructive startup reset.
+            return;
+        }
+    }
     if (run?.status === 'starting' && !pipeline?.active) {
         const attemptAgeMs = Date.now() - (Number(run.attemptedAt) || 0);
         if (attemptAgeMs >= 60_000) {
@@ -2796,7 +3279,7 @@ async function resumePreparedPipelineStageAfterRestart() {
         return withCleanupParserStart(() => resumePreparedPipelineStageAfterRestart(NIGHT_CABINET_CLEANUP_START_PERMIT));
     }
     const state = await chrome.storage.local.get([
-        'pipelineRun', 'pipelineStage',
+        PARSER_WORK_AUTHORITY_KEY, 'pipelineRun', 'pipelineStage',
         'multiAccountIherbState', 'pendingIherbSwitch', 'iherbSwitchInProgress',
         'iherbParserTabId', 'iherbParseAttemptId', 'iherbTimeoutAttempt',
         'iherbParsingComplete',
@@ -2810,6 +3293,8 @@ async function resumePreparedPipelineStageAfterRestart() {
     ]);
     const run = state.pipelineRun;
     const stageState = state.pipelineStage;
+    if (run?.status === 'starting' && !stageState?.active
+        && state[PARSER_WORK_AUTHORITY_KEY]?.record?.runId === run.id) return parserWorkResumeStart(run.id);
     if (run?.id !== stageState?.runId) return false;
     const stage = stageState.stages?.[stageState.currentIndex];
     const generation = pipelineGenerationFromStage(stageState);
@@ -2827,6 +3312,7 @@ async function resumePreparedPipelineStageAfterRestart() {
         return runPipelineStage('done', run.id);
     }
     if (!stageState.active || run?.status !== 'running') return false;
+    await parserWorkRequire(run.id);
 
     // The stage identity/timer is committed before any browser mutation. If the
     // worker died in that narrow gap, resume only when the shop-specific durable
@@ -3457,7 +3943,9 @@ async function handleIherbPressHoldDetected(request, sender) {
 // the parser reads. The value sits in embedded JSON: trackingSection → label "Number"
 // → value. This is cross-origin from the parser's www.ebay.com tab, so it MUST run in
 // the background SW (host_permissions <all_urls> bypasses CORS). Returns '' on miss.
-async function fetchEbayOrderTracking(orderId) {
+async function fetchEbayOrderTracking(orderId, runId) {
+    if (!runId) throw new Error('PARSER_WORK_GENERATION_REQUIRED');
+    await parserWorkRequire(runId);
     if (!orderId || orderId === 'N/A') return '';
     try {
         const url = `https://order.ebay.com/ord/show?orderId=${encodeURIComponent(orderId)}`;
@@ -3481,16 +3969,36 @@ async function fetchEbayOrderTracking(orderId) {
 // alive throughout (a single content-script message → one long busy loop, instead of
 // many small messages with idle gaps that let the SW sleep and drop the async reply,
 // hanging the parse). Returns { [orderId]: tracking }.
-async function fetchEbayOrderTrackings(orderIds) {
+async function fetchEbayOrderTrackings(orderIds, runId) {
     const out = {};
     for (const orderId of (orderIds || [])) {
-        out[orderId] = await fetchEbayOrderTracking(orderId);
+        out[orderId] = await fetchEbayOrderTracking(orderId, runId);
         await new Promise(r => setTimeout(r, 500)); // gentle pacing between detail fetches
     }
     return out;
 }
 
+async function fetchEbayTrackingForSender(request, sender) {
+    const state = await chrome.storage.local.get(['pipelineRun','pipelineStage','ebayParserTabId']);
+    const runId = state.pipelineRun?.id, stage = state.pipelineStage;
+    const authority = await parserWorkRequire(runId);
+    if (!runId || stage?.runId !== runId || stage.active !== true || stage.stages?.[stage.currentIndex] !== 'ebay'
+        || !Number.isSafeInteger(sender?.tab?.id) || sender.tab.id !== state.ebayParserTabId
+        || !authority.ownedTabs.includes(sender.tab.id)) throw new Error('PARSER_WORK_EBAY_SENDER_CHANGED');
+    const ids = request.action === 'fetchEbayOrderTrackings' ? request.orderIds : [request.orderId];
+    if (!Array.isArray(ids) || ids.length > 1000 || ids.some(id => typeof id !== 'string' || id.length > 128)) {
+        throw new Error('PARSER_WORK_EBAY_REQUEST_INVALID');
+    }
+    return runParserOperationSingleFlight('ebay-detail-tracking', JSON.stringify([runId, sender.tab.id, ids]),
+        () => request.action === 'fetchEbayOrderTrackings' ? fetchEbayOrderTrackings(ids, runId) : fetchEbayOrderTracking(ids[0], runId));
+}
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request?.action === 'parserWorkFinishWake') {
+        if (!cleanupKeys(request, ['action']) || sender?.tab) { sendResponse({ ok: false }); return false; }
+        handleParserWorkFinishRequest().then(sendResponse).catch(() => sendResponse({ ok: false, reason: 'PARSER_WORK_FINISH_UNKNOWN' }));
+        return true;
+    }
     // Debug logs for messages
     if (request.action !== 'progress' && request.action !== 'addLog') { // Reduce noise
         console.log('📨 Message received:', request.action, request);
@@ -3698,6 +4206,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 sendResponse({ active: false, owned: false });
                 return;
             }
+            await parserWorkRequire();
             const state = await chrome.storage.local.get([
                 'pipelineRun', 'pipelineStage', 'multiAccountIherbState',
                 'iherbParserTabId', 'ebayParserTabId', 'iherbStageFinalizing',
@@ -3771,6 +4280,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         return true;
     } else if (request.action === "getAmazonParserContext") {
         (async () => {
+            await parserWorkRequire();
             const state = await chrome.storage.local.get([
                 'amazonParserTabId', 'pipelineRun', 'pipelineStage', 'multiAccountState',
                 'amazonFinalReturn', 'pendingAccountSwitch', 'amazonStageFinalizing',
@@ -3820,13 +4330,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     } else if (request.action === "fetchEbayOrderTracking") {
         // Parser found no tracking in the list feed for this order — read it from the
         // order-detail page (cross-origin; only the background SW can, due to CORS).
-        fetchEbayOrderTracking(request.orderId)
+        fetchEbayTrackingForSender(request, sender)
             .then(tracking => sendResponse({ ok: true, tracking }))
             .catch(err => sendResponse({ ok: false, tracking: '', error: String(err?.message || err) }));
         return true; // async
     } else if (request.action === "fetchEbayOrderTrackings") {
         // Batch: recover tracking for all feed-untracked orders from their detail pages.
-        fetchEbayOrderTrackings(request.orderIds)
+        fetchEbayTrackingForSender(request, sender)
             .then(map => sendResponse({ ok: true, map }))
             .catch(err => sendResponse({ ok: false, map: {}, error: String(err?.message || err) }));
         return true; // async
@@ -4099,6 +4609,9 @@ async function dispatchCurrentAmazonAccountSwitchOnce(email, expectedGeneration,
         console.warn('⏭ Amazon generation changed while resolving parser tab');
         return false;
     }
+    const workAuthority = await parserWorkRequire(expectedGeneration.runId);
+    if (parserTab && !workAuthority.ownedTabs.includes(parserTab.id)) parserTab = null;
+    if (parserTab) await parserWorkRememberTab(parserTab.id, expectedGeneration.runId);
     // A failed/expired recovery can leave its exact known blank tab awaiting
     // normal final-return cleanup. Reuse only that durable create receipt; never
     // make a second tab merely because the generic URL gate rejects about:blank.
@@ -4124,7 +4637,7 @@ async function dispatchCurrentAmazonAccountSwitchOnce(email, expectedGeneration,
             console.warn('AMAZON_TAB_CREATE_UNCERTAIN: новая вкладка запрещена');
             return false;
         }
-        parserTab = await chrome.tabs.create({ url: 'about:blank', active: false });
+        parserTab = await parserWorkCreateTab({ url: 'about:blank', active: false }, { runId: expectedGeneration.runId });
         if (!parserTab?.id) throw new Error('failed to create owned Amazon parser tab');
         createdParserTab = true;
         afterTab = await readDispatchState();
@@ -4200,6 +4713,7 @@ async function switchToNextAmazonAccount(expectedGeneration = null) {
         console.warn('⏭ Refusing stale Amazon queue mutation');
         return false;
     }
+    await parserWorkRequire(generation.runId);
     if (stored.multiAccountState) {
         isMultiAccountParsing = stored.multiAccountState.isMultiAccountParsing;
         amazonAccountsQueue = stored.multiAccountState.amazonAccountsQueue || [];
@@ -4374,6 +4888,7 @@ async function startSequentialPipelineOnce() {
   if (!existing.pipelineRun?.id || existing.pipelineRun.status !== 'starting') {
     return { started: false, reason: 'pipeline-run-not-initialized' };
   }
+  await parserWorkRequire(existing.pipelineRun.id);
   // Reset the legacy parallel-parse completion tracker and flip the flag that
   // gates handleProgressMessage's completion branch — otherwise eBay's
   // "Done ✅" will be ignored and we never advance from ebay → amazon.
@@ -4467,6 +4982,7 @@ async function runPipelineStage(stageName, expectedRunId = null) {
       return false;
     }
   }
+  await parserWorkRequire(expectedRunId, { terminal: stageName === 'done' });
   // Stamp when THIS stage started, so handlePipelineWatchdog can force-advance a stage
   // that hangs. eBay had no safety-net; a hung eBay froze the whole nightly run and the
   // Google Sheets upload with it (blackout from 2026-06-15).
@@ -4920,6 +5436,7 @@ async function startEbayStageForPipeline(expectedGeneration = null) {
     console.warn('⏭ Refusing stale eBay stage dispatch');
     return false;
   }
+  await parserWorkRequire(generation.runId);
   // content-ebay.js checkAutoParse требует autoParsePending='ebay' + свежий
   // autoParseTimestamp (<120s). Без этого он молча скипнет парсинг.
   await chrome.storage.local.set({
@@ -4930,10 +5447,12 @@ async function startEbayStageForPipeline(expectedGeneration = null) {
   });
   const url = 'https://www.ebay.com/mye/myebay/purchase';
   let tab = await getEbayParserTab(prepared.ebayParserTabId);
+  if (tab && !(await parserWorkRequire(generation.runId)).ownedTabs.includes(tab.id)) tab = null;
+  if (tab) await parserWorkRememberTab(tab.id, generation.runId);
   if (!tab) {
     // Establish ownership before navigation so a content script can never load
     // in an unowned tab and consume the global auto-parse intent.
-    tab = await chrome.tabs.create({ url: 'about:blank', active: false });
+    tab = await parserWorkCreateTab({ url: 'about:blank', active: false }, { runId: generation.runId });
     if (!tab?.id) throw new Error('failed to create owned eBay parser tab');
     await chrome.storage.local.set({ ebayParserTabId: tab.id });
   }
@@ -4966,6 +5485,7 @@ async function startMultiAccountIherbParsing() {
         || cleanupStartState.nightCabinetCleanupLedger !== undefined) && cleanupPermit !== NIGHT_CABINET_CLEANUP_START_PERMIT) {
         return withCleanupParserStart(() => startMultiAccountIherbParsing(NIGHT_CABINET_CLEANUP_START_PERMIT));
     }
+    const workAuthority = await parserWorkRequire();
     console.log('🚀 startMultiAccountIherbParsing called');
 
     const cfg = await loadAccountsConfig();
@@ -5011,7 +5531,7 @@ async function startMultiAccountIherbParsing() {
 
     // Находим существующий iherb-таб или создаём один. НЕ закрываем чужие табы.
     const existingTab = await chrome.storage.local.get(['iherbParserTabId']);
-    const tabId = await ensureValidIherbParserTab(existingTab.iherbParserTabId);
+    const tabId = await ensureValidIherbParserTab(existingTab.iherbParserTabId, workAuthority.record.runId);
     await chrome.storage.local.set({ iherbParserTabId: tabId });
 
     await switchToNextIherbAccount();
@@ -5045,7 +5565,7 @@ async function dispatchCurrentIherbAccountSwitchOnce(email, expectedGeneration) 
         return false;
     }
 
-    const tabId = await ensureValidIherbParserTab(state.iherbParserTabId);
+    const tabId = await ensureValidIherbParserTab(state.iherbParserTabId, expectedGeneration.runId);
     const afterTab = await readDispatchState();
     if (!ownsDispatch(afterTab)) {
         console.warn('⏭ iHerb generation changed while resolving parser tab');
@@ -5132,6 +5652,7 @@ async function switchToNextIherbAccountOnce(expectedGeneration = null) {
         console.warn('⏭ Refusing stale iHerb queue mutation');
         return false;
     }
+    await parserWorkRequire(generation.runId);
     if (stored.multiAccountIherbState) {
         isMultiAccountIherb = stored.multiAccountIherbState.isMultiAccountIherb;
         iherbAccountsQueue  = stored.multiAccountIherbState.iherbAccountsQueue || [];
@@ -5949,7 +6470,7 @@ async function finalReturnToIherbPrimaryOnce(_tabId, expectedGeneration = null) 
         return false;
     }
 
-    const tabId = await ensureValidIherbParserTab(returnState.iherbParserTabId);
+    const tabId = await ensureValidIherbParserTab(returnState.iherbParserTabId, expectedGeneration.runId);
     returnState = await readReturnState();
     if (!ownsReturn(returnState)) {
         console.warn('⏭ iHerb generation changed while resolving final-return tab');
@@ -6078,10 +6599,11 @@ async function waitForIherbFinalReturnCompletion(expectedGeneration, maxWaitMs) 
 }
 
 // ─── Shared: ensure we have exactly one iHerb parser tab ───────────────────
-async function ensureIherbParserTab() {
+async function ensureIherbParserTab(expectedRunId) {
+    if (!expectedRunId) throw new Error('PARSER_WORK_GENERATION_REQUIRED');
     // Lost ownership cannot be reconstructed from a URL: an existing iHerb tab
     // may belong to the operator or another task. Create one parser-owned tab.
-    const t = await chrome.tabs.create({ url: 'https://www.iherb.com/', active: false });
+    const t = await parserWorkCreateTab({ url: 'https://www.iherb.com/', active: false }, { runId: expectedRunId });
     await waitForTabComplete(t.id, 20000);
     return t.id;
 }
@@ -6091,19 +6613,22 @@ async function ensureIherbParserTab() {
 // ошибку "Cannot access a chrome-extension:// URL of different extension",
 // которая возникает когда chrome.debugger.attach пытается подключиться к табу
 // чужого расширения (stale ID после закрытия iHerb-таба).
-async function ensureValidIherbParserTab(cachedTabId) {
-    if (cachedTabId) {
-        try {
-            const t = await chrome.tabs.get(cachedTabId);
-            if (t && /^https?:\/\/[a-z0-9.-]*iherb\.com\//i.test(t.url || '')) {
-                return cachedTabId;
-            }
-            console.warn(`⚠️ iherbParserTabId=${cachedTabId} stale (url=${t?.url?.slice(0,80)}) — re-query`);
-        } catch (e) {
-            console.warn(`⚠️ iherbParserTabId=${cachedTabId} not found — re-query`);
+async function ensureValidIherbParserTab(cachedTabId, expectedRunId) {
+    if (!expectedRunId) throw new Error('PARSER_WORK_GENERATION_REQUIRED');
+    const authority = await parserWorkRequire(expectedRunId);
+    let tab = null;
+    if (cachedTabId && authority.ownedTabs.includes(cachedTabId)) {
+        try { tab = await chrome.tabs.get(cachedTabId); }
+        catch (error) {
+            if (!amazonMissingTabErrorIsExact(error, cachedTabId)) throw error;
+        }
+        if (tab && /^https?:\/\/(?:[a-z0-9-]+\.)*iherb\.com\//i.test(tab.url || '')) {
+            await parserWorkRememberTab(cachedTabId, expectedRunId);
+            return cachedTabId;
         }
     }
-    return ensureIherbParserTab();
+    await parserWorkRequire(expectedRunId);
+    return ensureIherbParserTab(expectedRunId);
 }
 
 function waitForTabComplete(tabId, timeoutMs) {
@@ -6480,6 +7005,7 @@ async function startMultiAccountAmazonParsing() {
         || cleanupStartState.nightCabinetCleanupLedger !== undefined) && cleanupPermit !== NIGHT_CABINET_CLEANUP_START_PERMIT) {
         return withCleanupParserStart(() => startMultiAccountAmazonParsing(NIGHT_CABINET_CLEANUP_START_PERMIT));
     }
+    await parserWorkRequire();
     console.log('🚀 startMultiAccountAmazonParsing called');
 
     const cfg = await loadAccountsConfig();
@@ -6817,7 +7343,7 @@ async function dispatchAmazonMissingTabRecovery(email, generation) {
             await saveAmazonMissingTabRecord(state, record);
             state = await readAmazonMissingTabState();
             if (!owns(state)) return false;
-            const tab = await chrome.tabs.create({ url: 'about:blank', active: false });
+            const tab = await parserWorkCreateTab({ url: 'about:blank', active: false }, { runId: generation.runId });
             if (!Number.isInteger(tab?.id) || tab.id <= 0) throw new Error('AMAZON_TAB_CREATE_UNCERTAIN');
             state = await readAmazonMissingTabState();
             if (!owns(state)) {
@@ -6932,6 +7458,13 @@ function parserTabOwnershipReply(state, tabId) {
 }
 
 function handleParserTabOwnershipMessage(request, sender, sendResponse) {
+    if (sender?.id === 'ppcgaihnphmgololipboonimikclclgc' && request?.action === 'parserWorkAuthorityV1') {
+        readParserWorkAuthority(request).then(sendResponse).catch(() => sendResponse({
+            action: 'parserWorkAuthorityV1', protocolVersion: PARSER_WORK_PROTOCOL_VERSION,
+            known: false, state: 'unknown', record: null, lease: null, now: Date.now()
+        }));
+        return true;
+    }
     if (sender?.id === 'ppcgaihnphmgololipboonimikclclgc' && request?.action === 'nightCabinetCleanupAuthorityV1') {
         readNightCabinetCleanupAuthority(request).then(sendResponse).catch(() => sendResponse({
             action: 'nightCabinetCleanupAuthorityV1', protocolVersion: STORE_WALK_CLEANUP_PROTOCOL_VERSION,
@@ -8530,6 +9063,15 @@ async function handleIherbWatchdog() {
 
 // Alarm listener - this fires even when Service Worker wakes up
 chrome.alarms.onAlarm.addListener(async (alarm) => {
+    if (alarm.name === PARSER_WORK_RETRY_ALARM) {
+        const state = await chrome.storage.local.get([PARSER_WORK_AUTHORITY_KEY, 'pipelineRun']);
+        const authority = state[PARSER_WORK_AUTHORITY_KEY];
+        if (parserWorkAuthorityValid(authority) && ['requesting', 'held'].includes(authority.state)
+            && state.pipelineRun?.id === authority.record.runId && state.pipelineRun.status === 'starting') {
+            await parserWorkResumeStart(authority.record.runId);
+        }
+        return;
+    }
     if (alarm.name === NIGHT_CABINET_RETRY_ALARM) {
         const state = await chrome.storage.local.get([NIGHT_CABINET_RETRY_KEY]);
         const retry = state[NIGHT_CABINET_RETRY_KEY];
@@ -10128,82 +10670,17 @@ async function sendParseCommandsWithRetry(openedTabs) {
     }
 }
 
-// Шлёт текстовую команду в Telegram-группу для AutoBuy:
-//   /parser_lock {shop} on|off
-// AutoBuy подхватывает в native-host telegram-poller и пишет в свой chrome.storage,
-// а auto-cart блокирует авто-выкуп на этот шоп пока флаг on.
+// Legacy diagnostic only. Browser admission is enforced by parserWorkRequire;
+// this log is not a transport and never releases the normal ownership fence.
 async function setParserLock(shop, on) {
     const cmd = `/parser_lock ${shop} ${on ? 'on' : 'off'}`;
     console.log(cmd);
 }
 
 async function launchParsersFromBackground() {
-    const cleanupPermit = arguments[0];
-    const cleanupStartState = await chrome.storage.local.get([
-        'nightCabinetAuthorityScope', 'nightCabinetCleanupLease', 'nightCabinetCleanupLedger'
-    ]);
-    if ((cleanupStartState.nightCabinetAuthorityScope !== undefined || cleanupStartState.nightCabinetCleanupLease !== undefined
-        || cleanupStartState.nightCabinetCleanupLedger !== undefined) && cleanupPermit !== NIGHT_CABINET_CLEANUP_START_PERMIT) {
-        return withCleanupParserStart(() => launchParsersFromBackground(NIGHT_CABINET_CLEANUP_START_PERMIT));
-    }
-    console.log('🚀 launchParsersFromBackground() triggered');
-    if (!parseReport.startedAt || (Date.now() - parseReport.startedAt > 5000)) {
-        parseReport = { stores: {}, screenshots: { sent: 0, skipped: 0, failed: 0, broken: 0 }, startedAt: Date.now() };
-        sendTelegramMessage('🚀 Запущен парсинг всех магазинов...');
-    }
-    
-    // Ensure stop flag is cleared
-    await chrome.storage.local.set({ stopAllParsers: false });
-
-    // Start parsing state
-    isParsingAllStores = true;
-    storesCompleted = { ebay: false, iherb: false, amazon: false };
-    saveParsingState();
-    
-    // Reset progress cache
-    cachedProgressState = {}; 
-    chrome.storage.local.set({ progressState: cachedProgressState });
-    
-    // eBay open immediately. Amazon и iHerb идут через multi-account flow.
-    const storesToParse = [
-        { key: 'ebay', url: 'https://www.ebay.com/mye/myebay/purchase', emoji: '🛒' }
-    ];
-
-    const now = Date.now();
-    await chrome.storage.local.set({
-        autoParse_ebay: now,
-        autoParse_iherb: now,
-        autoParse_amazon: now,
-        ebay_should_autoparse: true,
-        iherb_should_autoparse: true,
-        amazon_should_autoparse: true
-    });
-    console.log('🚩 Auto-parse flags set for eBay, iHerb & Amazon');
-    parseReport = { stores: {}, screenshots: { sent: 0, skipped: 0, failed: 0, broken: 0 }, startedAt: Date.now() };
-
-    const openedTabs = {};
-    for (const store of storesToParse) {
-        console.log(`🌐 Opening tab for ${store.key}...`);
-        const tab = await chrome.tabs.create({ url: store.url, active: false });
-        openedTabs[store.key] = tab.id;
-        setParserLock(store.key, true);
-    }
-
-    // FALLBACK: If auto-parse flags don't work, send message with retry after page loads
-    sendParseCommandsWithRetry(openedTabs);
-
-    // Amazon: multi-account flow (photopochtoy + ipochtoy sequentially)
-    startMultiAccountAmazonParsing();
-
-    // iHerb: multi-account flow (pochtoy + photopochtoy sequentially)
-    startMultiAccountIherbParsing();
-
-    // Watchdog: Check progress after 3 minutes
-    setTimeout(() => {
-        if (isParsingAllStores && !storesCompleted.ebay && !storesCompleted.iherb && !storesCompleted.amazon) {
-             console.log(`⚠️ Внимание: Прошло 3 минуты, а парсинг не завершен. Проверьте вкладки браузера.`);
-        }
-    }, 180000);
+    // The legacy parallel entry has no native completion/verifier owner. All
+    // supported callers use runDailyAutoParse and the sequential lease door.
+    return { started: false, reason: 'legacy-parallel-parser-start-refused' };
 }
 
 async function sendTelegramMessage(text) {
@@ -10958,6 +11435,7 @@ async function processScreenshotQueue() {
 
     try {
 
+    const workAuthority = await parserWorkRequire(null, { terminal: true });
     const beforeFilter = trackScreenshotQueue.length;
     trackScreenshotQueue = await filterAlreadySent(trackScreenshotQueue);
     parseReport.screenshots.skipped += (beforeFilter - trackScreenshotQueue.length);
@@ -10990,7 +11468,7 @@ async function processScreenshotQueue() {
     // путает SPA-роутеры. Теперь только chrome.tabs.update({ url }).
     let reuseTab = null;
     try {
-        reuseTab = await chrome.tabs.create({ url: 'about:blank', active: true });
+        reuseTab = await parserWorkCreateTab({ url: 'about:blank', active: true }, { terminal: true, runId: workAuthority.record.runId });
     } catch (e) {
         console.warn('⚠️ Не удалось создать reusable tab, fallback на per-item create:', e?.message || e);
     }
@@ -11054,7 +11532,7 @@ async function processScreenshotQueue() {
             }
         }
         try {
-            const result = await captureTrackScreenshot(item, done, total, reuseTab?.id);
+            const result = await captureTrackScreenshot(item, done, total, reuseTab?.id, workAuthority.record.runId);
             if (result?.status === 'captcha') {
                 const blocked = {
                     kind: 'captcha',
@@ -11728,7 +12206,9 @@ async function captureIherbTrackingCard(tab) {
     }
 }
 
-async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountName, extraTracks }, current, total, reuseTabId) {
+async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountName, extraTracks }, current, total, reuseTabId, expectedRunId) {
+    if (!expectedRunId) throw new Error('PARSER_WORK_GENERATION_REQUIRED');
+    await parserWorkRequire(expectedRunId, { terminal: true });
     // markAsSent receives only tracks whose archive request actually succeeded.
     // The old code pre-filled this set from the request, so every error looked
     // like a successful delivery and the queue item was deleted.
@@ -11759,11 +12239,11 @@ async function captureTrackScreenshot({ orderId, trackNumber, trackUrl, accountN
                 tab = await chrome.tabs.update(reuseTabId, { url: fullUrl, active: true });
             } catch (e) {
                 console.warn('⚠️ reuseTab update failed, fallback to create:', e?.message || e);
-                tab = await chrome.tabs.create({ url: fullUrl, active: true });
+                tab = await parserWorkCreateTab({ url: fullUrl, active: true }, { terminal: true, runId: expectedRunId });
                 createdLocally = true;
             }
         } else {
-            tab = await chrome.tabs.create({ url: fullUrl, active: true });
+            tab = await parserWorkCreateTab({ url: fullUrl, active: true }, { terminal: true, runId: expectedRunId });
             createdLocally = true;
         }
 

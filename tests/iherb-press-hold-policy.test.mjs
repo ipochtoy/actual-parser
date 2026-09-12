@@ -345,7 +345,7 @@ test('unresolved Press & Hold marker blocks the next daily launch even with an e
   vm.createContext(context);
   vm.runInContext(extractFunction(background, 'runDailyAutoParseOnce'), context);
 
-  assert.equal(await context.runDailyAutoParseOnce('alarm'), false);
+  assert.equal(await context.runDailyAutoParseOnce('coordinator-control', {external:true}), false);
   assert.equal(state.lastDailyAutoParseStatus, 'blocked-human-captcha');
   assert.equal(state.lastDailyAutoParseError, 'iHerb Press & Hold still requires a human');
   assert.deepEqual(calls.diagnostics.map(item => item.event), ['run-start', 'run-skip']);

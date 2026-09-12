@@ -1,3 +1,4 @@
+import { installParserComponentAdmission } from './helpers/parser-normal-fixture.mjs';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
@@ -73,7 +74,7 @@ function harness({ storage = {}, rows = [] } = {}) {
       },
     } } },
   };
-  vm.createContext(context);
+  vm.createContext(context); installParserComponentAdmission(context);
   vm.runInContext(receiptSource(), context);
   h.context = context;
   h.send = (id = identity) => context.archiveScreenshotWithReceipt('fixture-image', 'fixture-caption', clone(id));
