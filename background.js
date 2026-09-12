@@ -22,6 +22,18 @@ const STANDALONE_WALK_LEASE_PROTOCOL_VERSION = 1;
 const STANDALONE_WALK_LEDGER_KEY = 'standaloneWalkGenerationLedger';
 const STANDALONE_WALK_FIRST_ADMISSION_MS = 120_000;
 const STANDALONE_WALK_GENERATION_LIMIT = 128;
+const STORE_WALK_CLEANUP_PROTOCOL_VERSION = 1;
+const NIGHT_CABINET_AUTHORITY_SCOPE_KEY = 'nightCabinetAuthorityScope';
+const NIGHT_CABINET_CLEANUP_KEY = 'nightCabinetCleanupLease';
+const NIGHT_CABINET_CLEANUP_LEDGER_KEY = 'nightCabinetCleanupLedger';
+const NIGHT_CABINET_CLEANUP_REQUEST_KEY = 'nightCabinetCleanupTransitionRequest';
+const NIGHT_CABINET_CLEANUP_RESULT_KEY = 'nightCabinetCleanupTransitionResult';
+const MANUAL_CONTROL_CLEANUP_CLOSURES_KEY = 'manualControlCleanupClosures';
+const NIGHT_CABINET_CLEANUP_TTL_MS = 15 * 60_000;
+const NIGHT_CABINET_CLEANUP_PROOF_MS = 60_000;
+const NIGHT_CABINET_CLEANUP_ATTEMPT_LIMIT = 64;
+const NIGHT_CABINET_CLEANUP_START_PERMIT = Symbol('serialized-parser-cleanup-start');
+const nightCabinetCleanupParserStarts = new Set();
 const NIGHT_CABINET_TIME_ZONE = 'America/New_York';
 const NIGHT_CABINET_OWNERS = new Set(['store-walk', 'parser']);
 const NIGHT_CABINET_PHASES = new Set([
@@ -431,7 +443,18 @@ async function manualControlTransitionProof(request, current, now) {
     if (!inspected.ok || !manualControlTokenAllowed(inspected.envelope,request.desired)) return { ok:false, reason:'manual-control-generation-mismatch' };
     const envelope = inspected.envelope;
     const key = `manualControlGeneration:${envelope.id}`;
-    const values = await chrome.storage.local.get(['manualControlGenerationIndex',key]);
+    const values = await chrome.storage.local.get(['manualControlGenerationIndex',key,'manualControlCleanupClosures',
+        NIGHT_CABINET_AUTHORITY_SCOPE_KEY, NIGHT_CABINET_CLEANUP_KEY, NIGHT_CABINET_CLEANUP_LEDGER_KEY]);
+    if (values['manualControlCleanupClosures'] !== undefined
+        && (!inspectManualCleanupClosures(values['manualControlCleanupClosures'])
+            || values['manualControlCleanupClosures'][envelope.id])) return {ok:false,reason:'manual-control-cleanup-closed'};
+    // The primary closed ledger remains proof of consumption if the secondary
+    // closure index disappears. It does not consume another generation's ID.
+    if (values[NIGHT_CABINET_CLEANUP_KEY] !== undefined || values[NIGHT_CABINET_CLEANUP_LEDGER_KEY] !== undefined) {
+        const cleanup = await inspectCleanupLedger(values, now);
+        if (!cleanup.ok || (cleanup.closed && cleanup.ledger.target.generation?.kind === 'manual-control'
+            && cleanup.ledger.target.generation.envelope.id === envelope.id)) return {ok:false,reason:'manual-control-cleanup-closed'};
+    }
     const index = values.manualControlGenerationIndex == null ? [] : values.manualControlGenerationIndex;
     if (!Array.isArray(index) || index.length > 64 || new Set(index).size !== index.length
         || index.some(id => typeof id !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(id))) return { ok:false, reason:'manual-control-index-invalid' };
@@ -463,7 +486,16 @@ async function manualControlParserStartProof(lease, now) {
     const match = /^control:([a-f0-9-]{36}):parser-1$/.exec(lease.token);
     if (!match) throw new Error('manual control parser token invalid');
     const key = `manualControlGeneration:${match[1]}`;
-    const values = await chrome.storage.local.get(['manualControlGenerationIndex',key]);
+    const values = await chrome.storage.local.get(['manualControlGenerationIndex',key,'manualControlCleanupClosures',
+        NIGHT_CABINET_AUTHORITY_SCOPE_KEY, NIGHT_CABINET_CLEANUP_KEY, NIGHT_CABINET_CLEANUP_LEDGER_KEY]);
+    if (values['manualControlCleanupClosures'] !== undefined
+        && (!inspectManualCleanupClosures(values['manualControlCleanupClosures'])
+            || values['manualControlCleanupClosures'][match[1]])) throw new Error('manual control cleanup generation closed');
+    if (values[NIGHT_CABINET_CLEANUP_KEY] !== undefined || values[NIGHT_CABINET_CLEANUP_LEDGER_KEY] !== undefined) {
+        const cleanup = await inspectCleanupLedger(values, now);
+        if (!cleanup.ok || (cleanup.closed && cleanup.ledger.target.generation?.kind === 'manual-control'
+            && cleanup.ledger.target.generation.envelope.id === match[1])) throw new Error('manual control cleanup generation closed');
+    }
     const record = values[key];
     const inspected = inspectManualControlEnvelope(record?.envelope,{now});
     if (!inspected.ok || record?.schemaVersion !== 1 || Object.keys(record).sort().join(',') !== 'admittedAt,envelope,parserRunId,schemaVersion'
@@ -664,7 +696,13 @@ async function clearNightCabinetRetry(slotId) {
 async function prepareParserNightCabinetLease({ slotId, token = null, external = false, now = Date.now() }) {
     let raw;
     try {
-        raw = (await chrome.storage.local.get([NIGHT_CABINET_LEASE_KEY]))[NIGHT_CABINET_LEASE_KEY];
+        const state = await chrome.storage.local.get([NIGHT_CABINET_LEASE_KEY,
+            'nightCabinetAuthorityScope', 'nightCabinetCleanupLease', 'nightCabinetCleanupLedger']);
+        if (state['nightCabinetCleanupLease'] !== undefined || state['nightCabinetCleanupLedger'] !== undefined) {
+            const gate = await cleanupNormalAdmission(state);
+            if (!gate.ok) return gate;
+        }
+        raw = state[NIGHT_CABINET_LEASE_KEY];
     } catch (error) {
         return { ok: false, reason: 'lease-unreadable', error: String(error?.message || error) };
     }
@@ -742,6 +780,7 @@ async function handleNightCoordinatorLeaseTransitionRequest() {
             NIGHT_CABINET_TRANSITION_HANDLED_KEY,
             NIGHT_CABINET_CATCHUP_RESUME_KEY,
             NIGHT_CABINET_LEASE_KEY,
+            'nightCabinetAuthorityScope', 'nightCabinetCleanupLease', 'nightCabinetCleanupLedger',
             STANDALONE_WALK_LEDGER_KEY,
             'pipelineRun', 'pipelineStage', 'trackScreenshotQueue', 'screenshotQueueBlocked',
             'pendingSheetsUpload', 'lastSheetsUploadRunId', 'lastSheetsUploadOkAt',
@@ -754,14 +793,7 @@ async function handleNightCoordinatorLeaseTransitionRequest() {
             return { handled: false, ok: false, reason: inspectedRequest.reason };
         }
         const request = inspectedRequest.request;
-        if (state[NIGHT_CABINET_TRANSITION_HANDLED_KEY] === request.requestId) {
-            return {
-                handled: false,
-                ok: state[NIGHT_CABINET_TRANSITION_RESULT_KEY]?.ok === true,
-                reason: 'transition-request-already-handled',
-                result: state[NIGHT_CABINET_TRANSITION_RESULT_KEY] || null
-            };
-        }
+
 
         const finish = async (ok, reason, lease = null, extraMutation = {}) => {
             const result = {
@@ -781,6 +813,18 @@ async function handleNightCoordinatorLeaseTransitionRequest() {
             return { handled: true, ok: !!ok, reason, result };
         };
 
+        if (state['nightCabinetCleanupLease'] !== undefined || state['nightCabinetCleanupLedger'] !== undefined) {
+            const gate = await cleanupNormalAdmission(state);
+            if (!gate.ok) return finish(false, gate.reason);
+        }
+        if (state[NIGHT_CABINET_TRANSITION_HANDLED_KEY] === request.requestId) {
+            return {
+                handled: false,
+                ok: state[NIGHT_CABINET_TRANSITION_RESULT_KEY]?.ok === true,
+                reason: 'transition-request-already-handled',
+                result: state[NIGHT_CABINET_TRANSITION_RESULT_KEY] || null
+            };
+        }
         const inspectedCurrent = inspectNightCabinetLease(state[NIGHT_CABINET_LEASE_KEY], { now });
         if (inspectedCurrent.state === 'malformed') {
             return finish(false, inspectedCurrent.reason);
@@ -905,6 +949,434 @@ async function handleNightCoordinatorLeaseTransitionWake(request) {
     return handleNightCoordinatorLeaseTransitionRequest();
 }
 
+// Cleanup authority is separate from the expired work owner. These validators
+// attest only Parser state and Node's bounded evidence envelope, never remote PIDs.
+function cleanupObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function cleanupKeys(value, required, optional = []) {
+    return cleanupObject(value) && required.every(key => Object.hasOwn(value, key))
+        && Object.keys(value).every(key => required.includes(key) || optional.includes(key));
+}
+
+function cleanupCanonicalJson(value) {
+    return JSON.stringify(value, (_, item) => cleanupObject(item)
+        ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
+}
+
+function cleanupEqual(a, b) {
+    return cleanupCanonicalJson(a) === cleanupCanonicalJson(b);
+}
+
+async function cleanupSha(value) {
+    const bytes = new TextEncoder().encode(cleanupCanonicalJson(value));
+    return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)))
+        .map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function cleanupUuid(value) {
+    return typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value);
+}
+
+function cleanupHash(value) {
+    return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+}
+
+function cleanupTime(value) {
+    return Number.isSafeInteger(value) && value > 0;
+}
+
+function cleanupActor(value, withSession = false) {
+    const keys = ['hostId', 'bootId', 'pid', 'processStartFingerprint', 'runId'];
+    if (withSession) keys.push('session');
+    return cleanupKeys(value, keys) && typeof value.hostId === 'string'
+        && /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(value.hostId) && cleanupUuid(value.bootId)
+        && Number.isSafeInteger(value.pid) && value.pid > 0
+        && typeof value.processStartFingerprint === 'string' && value.processStartFingerprint.trim().length > 0
+        && value.processStartFingerprint.length <= 160 && !/[\r\n\0]/.test(value.processStartFingerprint)
+        && typeof value.runId === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._:-]{7,199}$/.test(value.runId)
+        && (!withSession || (typeof value.session === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,159}$/.test(value.session)));
+}
+
+function cleanupScope(raw) {
+    return cleanupKeys(raw, ['schemaVersion', 'kind', 'id']) && raw.schemaVersion === 1
+        && raw.kind === 'pittsburgh-parser-authority' && cleanupUuid(raw.id);
+}
+
+function inspectCleanupTarget(target, now) {
+    if (!cleanupKeys(target, ['schemaVersion', 'kind', 'scopeId', 'lease', 'run', 'refs', 'generation'])
+        || target.schemaVersion !== 1 || !['dead-store-walk', 'unstarted-store-walk'].includes(target.kind)
+        || !cleanupUuid(target.scopeId) || !cleanupActor(target.run, true)
+        || !cleanupKeys(target.refs, ['manifestSha', 'claimSha', 'reportSha', 'guardSha'])
+        || !cleanupHash(target.refs.manifestSha)
+        || ['claimSha', 'reportSha', 'guardSha'].some(key => target.refs[key] !== null && !cleanupHash(target.refs[key]))
+        || (target.kind === 'dead-store-walk' && !cleanupHash(target.refs.reportSha))) return false;
+    const inspected = inspectNightCabinetLease(target.lease, { now });
+    if (!cleanupKeys(target.lease, ['slotId', 'owner', 'phase', 'token', 'heartbeat', 'expires'], ['runId'])
+        || (Object.hasOwn(target.lease, 'runId') && (typeof target.lease.runId !== 'string'
+            || target.lease.runId !== target.run.runId))
+        || !inspected.lease || !cleanupEqual(target.lease, inspected.lease)
+        || !cleanupTime(target.lease.heartbeat) || !cleanupTime(target.lease.expires)
+        || target.lease.owner !== 'store-walk'
+        || !['claimed', 'running', 'recover', 'store-main', 'store-catchup'].includes(target.lease.phase)) return false;
+    const generation = target.generation;
+    if (target.lease.token.startsWith('standalone:')) {
+        return cleanupKeys(generation, ['kind', 'envelope']) && generation.kind === 'standalone-store-walk'
+            && inspectStandaloneWalkEnvelope(generation.envelope, { now, allowExpired: true }).ok
+            && standaloneWalkTokenAllowed(generation.envelope, target.lease)
+            && generation.envelope.runId === target.run.runId;
+    }
+    if (target.lease.token.startsWith('control:')) {
+        return cleanupKeys(generation, ['kind', 'envelope']) && generation.kind === 'manual-control'
+            && inspectManualControlEnvelope(generation.envelope, { now, allowExpired: true }).ok
+            && manualControlTokenAllowed(generation.envelope, target.lease)
+            && (target.run.runId.startsWith(`${generation.envelope.coordinatorRunId}-store-`)
+                || (target.run.runId === generation.envelope.coordinatorRunId
+                    && (target.kind === 'unstarted-store-walk'
+                        || (target.kind === 'dead-store-walk' && ['recover', 'store-main'].includes(target.lease.phase)))));
+    }
+    return generation === null;
+}
+
+function inspectCleanupAttempt(attempt) {
+    return cleanupKeys(attempt, ['schemaVersion', 'kind', 'id', 'scopeId', 'targetSha', 'owner', 'createdAt', 'deadlineAt', 'proofSha'])
+        && attempt.schemaVersion === 1 && attempt.kind === 'store-walk-cleanup'
+        && cleanupUuid(attempt.id) && cleanupUuid(attempt.scopeId) && cleanupHash(attempt.targetSha)
+        && cleanupActor(attempt.owner) && cleanupTime(attempt.createdAt) && cleanupTime(attempt.deadlineAt)
+        && attempt.deadlineAt - attempt.createdAt === NIGHT_CABINET_CLEANUP_TTL_MS && cleanupHash(attempt.proofSha);
+}
+
+function inspectCleanupProof(proof, target, attempt, now) {
+    if (!cleanupKeys(proof, ['schemaVersion', 'kind', 'scopeId', 'targetSha', 'attemptId', 'capturedAt', 'evidenceSha', 'hosts', 'previous'])
+        || proof.schemaVersion !== 1 || proof.kind !== 'store-walk-cleanup-admission'
+        || proof.scopeId !== target.scopeId || proof.targetSha !== attempt.targetSha || proof.attemptId !== attempt.id
+        || !cleanupTime(proof.capturedAt) || proof.capturedAt > now || now - proof.capturedAt > NIGHT_CABINET_CLEANUP_PROOF_MS
+        || !cleanupHash(proof.evidenceSha) || !Array.isArray(proof.hosts) || proof.hosts.length !== 3) return false;
+    const hosts = new Set();
+    for (const host of proof.hosts) {
+        if (!cleanupKeys(host, ['hostId', 'bootId', 'observedAt', 'proofSha'])
+            || typeof host.hostId !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(host.hostId)
+            || hosts.has(host.hostId) || !cleanupUuid(host.bootId) || !cleanupHash(host.proofSha)
+            || !cleanupTime(host.observedAt) || host.observedAt > proof.capturedAt
+            || now - host.observedAt > NIGHT_CABINET_CLEANUP_PROOF_MS) return false;
+        hosts.add(host.hostId);
+    }
+    if (!hosts.has(target.run.hostId) || !hosts.has(attempt.owner.hostId)) return false;
+    const previous = proof.previous;
+    return previous === null || (cleanupKeys(previous, ['attemptId', 'auxSha', 'owner', 'processesGone', 'proofSha'])
+        && cleanupUuid(previous.attemptId) && cleanupHash(previous.auxSha) && cleanupActor(previous.owner)
+        && hosts.has(previous.owner.hostId) && previous.processesGone === true && cleanupHash(previous.proofSha));
+}
+
+function inspectCleanupReceipt(receipt, attempt, admittedAt, now) {
+    return cleanupKeys(receipt, ['schemaVersion', 'kind', 'scopeId', 'targetSha', 'attemptId', 'completedAt', 'receiptSha',
+        'home', 'ownTabs', 'protections', 'pause', 'claimsClosed'])
+        && receipt.schemaVersion === 1 && receipt.kind === 'store-walk-cleanup-complete'
+        && receipt.scopeId === attempt.scopeId && receipt.targetSha === attempt.targetSha && receipt.attemptId === attempt.id
+        && cleanupTime(receipt.completedAt) && receipt.completedAt >= admittedAt
+        && receipt.completedAt <= Math.min(now, attempt.deadlineAt) && cleanupHash(receipt.receiptSha)
+        && ['home', 'ownTabs', 'protections', 'pause', 'claimsClosed'].every(key => receipt[key] === true);
+}
+
+function cleanupRequestRef(value) {
+    return cleanupKeys(value, ['id', 'sha']) && typeof value.id === 'string' && value.id.length >= 16
+        && value.id.length <= 200 && cleanupHash(value.sha);
+}
+
+async function inspectCleanupLedger(state, now = Date.now()) {
+    const aux = state[NIGHT_CABINET_CLEANUP_KEY], ledger = state[NIGHT_CABINET_CLEANUP_LEDGER_KEY];
+    // Only absent keys mean no cleanup history. A persisted null is malformed
+    // and cannot erase a pending owner or bypass the direct-start gate.
+    if (aux === undefined && ledger === undefined) {
+        return { ok: true, empty: true, aux: null, ledger: null };
+    }
+    const refused = { ok: false, reason: 'cleanup-authority-malformed' };
+    const scope = state[NIGHT_CABINET_AUTHORITY_SCOPE_KEY];
+    if (!cleanupScope(scope) || !cleanupKeys(ledger, ['schemaVersion', 'scopeId', 'target', 'targetSha', 'attempts', 'closedAt', 'receipt'])
+        || ledger.schemaVersion !== 1 || ledger.scopeId !== scope.id || !inspectCleanupTarget(ledger.target, now)
+        || ledger.target.scopeId !== scope.id || !cleanupHash(ledger.targetSha)
+        || ledger.targetSha !== await cleanupSha(ledger.target) || !cleanupObject(ledger.attempts)
+        || cleanupCanonicalJson(ledger).length > 262144) return refused;
+    const records = Object.entries(ledger.attempts);
+    if (!records.length || records.length > NIGHT_CABINET_CLEANUP_ATTEMPT_LIMIT) return refused;
+    let open = 0, finished = 0;
+    for (const [id, record] of records) {
+        if (!cleanupKeys(record, ['schemaVersion', 'scopeId', 'targetSha', 'attempt', 'proof', 'admittedAt', 'closedAt', 'phase', 'receipt', 'claimRequest', 'finishRequest'])
+            || record.schemaVersion !== 1 || record.scopeId !== scope.id || record.targetSha !== ledger.targetSha
+            || !inspectCleanupAttempt(record.attempt) || record.attempt.id !== id || record.attempt.targetSha !== ledger.targetSha
+            || record.attempt.scopeId !== scope.id || !cleanupTime(record.admittedAt)
+            || record.admittedAt < record.attempt.createdAt || record.admittedAt > record.attempt.createdAt + NIGHT_CABINET_CLEANUP_PROOF_MS
+            || record.admittedAt > now || !inspectCleanupProof(record.proof, ledger.target, record.attempt, record.admittedAt)
+            || record.attempt.proofSha !== await cleanupSha(record.proof) || !cleanupRequestRef(record.claimRequest)) return refused;
+        if (record.phase === 'cleanup') {
+            if (record.closedAt !== null || record.receipt !== null || record.finishRequest !== null) return refused;
+            open++;
+        } else {
+            if (!cleanupTime(record.closedAt) || record.closedAt < record.admittedAt || record.closedAt > now) return refused;
+            if (record.phase === 'abandoned') {
+                if (record.receipt !== null || record.finishRequest !== null || record.closedAt < record.attempt.deadlineAt) return refused;
+            } else if (record.phase === 'degraded') {
+                if (!inspectCleanupReceipt(record.receipt, record.attempt, record.admittedAt, record.closedAt)
+                    || !cleanupRequestRef(record.finishRequest)) return refused;
+                finished++;
+            } else return refused;
+        }
+    }
+    if (!aux || !cleanupEqual(aux, ledger.attempts[aux.attempt?.id])) return refused;
+    // Every retry extends one exact prior record, never a fork, a truncated
+    // history or an expired timestamp alone. Reconstruct only its old open form.
+    const visited = new Set();
+    let cursor = aux;
+    while (cursor) {
+        if (visited.has(cursor.attempt.id)) return refused;
+        visited.add(cursor.attempt.id);
+        const previous = cursor.proof.previous;
+        if (previous === null) break;
+        const prior = ledger.attempts[previous.attemptId];
+        if (!prior || prior.phase !== 'abandoned' || prior.closedAt !== cursor.admittedAt
+            || prior.attempt.deadlineAt > cursor.proof.capturedAt
+            || !cleanupEqual(previous.owner, prior.attempt.owner)
+            || previous.auxSha !== await cleanupSha({ ...prior, phase: 'cleanup', closedAt: null })) return refused;
+        cursor = prior;
+    }
+    if (visited.size !== records.length) return refused;
+    if (ledger.closedAt === null) {
+        if (ledger.receipt !== null || open !== 1 || finished !== 0 || aux.phase !== 'cleanup') return refused;
+    } else if (!cleanupTime(ledger.closedAt) || open !== 0 || finished !== 1 || aux.phase !== 'degraded'
+        || aux.closedAt !== ledger.closedAt || !cleanupEqual(ledger.receipt, aux.receipt)) return refused;
+    return { ok: true, empty: false, aux, ledger, closed: ledger.closedAt !== null };
+}
+
+async function cleanupNormalAdmission(state) {
+    const checked = await inspectCleanupLedger(state);
+    return !checked.ok ? checked : checked.empty || checked.closed
+        ? { ok: true } : { ok: false, reason: 'store-walk-cleanup-pending' };
+}
+
+function cleanupParserRuntimeIdle() {
+    return nightCabinetCleanupParserStarts.size === 0
+        && typeof isParsingAllStores === 'boolean' && isParsingAllStores === false
+        && typeof isProcessingScreenshots === 'boolean' && isProcessingScreenshots === false
+        && typeof isMultiAccountParsing === 'boolean' && isMultiAccountParsing === false
+        && typeof isMultiAccountIherb === 'boolean' && isMultiAccountIherb === false
+        && typeof finalSheetsUploadInFlight !== 'undefined' && finalSheetsUploadInFlight === null
+        && typeof finalUploadScheduleInFlight !== 'undefined' && finalUploadScheduleInFlight === null
+        && dailyRunStartInFlight === null && typeof sequentialPipelineStartInFlight !== 'undefined' && sequentialPipelineStartInFlight === null
+        && typeof pipelineAdvanceInFlight !== 'undefined' && pipelineAdvanceInFlight === null
+        && (typeof rejectedUploadArchiveInFlight === 'undefined' || rejectedUploadArchiveInFlight === null)
+        && typeof uploadToSheets === 'function' && (uploadToSheets.activeCount || 0) === 0;
+}
+
+async function withCleanupParserStart(work) {
+    const marker = Symbol('parser-start');
+    await withNightCabinetLeaseWrite(async () => {
+        const state = await chrome.storage.local.get([NIGHT_CABINET_AUTHORITY_SCOPE_KEY, NIGHT_CABINET_CLEANUP_KEY, NIGHT_CABINET_CLEANUP_LEDGER_KEY]);
+        const gate = await cleanupNormalAdmission(state);
+        if (!gate.ok) throw new Error(gate.reason);
+        nightCabinetCleanupParserStarts.add(marker);
+    });
+    try { return await work(); }
+    finally { nightCabinetCleanupParserStarts.delete(marker); }
+}
+
+async function cleanupGenerationProof(target, state, now) {
+    const desired = { ...target.lease, phase: 'degraded' };
+    if (target.generation?.kind === 'standalone-store-walk') {
+        return standaloneWalkTransitionProof({ standaloneWalk: target.generation.envelope, desired }, target.lease,
+            state[STANDALONE_WALK_LEDGER_KEY], now);
+    }
+    if (target.generation?.kind === 'manual-control') {
+        return manualControlTransitionProof({ manualControl: target.generation.envelope, desired }, target.lease, now);
+    }
+    if (state[STANDALONE_WALK_LEDGER_KEY] != null) {
+        const ledger = inspectStandaloneWalkLedger(state[STANDALONE_WALK_LEDGER_KEY], now);
+        if (!ledger.ok || Object.values(ledger.ledger.generations).some(record => record.closedAt === null)) {
+            return { ok: false, reason: 'standalone-owner-work-unproven' };
+        }
+    }
+    return { ok: true, mutation: {} };
+}
+
+function inspectManualCleanupClosures(raw) {
+    if (!cleanupObject(raw) || Object.keys(raw).length > 64) return false;
+    return Object.entries(raw).every(([id, record]) => cleanupUuid(id)
+        && cleanupKeys(record, ['schemaVersion', 'envelope', 'targetSha', 'receiptSha', 'closedAt', 'phase'])
+        && record.schemaVersion === 1 && record.envelope?.id === id
+        && inspectManualControlEnvelope(record.envelope, { now: Date.now(), allowExpired: true }).ok
+        && cleanupHash(record.targetSha) && cleanupHash(record.receiptSha) && cleanupTime(record.closedAt)
+        && record.closedAt <= Date.now() && record.phase === 'degraded');
+}
+
+async function handleNightCabinetCleanupTransitionRequest() {
+    return withNightCabinetLeaseWrite(async () => {
+        const now = Date.now();
+        const state = await chrome.storage.local.get([NIGHT_CABINET_AUTHORITY_SCOPE_KEY, NIGHT_CABINET_CLEANUP_KEY,
+            NIGHT_CABINET_CLEANUP_LEDGER_KEY, NIGHT_CABINET_CLEANUP_REQUEST_KEY, NIGHT_CABINET_LEASE_KEY,
+            STANDALONE_WALK_LEDGER_KEY, MANUAL_CONTROL_CLEANUP_CLOSURES_KEY, 'pipelineRun', 'pipelineStage', 'parsingState',
+            'trackScreenshotQueue', 'screenshotQueueBlocked', 'pendingSheetsUpload', 'iherbStageFinalizing',
+            'amazonStageFinalizing', 'pendingIherbSwitch', 'pendingAccountSwitch']);
+        const request = state[NIGHT_CABINET_CLEANUP_REQUEST_KEY];
+        if (!cleanupKeys(request, ['schemaVersion', 'requestId', 'requestedAt', 'operation', 'expectedLease', 'expectedAux', 'target', 'attempt'], ['proof', 'receipt'])
+            || request.schemaVersion !== 1 || typeof request.requestId !== 'string' || request.requestId.length < 16 || request.requestId.length > 200
+            || !cleanupTime(request.requestedAt) || request.requestedAt > now
+            || !['claim', 'retry', 'finish', 'finish-metadata'].includes(request.operation)
+            || cleanupCanonicalJson(request).length > 32768) return { handled: false, ok: false, reason: 'cleanup-request-invalid' };
+        const finish = async (ok, reason, mutation = {}, aux = null) => {
+            const result = { requestId: request.requestId, ok, reason, at: Date.now(),
+                ...(aux ? { aux, lease: mutation[NIGHT_CABINET_LEASE_KEY] || state[NIGHT_CABINET_LEASE_KEY] } : {}) };
+            await chrome.storage.local.set({ ...mutation, [NIGHT_CABINET_CLEANUP_RESULT_KEY]: result });
+            return { handled: true, ok, reason, result };
+        };
+        const { target, attempt } = request;
+        if (!cleanupScope(state[NIGHT_CABINET_AUTHORITY_SCOPE_KEY]) || state[NIGHT_CABINET_AUTHORITY_SCOPE_KEY].id !== target?.scopeId) {
+            return finish(false, 'cleanup-canonical-scope-unproven');
+        }
+        if (!inspectCleanupTarget(target, now) || !inspectCleanupAttempt(attempt) || attempt.scopeId !== target.scopeId
+            || attempt.targetSha !== await cleanupSha(target) || !cleanupEqual(request.expectedLease, target.lease)) {
+            return finish(false, 'cleanup-target-invalid');
+        }
+        const checked = await inspectCleanupLedger(state, now);
+        if (!checked.ok) return finish(false, checked.reason);
+        const requestSha = await cleanupSha(request);
+        const record = checked.ledger?.attempts[attempt.id];
+        const sameTarget = checked.ledger?.targetSha === attempt.targetSha && cleanupEqual(checked.ledger?.target, target);
+        for (const saved of Object.values(checked.ledger?.attempts || {})) {
+            for (const ref of [saved.claimRequest, saved.finishRequest]) {
+                if (ref?.id === request.requestId && ref.sha !== requestSha) return finish(false, 'cleanup-request-id-reused');
+            }
+        }
+        if (record && (!sameTarget || !cleanupEqual(record.attempt, attempt))) return finish(false, 'cleanup-attempt-reused');
+        // A durable commit followed by a lost reply grants no fresh time.
+        if (record?.claimRequest.id === request.requestId && record.claimRequest.sha === requestSha
+            && ['claim', 'retry'].includes(request.operation)) {
+            if (record.phase !== 'cleanup' || Date.now() >= attempt.deadlineAt || !cleanupEqual(checked.aux, record)
+                || !cleanupEqual(state[NIGHT_CABINET_LEASE_KEY], target.lease)) return finish(false, 'cleanup-attempt-closed');
+            return finish(true, 'cleanup-claim-already-committed', {}, record);
+        }
+        const closing = request.operation === 'finish' || request.operation === 'finish-metadata';
+        if (closing && record?.phase === 'degraded' && sameTarget && cleanupEqual(record.receipt, request.receipt)
+            && cleanupEqual(state[NIGHT_CABINET_LEASE_KEY], { ...target.lease, phase: 'degraded' })
+            && (cleanupEqual(request.expectedAux, checked.aux) || record.finishRequest?.sha === requestSha)) {
+            return finish(true, 'cleanup-finish-already-committed', {}, record);
+        }
+        if (!cleanupEqual(request.expectedAux, checked.aux) || !cleanupEqual(state[NIGHT_CABINET_LEASE_KEY], target.lease)
+            || target.lease.expires > now) return finish(false, 'cleanup-current-proof-mismatch');
+        if (request.requestedAt < now - NIGHT_CABINET_CLEANUP_PROOF_MS) return finish(false, 'cleanup-request-stale');
+        const idle = storeWalkParserIdleProof(state);
+        if (!idle.ok || !cleanupParserRuntimeIdle()) return finish(false, idle.reason || 'parser-runtime-not-idle');
+        const generation = await cleanupGenerationProof(target, state, now);
+        if (!generation.ok) return finish(false, generation.reason);
+        if (!closing) {
+            if (record) return finish(false, 'cleanup-attempt-reused');
+            if (!inspectCleanupProof(request.proof, target, attempt, now) || attempt.proofSha !== await cleanupSha(request.proof)
+                || request.proof.hosts.find(host => host.hostId === attempt.owner.hostId)?.bootId !== attempt.owner.bootId
+                || request.receipt != null || attempt.createdAt > now || attempt.createdAt < target.lease.expires
+                || now - attempt.createdAt > NIGHT_CABINET_CLEANUP_PROOF_MS) {
+                return finish(false, 'cleanup-node-proof-invalid');
+            }
+            const retry = request.operation === 'retry';
+            if (retry) {
+                const prior = checked.aux, proof = request.proof.previous;
+                if (checked.empty || checked.closed || !sameTarget || now < prior.attempt.deadlineAt
+                    || !proof || proof.attemptId !== prior.attempt.id || proof.auxSha !== await cleanupSha(prior)
+                    || !cleanupEqual(proof.owner, prior.attempt.owner) || request.proof.capturedAt < prior.attempt.deadlineAt
+                    || cleanupEqual(attempt.owner, prior.attempt.owner)) return finish(false, 'cleanup-retry-death-proof-required');
+            } else if ((!checked.empty && (!checked.closed || sameTarget)) || request.proof.previous !== null) {
+                return finish(false, 'cleanup-owner-unresolved');
+            }
+            const admittedAt = Date.now();
+            if (admittedAt >= attempt.deadlineAt || admittedAt - attempt.createdAt > NIGHT_CABINET_CLEANUP_PROOF_MS
+                || !inspectCleanupProof(request.proof, target, attempt, admittedAt) || !cleanupParserRuntimeIdle()) {
+                return finish(false, 'cleanup-admission-expired');
+            }
+            const attempts = retry ? { ...checked.ledger.attempts,
+                [checked.aux.attempt.id]: { ...checked.aux, phase: 'abandoned', closedAt: admittedAt } } : {};
+            if (Object.keys(attempts).length >= NIGHT_CABINET_CLEANUP_ATTEMPT_LIMIT) return finish(false, 'cleanup-attempt-limit');
+            const next = { schemaVersion: 1, scopeId: target.scopeId, targetSha: attempt.targetSha, attempt, proof: request.proof,
+                admittedAt, closedAt: null, phase: 'cleanup', receipt: null,
+                claimRequest: { id: request.requestId, sha: requestSha }, finishRequest: null };
+            const ledger = { schemaVersion: 1, scopeId: target.scopeId, target, targetSha: attempt.targetSha,
+                attempts: { ...attempts, [attempt.id]: next }, closedAt: null, receipt: null };
+            return finish(true, retry ? 'cleanup-retry-granted' : 'cleanup-claim-granted', {
+                [NIGHT_CABINET_CLEANUP_KEY]: next, [NIGHT_CABINET_CLEANUP_LEDGER_KEY]: ledger,
+            }, next);
+        }
+        if (!record || checked.closed || !sameTarget || !cleanupEqual(record, checked.aux)
+            || !inspectCleanupReceipt(request.receipt, attempt, record.admittedAt, now)) return finish(false, 'cleanup-receipt-invalid');
+        if (request.operation === 'finish') {
+            if (now >= attempt.deadlineAt || request.proof != null) return finish(false, 'cleanup-finish-deadline');
+        } else {
+            const proof = request.proof?.previous;
+            if (!inspectCleanupProof(request.proof, target, attempt, now) || !proof || proof.attemptId !== attempt.id
+                || proof.auxSha !== await cleanupSha(record) || !cleanupEqual(proof.owner, attempt.owner)) {
+                return finish(false, 'cleanup-metadata-death-proof-required');
+            }
+        }
+        const closedAt = Date.now();
+        if ((request.operation === 'finish' && closedAt >= attempt.deadlineAt)
+            || (request.operation === 'finish-metadata' && !inspectCleanupProof(request.proof, target, attempt, closedAt))
+            || !cleanupParserRuntimeIdle()) return finish(false, 'cleanup-finish-expired');
+        const next = { ...record, phase: 'degraded', closedAt, receipt: request.receipt,
+            finishRequest: { id: request.requestId, sha: requestSha } };
+        const ledger = { ...checked.ledger, attempts: { ...checked.ledger.attempts, [attempt.id]: next },
+            closedAt, receipt: request.receipt };
+        const closure = {};
+        if (target.generation?.kind === 'manual-control') {
+            const previous = state[MANUAL_CONTROL_CLEANUP_CLOSURES_KEY] === undefined
+                ? {} : state[MANUAL_CONTROL_CLEANUP_CLOSURES_KEY];
+            if (!inspectManualCleanupClosures(previous) || Object.keys(previous).length >= 64) return finish(false, 'manual-cleanup-closure-invalid');
+            closure[MANUAL_CONTROL_CLEANUP_CLOSURES_KEY] = { ...previous, [target.generation.envelope.id]: {
+                schemaVersion: 1, envelope: target.generation.envelope, targetSha: attempt.targetSha,
+                receiptSha: request.receipt.receiptSha, closedAt, phase: 'degraded',
+            } };
+        }
+        return finish(true, 'cleanup-finished', { ...generation.mutation, ...closure,
+            [NIGHT_CABINET_LEASE_KEY]: { ...target.lease, phase: 'degraded' },
+            [NIGHT_CABINET_CLEANUP_KEY]: next, [NIGHT_CABINET_CLEANUP_LEDGER_KEY]: ledger,
+        }, next);
+    });
+}
+
+async function handleNightCabinetCleanupTransitionWake(request) {
+    if (!request || request.action !== 'nightCabinetCleanupTransitionWake' || Object.keys(request).some(key => key !== 'action')) {
+        return { handled: false, ok: false, reason: 'cleanup-wake-payload-refused' };
+    }
+    return handleNightCabinetCleanupTransitionRequest();
+}
+
+async function readNightCabinetCleanupAuthority(request) {
+    const unknown = { action: 'nightCabinetCleanupAuthorityV1', protocolVersion: STORE_WALK_CLEANUP_PROTOCOL_VERSION,
+        known: false, state: 'unknown', now: Date.now() };
+    if (!cleanupKeys(request, ['action', 'scopeId', 'attemptId', 'targetSha'])
+        || request.action !== unknown.action || !cleanupUuid(request.scopeId)
+        || !cleanupUuid(request.attemptId) || !cleanupHash(request.targetSha)) return unknown;
+    return withNightCabinetLeaseWrite(async () => {
+        const state = await chrome.storage.local.get([NIGHT_CABINET_AUTHORITY_SCOPE_KEY, NIGHT_CABINET_CLEANUP_KEY,
+            NIGHT_CABINET_CLEANUP_LEDGER_KEY, NIGHT_CABINET_LEASE_KEY]);
+        const checked = await inspectCleanupLedger(state);
+        if (!checked.ok || checked.empty || checked.aux.scopeId !== request.scopeId
+            || checked.aux.attempt.id !== request.attemptId || checked.aux.targetSha !== request.targetSha
+            || (!checked.closed && !cleanupEqual(state[NIGHT_CABINET_LEASE_KEY], checked.ledger.target.lease))) return unknown;
+        const auxSha = await cleanupSha(checked.aux), now = Date.now();
+        // Expose only the exact predecessor already validated by the ledger
+        // chain. AutoBuy may transfer its expired fence to this retry, never
+        // infer the predecessor's death from a timestamp or a caller hint.
+        const predecessor = !checked.closed && checked.aux.proof.previous;
+        const prior = predecessor && checked.ledger.attempts[predecessor.attemptId];
+        const previous = prior ? {
+            scopeId: prior.scopeId, attemptId: prior.attempt.id, targetSha: prior.targetSha,
+            owner: prior.attempt.owner, createdAt: prior.attempt.createdAt, deadlineAt: prior.attempt.deadlineAt,
+            auxSha: predecessor.auxSha, processesGone: true, proofSha: predecessor.proofSha
+        } : null;
+        return { action: unknown.action, protocolVersion: STORE_WALK_CLEANUP_PROTOCOL_VERSION, known: true,
+            state: checked.closed ? 'closed' : now >= checked.aux.attempt.deadlineAt ? 'expired' : 'active',
+            scopeId: request.scopeId, attemptId: request.attemptId, targetSha: request.targetSha, now,
+            createdAt: checked.aux.attempt.createdAt, deadlineAt: checked.aux.attempt.deadlineAt, owner: checked.aux.attempt.owner,
+            auxSha, receipt: checked.aux.receipt, previous };
+    });
+}
+
 function setupDailyAlarm(reason = 'setup') {
     const now = new Date();
     const next = getNextDailyRun(now);
@@ -987,6 +1459,14 @@ async function runDailyAutoParse(source, coordinator = null) {
 }
 
 async function runDailyAutoParseOnce(source, coordinator = null) {
+    const cleanupPermit = arguments[2];
+    const cleanupStartState = await chrome.storage.local.get([
+        'nightCabinetAuthorityScope', 'nightCabinetCleanupLease', 'nightCabinetCleanupLedger'
+    ]);
+    if ((cleanupStartState.nightCabinetAuthorityScope !== undefined || cleanupStartState.nightCabinetCleanupLease !== undefined
+        || cleanupStartState.nightCabinetCleanupLedger !== undefined) && cleanupPermit !== NIGHT_CABINET_CLEANUP_START_PERMIT) {
+        return withCleanupParserStart(() => runDailyAutoParseOnce(source, coordinator, NIGHT_CABINET_CLEANUP_START_PERMIT));
+    }
     console.log(`⏰ Daily auto-parse started (${source})`);
     await addDailyDiagnostic('run-start', { source });
 
@@ -1510,6 +1990,13 @@ async function createPipelineRun(source, nightLease) {
   const expected = buildExpectedPipelineRoster(config);
   return withNightCabinetLeaseWrite(async () => {
     const now = Date.now();
+    const cleanupState = await chrome.storage.local.get([
+      'nightCabinetAuthorityScope', 'nightCabinetCleanupLease', 'nightCabinetCleanupLedger'
+    ]);
+    if (cleanupState['nightCabinetCleanupLease'] !== undefined || cleanupState['nightCabinetCleanupLedger'] !== undefined) {
+      const gate = await cleanupNormalAdmission(cleanupState);
+      if (!gate.ok) throw new Error(gate.reason);
+    }
     const currentLease = inspectNightCabinetLease(
       (await chrome.storage.local.get([NIGHT_CABINET_LEASE_KEY]))[NIGHT_CABINET_LEASE_KEY],
       { now }
@@ -2300,6 +2787,14 @@ async function reconcileStalePipelineState({ allowDestructiveCleanup = true } = 
 }
 
 async function resumePreparedPipelineStageAfterRestart() {
+    const cleanupPermit = arguments[0];
+    const cleanupStartState = await chrome.storage.local.get([
+        'nightCabinetAuthorityScope', 'nightCabinetCleanupLease', 'nightCabinetCleanupLedger'
+    ]);
+    if ((cleanupStartState.nightCabinetAuthorityScope !== undefined || cleanupStartState.nightCabinetCleanupLease !== undefined
+        || cleanupStartState.nightCabinetCleanupLedger !== undefined) && cleanupPermit !== NIGHT_CABINET_CLEANUP_START_PERMIT) {
+        return withCleanupParserStart(() => resumePreparedPipelineStageAfterRestart(NIGHT_CABINET_CLEANUP_START_PERMIT));
+    }
     const state = await chrome.storage.local.get([
         'pipelineRun', 'pipelineStage',
         'multiAccountIherbState', 'pendingIherbSwitch', 'iherbSwitchInProgress',
@@ -3028,6 +3523,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         processNextInQueue();
     } else if (request.action === "resetSheetMarks") {
         resetSheetMarks(request.options).then(()=>sendResponse({status:'ok'})).catch(e=>sendResponse({status:'error', message:String(e)}));
+    } else if (request.action === 'nightCabinetCleanupTransitionWake') {
+        handleNightCabinetCleanupTransitionWake(request)
+            .then(sendResponse)
+            .catch(error => sendResponse({ ok: false, reason: 'cleanup-wake-failed', error: String(error?.message || error) }));
+        return true;
     } else if (request.action === 'nightCoordinatorLeaseTransitionWake') {
         handleNightCoordinatorLeaseTransitionWake(request)
             .then(sendResponse)
@@ -3846,6 +4346,14 @@ async function startSequentialPipeline() {
 }
 
 async function startSequentialPipelineOnce() {
+    const cleanupPermit = arguments[0];
+    const cleanupStartState = await chrome.storage.local.get([
+        'nightCabinetAuthorityScope', 'nightCabinetCleanupLease', 'nightCabinetCleanupLedger'
+    ]);
+    if ((cleanupStartState.nightCabinetAuthorityScope !== undefined || cleanupStartState.nightCabinetCleanupLease !== undefined
+        || cleanupStartState.nightCabinetCleanupLedger !== undefined) && cleanupPermit !== NIGHT_CABINET_CLEANUP_START_PERMIT) {
+        return withCleanupParserStart(() => startSequentialPipelineOnce(NIGHT_CABINET_CLEANUP_START_PERMIT));
+    }
   const existing = await chrome.storage.local.get([
     'pipelineStage', 'screenshotQueueBlocked', 'trackScreenshotQueue', 'pipelineRun'
   ]);
@@ -4393,6 +4901,14 @@ async function getEbayParserTab(tabId) {
 }
 
 async function startEbayStageForPipeline(expectedGeneration = null) {
+    const cleanupPermit = arguments[1];
+    const cleanupStartState = await chrome.storage.local.get([
+        'nightCabinetAuthorityScope', 'nightCabinetCleanupLease', 'nightCabinetCleanupLedger'
+    ]);
+    if ((cleanupStartState.nightCabinetAuthorityScope !== undefined || cleanupStartState.nightCabinetCleanupLease !== undefined
+        || cleanupStartState.nightCabinetCleanupLedger !== undefined) && cleanupPermit !== NIGHT_CABINET_CLEANUP_START_PERMIT) {
+        return withCleanupParserStart(() => startEbayStageForPipeline(expectedGeneration, NIGHT_CABINET_CLEANUP_START_PERMIT));
+    }
   const prepared = await chrome.storage.local.get([
     'pipelineRun', 'pipelineStage', 'ebayParserTabId'
   ]);
@@ -4442,6 +4958,14 @@ async function startEbayStageForPipeline(expectedGeneration = null) {
 }
 
 async function startMultiAccountIherbParsing() {
+    const cleanupPermit = arguments[0];
+    const cleanupStartState = await chrome.storage.local.get([
+        'nightCabinetAuthorityScope', 'nightCabinetCleanupLease', 'nightCabinetCleanupLedger'
+    ]);
+    if ((cleanupStartState.nightCabinetAuthorityScope !== undefined || cleanupStartState.nightCabinetCleanupLease !== undefined
+        || cleanupStartState.nightCabinetCleanupLedger !== undefined) && cleanupPermit !== NIGHT_CABINET_CLEANUP_START_PERMIT) {
+        return withCleanupParserStart(() => startMultiAccountIherbParsing(NIGHT_CABINET_CLEANUP_START_PERMIT));
+    }
     console.log('🚀 startMultiAccountIherbParsing called');
 
     const cfg = await loadAccountsConfig();
@@ -5948,6 +6472,14 @@ async function waitForAmazonFinalReturnCompletion(expectedGeneration, maxWaitMs)
 
 // Initialize multi-account Amazon parsing
 async function startMultiAccountAmazonParsing() {
+    const cleanupPermit = arguments[0];
+    const cleanupStartState = await chrome.storage.local.get([
+        'nightCabinetAuthorityScope', 'nightCabinetCleanupLease', 'nightCabinetCleanupLedger'
+    ]);
+    if ((cleanupStartState.nightCabinetAuthorityScope !== undefined || cleanupStartState.nightCabinetCleanupLease !== undefined
+        || cleanupStartState.nightCabinetCleanupLedger !== undefined) && cleanupPermit !== NIGHT_CABINET_CLEANUP_START_PERMIT) {
+        return withCleanupParserStart(() => startMultiAccountAmazonParsing(NIGHT_CABINET_CLEANUP_START_PERMIT));
+    }
     console.log('🚀 startMultiAccountAmazonParsing called');
 
     const cfg = await loadAccountsConfig();
@@ -6400,6 +6932,13 @@ function parserTabOwnershipReply(state, tabId) {
 }
 
 function handleParserTabOwnershipMessage(request, sender, sendResponse) {
+    if (sender?.id === 'ppcgaihnphmgololipboonimikclclgc' && request?.action === 'nightCabinetCleanupAuthorityV1') {
+        readNightCabinetCleanupAuthority(request).then(sendResponse).catch(() => sendResponse({
+            action: 'nightCabinetCleanupAuthorityV1', protocolVersion: STORE_WALK_CLEANUP_PROTOCOL_VERSION,
+            known: false, state: 'unknown', now: Date.now(),
+        }));
+        return true;
+    }
     if (sender?.id !== 'ppcgaihnphmgololipboonimikclclgc'
         || request?.action !== 'parserTabOwnershipV1'
         || !Number.isInteger(request.tabId) || request.tabId <= 0) return false;
@@ -9599,6 +10138,14 @@ async function setParserLock(shop, on) {
 }
 
 async function launchParsersFromBackground() {
+    const cleanupPermit = arguments[0];
+    const cleanupStartState = await chrome.storage.local.get([
+        'nightCabinetAuthorityScope', 'nightCabinetCleanupLease', 'nightCabinetCleanupLedger'
+    ]);
+    if ((cleanupStartState.nightCabinetAuthorityScope !== undefined || cleanupStartState.nightCabinetCleanupLease !== undefined
+        || cleanupStartState.nightCabinetCleanupLedger !== undefined) && cleanupPermit !== NIGHT_CABINET_CLEANUP_START_PERMIT) {
+        return withCleanupParserStart(() => launchParsersFromBackground(NIGHT_CABINET_CLEANUP_START_PERMIT));
+    }
     console.log('🚀 launchParsersFromBackground() triggered');
     if (!parseReport.startedAt || (Date.now() - parseReport.startedAt > 5000)) {
         parseReport = { stores: {}, screenshots: { sent: 0, skipped: 0, failed: 0, broken: 0 }, startedAt: Date.now() };

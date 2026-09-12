@@ -100,6 +100,8 @@ test('row count cap refuses without silently truncating raw rows',async()=>{cons
 function installCanonicalDoor(h) {
  const {ctx}=h,now=ctx.Date.now();
  ctx.STANDALONE_WALK_LEDGER_KEY='standaloneWalkGenerationLedger';
+ Object.assign(ctx,{NIGHT_CABINET_AUTHORITY_SCOPE_KEY:'nightCabinetAuthorityScope',
+  NIGHT_CABINET_CLEANUP_KEY:'nightCabinetCleanupLease',NIGHT_CABINET_CLEANUP_LEDGER_KEY:'nightCabinetCleanupLedger'});
  Object.assign(ctx,{nightCabinetLeaseWriteChain:Promise.resolve(),NIGHT_CABINET_LEASE_KEY:'nightCabinetLease',NIGHT_CABINET_LEASE_TTL_MS:900000,NIGHT_CABINET_TIME_ZONE:'America/New_York',NIGHT_CABINET_OWNERS:new Set(['store-walk','parser']),NIGHT_CABINET_PHASES:new Set(['running','ready','store-catchup','store-main','completed','degraded']),NIGHT_CABINET_TRANSITION_REQUEST_KEY:'nightCoordinatorLeaseTransitionRequest',NIGHT_CABINET_TRANSITION_RESULT_KEY:'nightCoordinatorLeaseTransitionResult',NIGHT_CABINET_TRANSITION_HANDLED_KEY:'lastHandledNightCoordinatorLeaseTransitionId',NIGHT_CABINET_CATCHUP_RESUME_KEY:'nightCabinetCatchupResumeMarkers',nightCabinetLeaseSlotIds:()=>[String(h.state.pipelineRun.slotAt)]});
  h.state.nightCabinetLease={...h.state.nightCabinetLease,heartbeat:now-1,expires:now+900000};
  vm.runInContext([
